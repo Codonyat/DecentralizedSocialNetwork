@@ -1,0 +1,24 @@
+[package]
+name = "dsn-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI client for the Decentralized Social Network"
+
+[dependencies]
+dsn-core = { workspace = true }
+dsn-data = { workspace = true }
+dsn-token-y = { workspace = true }
+dsn-token-r = { workspace = true }
+dsn-invitation = { workspace = true }
+dsn-moderation = { workspace = true }
+dsn-indexer = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }

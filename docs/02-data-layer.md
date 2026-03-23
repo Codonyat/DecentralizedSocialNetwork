@@ -1,0 +1,328 @@
+# Data Layer Design (`dsn-data`)
+
+## Purpose
+
+Abstracts Autonomi network operations behind traits, enabling:
+1. In-memory mock for fast unit tests and simulation
+2. Real Autonomi backend for testnet/mainnet
+3. Clean separation of protocol logic from storage mechanics
+
+## Module Structure
+
+```
+crates/data/src/
+├── lib.rs              # Re-exports
+├── traits.rs           # Storage trait definitions
+├── memory.rs           # In-memory implementation
+├── autonomi.rs         # Real Autonomi implementation (feature-gated)
+├── error.rs            # Data layer errors
+└── conversion.rs       # Type conversion between dsn-core and Autonomi SDK types
+```
+
+## Core Storage Traits (`traits.rs`)
+
+### ScratchpadStore
+
+Handles all mutable, key-addressed data (profiles, follow lists, balances, etc.).
+
+```rust
+#[async_trait]
+pub trait ScratchpadStore: Send + Sync {
+    /// Create a new scratchpad for the given owner.
+    /// Returns the cost paid (0 for mock).
+    async fn create(
+        &self,
+        owner: &PublicKey,
+        content_type: ContentType,
+        data: &[u8],
+    ) -> Result<(), DataError>;
+
+    /// Read a scratchpad by owner's public key.
+    /// Returns None if not found.
+    async fn get(&self, owner: &PublicKey) -> Result<Option<ScratchpadData>, DataError>;
+
+    /// Update an existing scratchpad.
+    /// The implementation must verify the caller owns the scratchpad.
+    async fn update(
+        &self,
+        owner: &PublicKey,
+        content_type: ContentType,
+        data: &[u8],
+    ) -> Result<(), DataError>;
+
+    /// Check if a scratchpad exists.
+    async fn exists(&self, owner: &PublicKey) -> Result<bool, DataError>;
+}
+
+/// Metadata returned alongside scratchpad content.
+pub struct ScratchpadData {
+    pub owner: PublicKey,
+    pub content_type: ContentType,
+    pub data: Vec<u8>,
+    pub counter: u64,
+}
+
+/// Distinguishes different scratchpad purposes at the storage level.
+/// Maps to Autonomi's `data_encoding: u64` field.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContentType {
+    UserProfile = 1,
+    FeedIndex = 2,
+    FollowList = 3,
+    LikeList = 4,
+    CurationRecord = 5,
+    YBalance = 6,
+    RBalance = 7,
+}
+```
+
+### ChunkStore
+
+Handles all immutable, content-addressed data (posts, epoch boundaries, fraud proofs).
+
+```rust
+#[async_trait]
+pub trait ChunkStore: Send + Sync {
+    /// Store immutable data. Returns the content address.
+    async fn put(&self, data: &[u8]) -> Result<ContentAddress, DataError>;
+
+    /// Retrieve data by content address.
+    /// Returns None if not found.
+    async fn get(&self, address: &ContentAddress) -> Result<Option<Vec<u8>>, DataError>;
+
+    /// Check if a chunk exists.
+    async fn exists(&self, address: &ContentAddress) -> Result<bool, DataError>;
+}
+```
+
+### GraphStore
+
+Handles directed graph edges (replies, invitations, content flags).
+
+```rust
+#[async_trait]
+pub trait GraphStore: Send + Sync {
+    /// Store a graph entry. Returns the address.
+    async fn put(&self, entry: &GraphEntryData) -> Result<(), DataError>;
+
+    /// Get all graph entries for an owner.
+    /// May return multiple entries (each is immutable once stored).
+    async fn get(&self, owner: &PublicKey) -> Result<Vec<GraphEntryData>, DataError>;
+
+    /// Check if any graph entry exists for this owner.
+    async fn exists(&self, owner: &PublicKey) -> Result<bool, DataError>;
+}
+
+/// Our representation of a graph entry.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GraphEntryData {
+    pub owner: PublicKey,
+    pub parents: Vec<PublicKey>,
+    /// 32 bytes of content — typically a ContentAddress of a Chunk.
+    pub content: [u8; 32],
+    /// Outgoing edges: (target_owner, 32-byte metadata).
+    pub descendants: Vec<(PublicKey, [u8; 32])>,
+    pub signature: Signature,
+}
+```
+
+### Combined Storage Trait
+
+```rust
+/// The full storage backend combining all three stores.
+/// Every protocol crate accepts this trait.
+pub trait Storage: ScratchpadStore + ChunkStore + GraphStore {}
+
+/// Blanket impl: anything implementing all three is a Storage.
+impl<T> Storage for T where T: ScratchpadStore + ChunkStore + GraphStore {}
+```
+
+## Scratchpad Key Derivation
+
+A single user has multiple Scratchpads (profile, feed, follows, Y balance, etc.). Since each Scratchpad is addressed by its owner's public key, and each public key can only have one Scratchpad, we need **derived keys** for each purpose.
+
+### Strategy: Deterministic Child Keys
+
+```rust
+/// Derive a purpose-specific key from the user's root key.
+/// Each ContentType gets its own child key → its own Scratchpad address.
+pub fn derive_scratchpad_key(root_sk: &SecretKey, purpose: ContentType) -> SecretKey {
+    root_sk.derive_child(&(purpose as u64).to_le_bytes())
+}
+```
+
+| Purpose | Derivation Bytes | Scratchpad Contents |
+|---|---|---|
+| `UserProfile` | `[1, 0, 0, 0, 0, 0, 0, 0]` | Serialized `UserProfile` |
+| `FeedIndex` | `[2, 0, 0, 0, 0, 0, 0, 0]` | Serialized `FeedIndex` |
+| `FollowList` | `[3, 0, 0, 0, 0, 0, 0, 0]` | Serialized `FollowList` |
+| `LikeList` | `[4, 0, 0, 0, 0, 0, 0, 0]` | Serialized `LikeList` |
+| `CurationRecord` | `[5, 0, 0, 0, 0, 0, 0, 0]` | Serialized `CurationRecord` |
+| `YBalance` | `[6, 0, 0, 0, 0, 0, 0, 0]` | Serialized `YScratchpadPayload` (balance + latest_receipt pointer) |
+| `RBalance` | `[7, 0, 0, 0, 0, 0, 0, 0]` | Serialized `RBalance` |
+
+### Mapping Root Identity to Derived Keys
+
+The user's **root public key** is their canonical identity (used in posts, follows, etc.). Their derived public keys are discoverable:
+
+```rust
+/// Given a user's root public key and a purpose, compute the derived Scratchpad address.
+/// Any client can do this to look up any user's data.
+pub fn scratchpad_address_for(root_pk: &PublicKey, purpose: ContentType) -> KeyAddress;
+```
+
+This requires that key derivation is deterministic and works on public keys too. In real BLS, this is possible via `MainPubkey::derive_child()`. In our simulation, we hash `(root_pk || purpose)`.
+
+## In-Memory Implementation (`memory.rs`)
+
+```rust
+pub struct MemoryStorage {
+    /// Scratchpads: keyed by (owner_pk, content_type).
+    scratchpads: RwLock<HashMap<(PublicKey, ContentType), ScratchpadData>>,
+
+    /// Chunks: keyed by content address.
+    chunks: RwLock<HashMap<ContentAddress, Vec<u8>>>,
+
+    /// Graph entries: keyed by owner, multiple entries per owner.
+    graph_entries: RwLock<HashMap<PublicKey, Vec<GraphEntryData>>>,
+
+    /// Global Scratchpad write counter (for confirmation window tracking).
+    scratchpad_write_counter: AtomicU64,
+}
+```
+
+### Capabilities
+
+- Thread-safe via `RwLock` (supports concurrent agent simulation)
+- Tracks global write counter for event-based epoch simulation
+- Instant reads/writes (no network latency)
+- Supports deliberate failure injection for testing error paths
+
+```rust
+impl MemoryStorage {
+    pub fn new() -> Self;
+
+    /// Get the global scratchpad write count (for epoch/confirmation logic).
+    pub fn global_write_count(&self) -> u64;
+
+    /// Inject a simulated failure for the next N operations (testing only).
+    pub fn inject_failures(&self, count: usize);
+}
+```
+
+## Autonomi Implementation (`autonomi.rs`)
+
+Feature-gated behind `autonomi` feature flag. Not implemented in Phase 1-3.
+
+```rust
+#[cfg(feature = "autonomi")]
+pub struct AutonomiBacked {
+    client: autonomi::Client,
+    wallet: autonomi::Wallet,
+}
+```
+
+### Key Design Decisions for Autonomi Backend
+
+1. **Encryption**: Most Scratchpads are stored **unencrypted** (plaintext mode) because all data is intended to be publicly verifiable. The only exception might be draft posts or private follow lists (future feature).
+
+2. **Scratchpad creation**: Each derived key's Scratchpad must be created (paid for) once. The user pays a one-time ANT fee per purpose. After that, updates are free.
+
+3. **Counter management**: The `counter` field in Autonomi Scratchpads is a CRDT monotonic counter. Our `version` and `nonce` fields map to this. The data layer must track the current counter and increment on each update.
+
+4. **Error handling**: Autonomi can fail with network-level errors (timeout, quorum failure). The data layer retries with exponential backoff up to a configurable limit, then surfaces the error.
+
+5. **Read-after-write**: Due to Autonomi's eventual consistency, a read immediately after a write may return the old value. The data layer provides an `await_confirmation()` method that polls until the write is visible or timeout.
+
+## Data Mapping Summary
+
+| Core Type | Storage | Key | Notes |
+|---|---|---|---|
+| `UserProfile` | Scratchpad | derived(root, Profile) | Mutable, free updates |
+| `Post` | Chunk | content hash | Immutable, pay once |
+| `FeedIndex` | Scratchpad | derived(root, Feed) | Rolling list of post addresses |
+| `FollowList` | Scratchpad | derived(root, Follow) | Mutable list |
+| `LikeList` | Scratchpad | derived(root, Like) | Mutable list |
+| `CurationRecord` | Scratchpad | derived(root, Curation) | Stakes per user |
+| `YBalance` | Scratchpad | derived(root, YBalance) | Stores `YScratchpadPayload` (balance + latest_receipt pointer) |
+| `YReceipt` | Chunk | content hash | Immutable Y state transition record (~300-500 bytes) |
+| `RBalance` | Scratchpad | derived(root, RBalance) | Publicly verifiable |
+| `EpochBoundary` | Chunk | content hash | Immutable epoch marker |
+| Reply link | GraphEntry | reply-specific key | Immutable edge parent→child |
+| Invitation | GraphEntry | invitation-specific key | Immutable edge inviter→invitee |
+| Content flag | GraphEntry | flag-specific key | Immutable moderation flag |
+| Fraud proof | Chunk | content hash | Immutable evidence |
+
+## Error Types (`error.rs`)
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum DataError {
+    #[error("scratchpad not found for {owner:?}")]
+    ScratchpadNotFound { owner: PublicKey },
+
+    #[error("chunk not found: {address:?}")]
+    ChunkNotFound { address: ContentAddress },
+
+    #[error("scratchpad already exists for {owner:?}")]
+    ScratchpadAlreadyExists { owner: PublicKey },
+
+    #[error("data too large: {size} bytes, max {max}")]
+    DataTooLarge { size: usize, max: usize },
+
+    #[error("network error: {0}")]
+    Network(String),
+
+    #[error("timeout after {elapsed_ms}ms")]
+    Timeout { elapsed_ms: u64 },
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("signature verification failed")]
+    InvalidSignature,
+}
+```
+
+## GraphEntry Usage Patterns
+
+### Reply to a Post
+
+```
+GraphEntry {
+    owner: reply_specific_key,
+    parents: [post_author_pk],           // Points to parent post's author
+    content: reply_chunk_address,        // 32-byte address of the reply Chunk
+    descendants: [],                     // Replies to this reply will point back
+}
+```
+
+### Invitation
+
+```
+GraphEntry {
+    owner: invitation_specific_key,
+    parents: [inviter_pk],               // The inviter
+    content: invitee_pk_hash,            // Hash of invitee's public key (32 bytes)
+    descendants: [(invitee_pk, staked_r_bytes)],
+}
+```
+
+### Content Flag
+
+```
+GraphEntry {
+    owner: flag_specific_key,
+    parents: [flagger_pk],               // Who flagged
+    content: flagged_post_address,       // 32-byte address of flagged Chunk
+    descendants: [(post_author_pk, flag_reason_hash)],
+}
+```
+
+## Concurrency Model
+
+- All trait methods are `async` and take `&self` (shared reference)
+- Implementations use interior mutability (`RwLock`)
+- Multiple concurrent readers, exclusive writers
+- The in-memory backend supports running thousands of simulated agents concurrently
+- The Autonomi backend naturally handles concurrency (each network request is independent)

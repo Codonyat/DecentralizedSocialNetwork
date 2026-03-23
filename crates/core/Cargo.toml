@@ -1,0 +1,16 @@
+[package]
+name = "dsn-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types, crypto primitives, and shared data structures for the Decentralized Social Network"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }

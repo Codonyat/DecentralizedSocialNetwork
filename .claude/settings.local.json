@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.autonomi.com)",
+      "WebFetch(domain:venice.ai)",
+      "WebSearch",
+      "WebFetch(domain:messari.io)",
+      "WebFetch(domain:forum.autonomi.community)",
+      "WebFetch(domain:docs.farcaster.xyz)",
+      "WebFetch(domain:www.nervos.org)",
+      "WebFetch(domain:primer.autonomi.com)",
+      "WebFetch(domain:dev.autonomi.community)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(curl:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:autonomi.com)",
+      "Bash(git init:*)",
+      "Bash(wc:*)",
+      "Bash(do echo:*)",
+      "Bash(node:*)"
+    ]
+  }
+}
