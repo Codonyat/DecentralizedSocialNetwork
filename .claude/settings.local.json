@@ -18,7 +18,18 @@
       "Bash(git init:*)",
       "Bash(wc:*)",
       "Bash(do echo:*)",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(ls:*)",
+      "Bash(for dir in core data token-y token-r invitation moderation indexer cli)",
+      "Bash(do)",
+      "Bash(echo \"=== crates/$dir ===\")",
+      "Read(//c/Users/nilga/Repos/DecentralizedSocialNetwork/crates/**)",
+      "Bash(done)",
+      "Bash(echo \"=== crates/$dir/src ===\")",
+      "Read(//c/Users/nilga/Repos/DecentralizedSocialNetwork/crates/$dir/**)",
+      "Bash(cargo check:*)",
+      "Bash(rustup:*)",
+      "Bash(rustc:*)"
     ]
   }
 }

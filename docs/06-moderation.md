@@ -13,9 +13,9 @@ crates/moderation/src/
 ├── lib.rs              # Re-exports
 ├── flag.rs             # ContentFlag creation, validation, serialization
 ├── counter_flag.rs     # Counter-flag (contest) creation and validation
-├── aggregation.rs      # Flag score aggregation and weighted scoring
+├── aggregation.rs      # Flag score aggregation and uniform scoring
 ├── policy.rs           # ModerationPolicy trait + built-in policies
-├── reputation.rs       # Flagger reputation tracking and penalties
+├── reputation.rs       # Flagger reputation tracking (accuracy-based)
 ├── review.rs           # Broader community review triggered by counter-flags
 └── error.rs            # Moderation error types
 ```
@@ -24,10 +24,32 @@ crates/moderation/src/
 
 1. **No censorship at the data layer** -- Autonomi stores everything permanently. Flags are metadata *about* content, not deletion requests.
 2. **Indexer sovereignty** -- Each indexer chooses its own `ModerationPolicy`. Users who disagree switch indexers.
-3. **Reputation-gated flagging** -- Only users with R above a threshold can flag, preventing flag spam from bots.
-4. **Sublinear influence** -- Flag weight uses `sqrt(flagger_R)`, preventing whales from unilaterally hiding content.
-5. **Accountability** -- Flags are signed and permanent. Flaggers who abuse the system lose R.
+3. **Eligibility-gated flagging** -- Only users who are invited, have sufficient account age, and have donated enough can flag, preventing flag spam from bots.
+4. **Uniform influence** -- Each eligible flagger/reviewer contributes weight 1.0, preventing any single account from dominating moderation outcomes.
+5. **Accountability** -- Flags are signed and permanent. Flaggers who abuse the system lose credibility (low accuracy causes their flags to be ignored by indexers).
 6. **Contestability** -- Flagged content authors can counter-flag, triggering broader community review.
+
+## Eligibility Criteria
+
+A user is **eligible** to flag or review if all of the following are true:
+
+1. **Invited**: The user has an on-chain invitation record (exists in the web-of-trust graph).
+2. **Account age**: The user's account is at least `MIN_ACCOUNT_AGE_EPOCHS` epochs old.
+3. **Donation count**: The user has made at least `MIN_DONATION_COUNT` donations.
+
+Each eligible user receives a uniform weight of **1.0** for flagging and reviewing.
+
+```rust
+/// Check whether a user is eligible to flag or review.
+pub fn is_eligible(
+    user: &PublicKey,
+    eligible_accounts: &HashSet<PublicKey>,
+) -> bool {
+    eligible_accounts.contains(user)
+}
+```
+
+Indexers are responsible for computing the set of eligible accounts based on on-chain data (invitation records, account creation epochs, donation counts).
 
 ## Type Definitions
 
@@ -86,9 +108,6 @@ pub struct ContentFlag {
     /// Stored as a Chunk; this field holds the ContentAddress of that Chunk.
     pub explanation: Option<ContentAddress>,
 
-    /// Flagger's R balance at time of flagging (self-reported; verified by indexers).
-    pub flagger_r_at_flag: u64,
-
     /// Epoch in which the flag was submitted.
     pub flagged_at_epoch: u64,
 
@@ -109,7 +128,6 @@ The `flag_metadata_hash` stored in the GraphEntry descendant tuple is computed a
 pub fn flag_metadata_hash(flag: &ContentFlag) -> [u8; 32] {
     let bytes = bincode::serialize(&(
         flag.reason as u8,
-        flag.flagger_r_at_flag,
         flag.flagged_at_epoch,
         flag.sequence,
     )).unwrap();
@@ -148,9 +166,6 @@ pub struct CounterFlag {
 
     /// Optional evidence (ContentAddress of a Chunk with supporting material).
     pub evidence: Option<ContentAddress>,
-
-    /// Contester's R at time of counter-flag.
-    pub contester_r_at_counter: u64,
 
     /// Epoch in which the counter-flag was submitted.
     pub countered_at_epoch: u64,
@@ -204,9 +219,6 @@ pub struct ReviewVote {
     /// The vote: uphold the original flag, or overturn it.
     pub verdict: ReviewVerdict,
 
-    /// Reviewer's R at time of voting.
-    pub reviewer_r_at_vote: u64,
-
     /// Epoch of the vote.
     pub voted_at_epoch: u64,
 
@@ -237,13 +249,13 @@ pub struct PostModerationScore {
     /// The post being scored.
     pub post_address: ContentAddress,
 
-    /// Weighted flag score: sum of sqrt(flagger_R) for all active flags.
+    /// Weighted flag score: count of eligible flaggers (each weight 1.0).
     pub weighted_flag_score: f64,
 
-    /// Weighted counter-flag score: sum of sqrt(reviewer_R) for overturn votes.
+    /// Weighted counter-flag score: count of eligible overturn voters (each weight 1.0).
     pub weighted_overturn_score: f64,
 
-    /// Weighted uphold score: sum of sqrt(reviewer_R) for uphold votes.
+    /// Weighted uphold score: count of eligible uphold voters (each weight 1.0).
     pub weighted_uphold_score: f64,
 
     /// Net moderation score: flag_score + uphold_score - overturn_score.
@@ -275,7 +287,7 @@ pub struct PostModerationScore {
 ### Step 1: User Submits a Flag
 
 1. Alice sees a post she considers spam.
-2. Alice's client verifies she has `R >= MIN_FLAGGER_R` (the minimum R required to flag).
+2. Alice's client verifies she is eligible (invited, sufficient account age, sufficient donations).
 3. Alice's client constructs a `ContentFlag` with reason `Spam`.
 4. Alice derives a flag-specific key: `derive_child(root_sk, b"flag" || post_address)`.
 5. Alice's client serializes the flag, signs it, and writes a GraphEntry to Autonomi:
@@ -314,9 +326,9 @@ pub struct PostModerationScore {
 ### Step 4: Broader Community Review
 
 1. Indexers detect the counter-flag and mark the post as "under review."
-2. Community members with `R >= MIN_REVIEWER_R` can cast `ReviewVote` entries.
+2. Eligible community members (invited + account age >= N epochs + donation count >= M) can cast `ReviewVote` entries.
 3. The review window lasts `REVIEW_PERIOD_EPOCHS` epochs.
-4. Votes are weighted by `sqrt(reviewer_R)`.
+4. Each eligible reviewer contributes weight 1.0.
 5. Each reviewer may only vote once per review (enforced by derived key uniqueness).
 
 ### Step 5: Review Resolution
@@ -324,7 +336,7 @@ pub struct PostModerationScore {
 1. After the review period, indexers tally `weighted_uphold_score` vs `weighted_overturn_score`.
 2. If `weighted_overturn_score > weighted_uphold_score`:
    - The flag is **overturned**. The post is restored to visibility.
-   - The original flagger's reputation is penalized (see Reputation below).
+   - The original flagger's accuracy is penalized (see Reputation below).
 3. If `weighted_uphold_score >= weighted_overturn_score`:
    - The flag is **upheld**. The post remains hidden.
    - The contester receives no penalty (contesting is free except for the effort).
@@ -334,17 +346,12 @@ pub struct PostModerationScore {
 ### Core Scoring Formula
 
 ```rust
-/// Compute the weighted flag score for a single flag.
-pub fn flag_weight(flagger_r: u64) -> f64 {
-    (flagger_r as f64).sqrt()
-}
-
 /// Aggregate all flags, counter-flags, and review votes for a post.
 pub fn aggregate_moderation_score(
     flags: &[ContentFlag],
     counter_flags: &[CounterFlag],
     review_votes: &[ReviewVote],
-    verified_r: &HashMap<PublicKey, u64>,  // Verified R balances from indexer
+    eligible_accounts: &HashSet<PublicKey>,  // Eligible accounts computed by indexer
     current_epoch: u64,
 ) -> PostModerationScore {
     let mut weighted_flag_score = 0.0_f64;
@@ -353,12 +360,10 @@ pub fn aggregate_moderation_score(
     let mut reason_scores: HashMap<FlagReason, f64> = HashMap::new();
     let mut unique_flaggers: HashSet<PublicKey> = HashSet::new();
 
-    // 1. Score all flags
+    // 1. Score all flags (each eligible flagger contributes weight 1.0)
     for flag in flags {
-        // Use indexer-verified R, not self-reported
-        let r = verified_r.get(&flag.flagger).copied().unwrap_or(0);
-        if r < MIN_FLAGGER_R {
-            continue; // Below threshold, ignore flag
+        if !eligible_accounts.contains(&flag.flagger) {
+            continue; // Not eligible, ignore flag
         }
 
         // Each flagger counted only once per post
@@ -366,7 +371,7 @@ pub fn aggregate_moderation_score(
             continue;
         }
 
-        let weight = flag_weight(r);
+        let weight = 1.0;
         weighted_flag_score += weight;
 
         *reason_scores.entry(flag.reason).or_insert(0.0) += weight;
@@ -381,8 +386,7 @@ pub fn aggregate_moderation_score(
     // 3. Score review votes (only if a review was triggered)
     let mut unique_reviewers: HashSet<PublicKey> = HashSet::new();
     for vote in review_votes {
-        let r = verified_r.get(&vote.reviewer).copied().unwrap_or(0);
-        if r < MIN_REVIEWER_R {
+        if !eligible_accounts.contains(&vote.reviewer) {
             continue;
         }
 
@@ -390,7 +394,7 @@ pub fn aggregate_moderation_score(
             continue;
         }
 
-        let weight = flag_weight(r);
+        let weight = 1.0;
         match vote.verdict {
             ReviewVerdict::UpholdFlag => weighted_uphold_score += weight,
             ReviewVerdict::OverturnFlag => weighted_overturn_score += weight,
@@ -420,13 +424,13 @@ pub fn aggregate_moderation_score(
 
 ### Score Examples
 
-| Scenario | Flaggers (R) | Flag Score | Outcome (default policy, threshold=10.0) |
+| Scenario | Eligible Flaggers | Flag Score | Outcome (default policy, threshold=10.0) |
 |---|---|---|---|
-| 1 whale flags (R=1000) | [1000] | sqrt(1000) = 31.6 | Hidden |
-| 10 newcomers flag (R=5 each) | [5; 10] | 10 * sqrt(5) = 22.4 | Hidden |
-| 1 newcomer flags (R=5) | [5] | sqrt(5) = 2.2 | Visible (below threshold) |
-| 3 mid-tier flag (R=50 each) | [50; 3] | 3 * sqrt(50) = 21.2 | Hidden |
-| Whale flags, review overturns | flag=31.6, overturn=40.0 | net = 31.6 - 40.0 = -8.4 | Visible (overturned) |
+| 1 eligible user flags | 1 | 1.0 | Visible (below threshold) |
+| 10 eligible users flag | 10 | 10.0 | Hidden |
+| 3 eligible users flag | 3 | 3.0 | Visible (below threshold) |
+| 12 flag, review: 8 overturn vs 3 uphold | flag=12.0, overturn=8.0, uphold=3.0 | net = 12.0 + 3.0 - 8.0 = 7.0 | Visible (overturned below threshold) |
+| 15 flag, review: 2 overturn vs 5 uphold | flag=15.0, overturn=2.0, uphold=5.0 | net = 15.0 + 5.0 - 2.0 = 18.0 | Hidden (upheld) |
 
 ## Moderation Policy Abstraction (`policy.rs`)
 
@@ -635,26 +639,15 @@ pub struct FlaggerRecord {
     /// Computed accuracy rate: upheld / (upheld + overturned).
     /// Flags that were never contested count as upheld.
     pub accuracy_rate: f64,
-
-    /// R penalty accumulated from overturned flags.
-    pub total_r_penalty: u64,
 }
 ```
 
-### Reputation Penalties
+### Reputation Tracking
 
 ```rust
-/// Penalty applied when a flagger's flag is overturned.
-pub const OVERTURN_R_PENALTY_BPS: u64 = 500; // 5% of flagger's R at time of flag
-
 /// Threshold: if a flagger's accuracy drops below this, their future flags
-/// are ignored by the aggregation engine (treated as if R = 0).
+/// are ignored by indexers.
 pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
-
-/// Compute the R penalty for a flagger whose flag was overturned.
-pub fn compute_overturn_penalty(flagger_r_at_flag: u64) -> u64 {
-    flagger_r_at_flag * OVERTURN_R_PENALTY_BPS / 10_000
-}
 
 /// Determine if a flagger should be trusted based on their track record.
 pub fn is_flagger_trusted(record: &FlaggerRecord) -> bool {
@@ -674,9 +667,8 @@ pub fn update_flagger_record(
         ReviewOutcome::Upheld => {
             record.upheld_flags += 1;
         }
-        ReviewOutcome::Overturned { r_penalty } => {
+        ReviewOutcome::Overturned => {
             record.overturned_flags += 1;
-            record.total_r_penalty += r_penalty;
         }
     }
 
@@ -690,44 +682,12 @@ pub fn update_flagger_record(
 pub enum ReviewOutcome {
     /// The flag was correct.
     Upheld,
-    /// The flag was overturned; the flagger loses R.
-    Overturned { r_penalty: u64 },
+    /// The flag was overturned; the flagger loses credibility (no economic penalty).
+    Overturned,
 }
 ```
 
-### R Penalty Integration with `dsn-token-r`
-
-When a flag is overturned, the moderation crate computes a `SlashableOffense` that is fed into `dsn-token-r`'s slashing system:
-
-```rust
-/// Create an R slash event for an overturned flag.
-/// This is stored as a Chunk on Autonomi for auditability.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct FlagOverturnProof {
-    /// The flagger being penalized.
-    pub flagger: PublicKey,
-
-    /// The original flag that was overturned.
-    pub flag_ref: ContentAddress,
-
-    /// The counter-flag that initiated the review.
-    pub counter_flag_ref: ContentAddress,
-
-    /// Weighted overturn score vs uphold score.
-    pub overturn_score: f64,
-    pub uphold_score: f64,
-
-    /// R penalty amount.
-    pub r_penalty: u64,
-
-    /// Epoch of resolution.
-    pub resolved_at_epoch: u64,
-
-    /// Publisher's signature (any indexer can publish this proof).
-    pub publisher: PublicKey,
-    pub signature: Signature,
-}
-```
+Bad flaggers (those with low accuracy) have their flags ignored by indexers -- no economic penalty, just credibility loss. Once a flagger's accuracy drops below `MIN_FLAGGER_ACCURACY`, their flags are effectively invisible to the moderation system.
 
 ## Broader Community Review (`review.rs`)
 
@@ -737,7 +697,6 @@ pub struct FlagOverturnProof {
 /// Configuration constants for the review process.
 pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
 pub const MIN_REVIEW_VOTES: u32 = 5;   // Minimum votes for a decisive review
-pub const MIN_REVIEWER_R: u64 = 10;     // Minimum R to cast a review vote
 
 /// State machine for a review triggered by a counter-flag.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -746,8 +705,8 @@ pub enum ReviewState {
     Active {
         counter_flag_ref: ContentAddress,
         started_at_epoch: u64,
-        votes_uphold: Vec<(PublicKey, f64)>,   // (reviewer, sqrt_r weight)
-        votes_overturn: Vec<(PublicKey, f64)>,
+        votes_uphold: Vec<PublicKey>,
+        votes_overturn: Vec<PublicKey>,
     },
     /// Review period ended; outcome decided.
     Resolved {
@@ -764,14 +723,13 @@ pub enum ReviewState {
 pub enum ResolvedOutcome {
     /// Community upheld the flag.
     FlagUpheld {
-        uphold_score: f64,
-        overturn_score: f64,
+        uphold_count: u32,
+        overturn_count: u32,
     },
     /// Community overturned the flag.
     FlagOverturned {
-        uphold_score: f64,
-        overturn_score: f64,
-        flagger_r_penalty: u64,
+        uphold_count: u32,
+        overturn_count: u32,
     },
 }
 ```
@@ -783,7 +741,7 @@ pub enum ResolvedOutcome {
 pub fn resolve_review(
     counter_flag: &CounterFlag,
     review_votes: &[ReviewVote],
-    verified_r: &HashMap<PublicKey, u64>,
+    eligible_accounts: &HashSet<PublicKey>,
     current_epoch: u64,
 ) -> Result<ReviewState, ModerationError> {
     // Must be past review period
@@ -791,30 +749,28 @@ pub fn resolve_review(
         return Err(ModerationError::ReviewPeriodNotOver);
     }
 
-    let mut uphold_score = 0.0_f64;
-    let mut overturn_score = 0.0_f64;
+    let mut uphold_count = 0_u32;
+    let mut overturn_count = 0_u32;
     let mut votes_uphold = Vec::new();
     let mut votes_overturn = Vec::new();
     let mut unique_voters: HashSet<PublicKey> = HashSet::new();
 
     for vote in review_votes {
-        let r = verified_r.get(&vote.reviewer).copied().unwrap_or(0);
-        if r < MIN_REVIEWER_R {
+        if !eligible_accounts.contains(&vote.reviewer) {
             continue;
         }
         if !unique_voters.insert(vote.reviewer.clone()) {
             continue;
         }
 
-        let weight = (r as f64).sqrt();
         match vote.verdict {
             ReviewVerdict::UpholdFlag => {
-                uphold_score += weight;
-                votes_uphold.push((vote.reviewer.clone(), weight));
+                uphold_count += 1;
+                votes_uphold.push(vote.reviewer.clone());
             }
             ReviewVerdict::OverturnFlag => {
-                overturn_score += weight;
-                votes_overturn.push((vote.reviewer.clone(), weight));
+                overturn_count += 1;
+                votes_overturn.push(vote.reviewer.clone());
             }
         }
     }
@@ -826,24 +782,19 @@ pub fn resolve_review(
         });
     }
 
-    if overturn_score > uphold_score {
-        // Overturned: penalize the original flagger
-        let flagger_r_at_flag = counter_flag.contester_r_at_counter; // approximate
-        let penalty = compute_overturn_penalty(flagger_r_at_flag);
-
+    if overturn_count > uphold_count {
         Ok(ReviewState::Resolved {
             outcome: ResolvedOutcome::FlagOverturned {
-                uphold_score,
-                overturn_score,
-                flagger_r_penalty: penalty,
+                uphold_count,
+                overturn_count,
             },
             resolved_at_epoch: current_epoch,
         })
     } else {
         Ok(ReviewState::Resolved {
             outcome: ResolvedOutcome::FlagUpheld {
-                uphold_score,
-                overturn_score,
+                uphold_count,
+                overturn_count,
             },
             resolved_at_epoch: current_epoch,
         })
@@ -884,20 +835,17 @@ pub fn derive_review_vote_key(
 ## Constants
 
 ```rust
-/// Minimum R required to submit a content flag.
-pub const MIN_FLAGGER_R: u64 = 5;
+/// Minimum account age (in epochs) required to flag or review.
+pub const MIN_ACCOUNT_AGE_EPOCHS: u64 = 2;
 
-/// Minimum R required to cast a review vote.
-pub const MIN_REVIEWER_R: u64 = 10;
+/// Minimum number of donations required to flag or review.
+pub const MIN_DONATION_COUNT: u64 = 5;
 
 /// Number of epochs a review remains open for voting.
 pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
 
 /// Minimum number of unique review voters for a decisive outcome.
 pub const MIN_REVIEW_VOTES: u32 = 5;
-
-/// R penalty rate for overturned flags (basis points of flagger's R at flag time).
-pub const OVERTURN_R_PENALTY_BPS: u64 = 500;
 
 /// Flagger accuracy below which future flags are ignored.
 pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
@@ -914,35 +862,23 @@ pub const MAX_EXPLANATION_CHARS: usize = 512;
 /// Validate a content flag before accepting it.
 pub fn validate_flag(
     flag: &ContentFlag,
-    verified_r: &HashMap<PublicKey, u64>,
+    eligible_accounts: &HashSet<PublicKey>,
 ) -> Result<(), ModerationError> {
     // 1. Signature must verify
     if !flag.verify_signature() {
         return Err(ModerationError::InvalidSignature);
     }
 
-    // 2. Flagger must have sufficient R
-    let r = verified_r.get(&flag.flagger).copied().unwrap_or(0);
-    if r < MIN_FLAGGER_R {
-        return Err(ModerationError::InsufficientR {
-            have: r,
-            required: MIN_FLAGGER_R,
+    // 2. Flagger must be eligible
+    if !eligible_accounts.contains(&flag.flagger) {
+        return Err(ModerationError::NotEligible {
+            reason: "flagger is not eligible (must be invited, have sufficient account age, and sufficient donations)".to_string(),
         });
     }
 
     // 3. Cannot flag own content
     if flag.flagger == flag.post_author {
         return Err(ModerationError::CannotFlagOwnContent);
-    }
-
-    // 4. Self-reported R must approximately match verified R
-    // (Allow 10% tolerance for timing differences)
-    let tolerance = r / 10;
-    if flag.flagger_r_at_flag > r + tolerance {
-        return Err(ModerationError::RMismatch {
-            claimed: flag.flagger_r_at_flag,
-            verified: r,
-        });
     }
 
     Ok(())
@@ -989,14 +925,11 @@ pub enum ModerationError {
     #[error("invalid signature on moderation action")]
     InvalidSignature,
 
-    #[error("insufficient R for flagging: have {have}, required {required}")]
-    InsufficientR { have: u64, required: u64 },
+    #[error("not eligible: {reason}")]
+    NotEligible { reason: String },
 
     #[error("cannot flag own content")]
     CannotFlagOwnContent,
-
-    #[error("R mismatch: claimed {claimed}, verified {verified}")]
-    RMismatch { claimed: u64, verified: u64 },
 
     #[error("not the post author: only the post author can counter-flag")]
     NotPostAuthor,
@@ -1043,28 +976,29 @@ pub enum ModerationError {
 
 ### Flag Spam from Bots
 
-Bots have R = 0. They cannot flag (requires `R >= MIN_FLAGGER_R`). Even if they earned minimal R through the invitation system, `sqrt(low_R)` produces negligible weight. A single legitimate reviewer with moderate R outweighs hundreds of low-R flag-spammers.
+Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and have zero donations. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and make `MIN_DONATION_COUNT` donations before it can flag -- a meaningful cost that deters automated spam.
 
 ### Coordinated Flag Brigading
 
 A group conspires to flag legitimate content:
-- Each flagger's contribution is `sqrt(R)`, so amassing more flaggers has diminishing returns.
+- Each eligible flagger contributes exactly 1.0, so the damage is proportional to headcount.
 - The author counter-flags, triggering review.
 - Independent reviewers (not part of the brigade) vote to overturn.
-- Every brigade member who flagged loses R (5% each), making repeated brigading self-destructive.
+- Every brigade member who flagged loses accuracy, and once accuracy drops below `MIN_FLAGGER_ACCURACY`, their future flags are ignored entirely.
 - All flags are public and auditable, so brigading patterns are visible.
+- The eligibility threshold (invitations + account age + donations) makes it expensive to create many sockpuppet accounts for brigading.
 
 ### Retaliatory Flagging
 
 A user flags someone's content out of personal grudge:
-- A single flagger with moderate R may not reach the hide threshold (depending on indexer policy).
+- A single flagger contributes weight 1.0, which alone cannot reach the hide threshold (depending on indexer policy).
 - The author counter-flags, and community review corrects the injustice.
-- The retaliatory flagger loses R and accuracy, weakening future flags.
+- The retaliatory flagger loses accuracy, weakening future flags.
 
 ### Flag-to-Harass
 
 A user repeatedly flags a target's content:
-- Each overturn costs the flagger R.
+- Each overturn costs the flagger accuracy.
 - After accuracy drops below `MIN_FLAGGER_ACCURACY`, the flagger's future flags are ignored entirely.
 - The flagger effectively silences themselves, not their target.
 
@@ -1085,18 +1019,11 @@ A malicious indexer sets a hide threshold of 0 (hiding everything):
 ### `dsn-data`
 
 - Uses `GraphStore` trait to read/write flag, counter-flag, and review vote GraphEntries.
-- Uses `ChunkStore` to store flag explanations and `FlagOverturnProof` records.
-- Uses `ScratchpadStore` (via `dsn-token-r`) to read verified R balances.
-
-### `dsn-token-r`
-
-- Reads R balances to determine flagger eligibility and flag weight.
-- Produces `FlagOverturnProof` records that feed into R slashing.
-- The R penalty from overturned flags is applied via `dsn-token-r`'s slashing module.
+- Uses `ChunkStore` to store flag explanations.
 
 ### `dsn-indexer`
 
 - The indexer calls `aggregate_moderation_score()` during its crawl cycle.
+- The indexer computes the set of eligible accounts from on-chain data (invitation records, account creation epochs, donation counts) and passes it to the aggregation functions.
 - Applies its configured `ModerationPolicy` to decide visibility.
 - Maintains `FlaggerRecord` locally for reputation tracking.
-- Publishes `FlagOverturnProof` Chunks when reviews resolve.

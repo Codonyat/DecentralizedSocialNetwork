@@ -2,8 +2,8 @@
 members = [
     "crates/core",
     "crates/data",
+    "crates/chain",
     "crates/token-y",
-    "crates/token-r",
     "crates/invitation",
     "crates/moderation",
     "crates/indexer",
@@ -20,8 +20,8 @@ license = "MIT"
 # Internal crates
 dsn-core = { path = "crates/core" }
 dsn-data = { path = "crates/data" }
+dsn-chain = { path = "crates/chain" }
 dsn-token-y = { path = "crates/token-y" }
-dsn-token-r = { path = "crates/token-r" }
 dsn-invitation = { path = "crates/invitation" }
 dsn-moderation = { path = "crates/moderation" }
 dsn-indexer = { path = "crates/indexer" }

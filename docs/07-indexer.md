@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Autonomi is a content-addressed storage network with no built-in query capabilities. Clients cannot ask Autonomi "give me Alice's feed" or "search for posts about Rust." The indexer bridges this gap: it crawls Autonomi, builds queryable indices locally, and exposes a REST API for clients.
+Autonomi is a content-addressed storage network with no built-in query capabilities. Clients cannot ask Autonomi "give me Alice's feed" or "search for posts about Rust." The indexer bridges this gap: it listens to blockchain events, crawls Autonomi for content, builds queryable indices locally, and exposes a REST API for clients.
 
-Because ALL source data lives on Autonomi (immutable Chunks, signed Scratchpads, GraphEntries), any indexer output can be independently verified against the source. This makes indexers **verifiable**: clients can spot-check any result the indexer returns by fetching the underlying Autonomi data themselves.
+Because ALL source content lives on Autonomi (immutable Chunks, signed Scratchpads, GraphEntries) and all economic activity (bonds, donations, transfers, emissions) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: clients can spot-check any result the indexer returns by fetching the underlying Autonomi data or querying the blockchain themselves.
 
 Multiple competing indexers can run simultaneously. No single indexer can censor content without clients noticing — they simply switch to a different indexer or verify against Autonomi directly.
 
@@ -13,8 +13,9 @@ Multiple competing indexers can run simultaneously. No single indexer can censor
 ```
 crates/indexer/src/
 ├── lib.rs              # Re-exports, IndexerService construction
-├── config.rs           # Configuration: crawl frequency, moderation policy, storage paths
-├── crawler.rs          # Crawl loop: discover users, fetch data, follow links
+├── config.rs           # Configuration: crawl frequency, chain settings, moderation policy, storage paths
+├── chain_listener.rs   # Listens to blockchain events, populates local index
+├── crawler.rs          # Crawl loop: discover users, fetch content, follow links
 ├── store.rs            # Local index storage (SQLite-backed)
 ├── models.rs           # Internal data model: indexed posts, profiles, engagement
 ├── api/
@@ -23,22 +24,121 @@ crates/indexer/src/
 │   ├── profiles.rs     # GET /profiles/:user_pk — profile + stats
 │   ├── posts.rs        # GET /posts/:address — single post + thread
 │   ├── search.rs       # GET /search?q=... — full-text search
-│   ├── engagement.rs   # GET /engagement/:post_address — likes, curations, boosts
+│   ├── engagement.rs   # GET /engagement/:post_address — bonds, donations
 │   ├── moderation.rs   # GET /moderation/:post_address — flag status, verdicts
+│   ├── names.rs        # GET /names/:name — name resolution
 │   ├── spotcheck.rs    # GET /spotcheck/:post_address — raw Autonomi data for verification
 │   └── health.rs       # GET /health — indexer status, crawl stats
-├── watcher.rs          # Fraud/R/Y verification performed during crawl
-├── feed_builder.rs     # Feed ranking: chronological, curated, boosted
+├── feed_builder.rs     # Feed ranking: chronological, donated, bonded
 └── error.rs            # Indexer error types
 ```
 
+## Chain Listener (`chain_listener.rs`)
+
+The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (bonds, donations, emissions, transfers, invitations, name registrations).
+
+### Event Types
+
+The listener processes the following on-chain events:
+
+| Event | Description | Index Action |
+|---|---|---|
+| **Bond** | User bonds Y tokens to a post | `upsert_bond` |
+| **Donation** | User donates Y tokens to an author via a post | `upsert_donation` |
+| **Emission** | New Y tokens emitted to an address | Update user's `y_balance` |
+| **Transfer** | Y tokens transferred between users | Update sender/receiver `y_balance` |
+| **Invitation** | New user invited to the network | `ensure_user_known`, record invitation link |
+| **NameRegistration** | User registers or updates a name | `upsert_name` |
+
+### Reorg Handling
+
+The chain listener tracks a configurable **confirmation depth** (e.g., 12 blocks). Events are only considered final once they are buried under N confirmations. If the chain reorganizes:
+
+1. The listener detects that a previously seen block hash no longer matches the canonical chain.
+2. All events from reorged blocks are rolled back from the local index.
+3. The listener replays events from the new canonical chain starting at the fork point.
+
+```rust
+/// The main chain listener loop. Polls the blockchain for new events.
+pub async fn run_chain_listener(
+    index: Arc<dyn IndexStore>,
+    config: &ChainConfig,
+) -> Result<(), IndexerError> {
+    let provider = Provider::new(&config.rpc_url).await?;
+    let mut last_confirmed_block = index.last_indexed_block().await?.unwrap_or(config.start_block);
+
+    loop {
+        let latest_block = provider.get_block_number().await?;
+        let confirmed_up_to = latest_block.saturating_sub(config.confirmation_depth);
+
+        if confirmed_up_to > last_confirmed_block {
+            // Check for reorgs: verify stored block hashes match canonical chain
+            let fork_point = detect_reorg(&provider, &index, last_confirmed_block).await?;
+            if let Some(fork_block) = fork_point {
+                tracing::warn!(fork_block, "chain reorg detected, rolling back");
+                index.rollback_to_block(fork_block).await?;
+                last_confirmed_block = fork_block;
+            }
+
+            // Process new confirmed blocks
+            let events = fetch_events(
+                &provider,
+                &config.contract_address,
+                last_confirmed_block + 1,
+                confirmed_up_to,
+            ).await?;
+
+            for event in &events {
+                process_chain_event(&index, event).await?;
+            }
+
+            last_confirmed_block = confirmed_up_to;
+            index.update_last_indexed_block(confirmed_up_to).await?;
+        }
+
+        tokio::time::sleep(Duration::from_secs(config.chain_poll_interval_secs)).await;
+    }
+}
+
+/// Process a single blockchain event into the local index.
+async fn process_chain_event(
+    index: &Arc<dyn IndexStore>,
+    event: &ChainEvent,
+) -> Result<(), IndexerError> {
+    match event {
+        ChainEvent::Bond { user, post_address, amount, block_number } => {
+            index.upsert_bond(user, post_address, *amount, *block_number).await?;
+        }
+        ChainEvent::Donation { donor, post_address, author, amount, block_number } => {
+            index.upsert_donation(donor, post_address, author, *amount, *block_number).await?;
+        }
+        ChainEvent::Emission { recipient, amount, .. } => {
+            index.add_y_balance(recipient, *amount).await?;
+        }
+        ChainEvent::Transfer { from, to, amount, .. } => {
+            index.transfer_y_balance(from, to, *amount).await?;
+        }
+        ChainEvent::Invitation { inviter, invitee, .. } => {
+            index.ensure_user_known(invitee).await?;
+            index.record_invitation(inviter, invitee).await?;
+        }
+        ChainEvent::NameRegistration { user, name, .. } => {
+            index.upsert_name(user, name).await?;
+        }
+    }
+    Ok(())
+}
+```
+
 ## Crawler Design (`crawler.rs`)
+
+The crawler fetches content from Autonomi — profiles, posts, follow lists, and reply graphs. It does NOT handle any economic data (bonds, donations, balances, emissions); that is the chain listener's responsibility.
 
 ### Discovery Strategy
 
 The crawler maintains a set of **known public keys** (the user registry) and discovers new users through three channels:
 
-1. **Invitation graph traversal** — When the crawler encounters an invitation GraphEntry, it adds the invitee's public key to the known set. This is the primary discovery mechanism since all legitimate users enter through the invitation tree.
+1. **Chain listener events** — When the chain listener processes an Invitation event, it adds the invitee's public key to the known set. This is the primary discovery mechanism since all legitimate users enter through the invitation tree.
 
 2. **Follow list expansion** — When crawling a user's FollowList Scratchpad, any followed public key not yet known is added to the crawl queue. This catches users discovered through social links.
 
@@ -50,26 +150,17 @@ The crawler maintains a set of **known public keys** (the user registry) and dis
 /// The main crawl loop. Runs continuously with configurable sleep between cycles.
 pub async fn run_crawl_loop(
     storage: Arc<dyn Storage>,
-    index: Arc<IndexStore>,
+    index: Arc<dyn IndexStore>,
     config: &CrawlerConfig,
 ) -> Result<(), IndexerError> {
     loop {
         let cycle_start = Instant::now();
 
-        // 1. Discover new users from invitation graph
-        discover_new_users(storage.as_ref(), index.as_ref()).await?;
-
-        // 2. Crawl all known users (prioritized by staleness)
+        // 1. Crawl all known users (prioritized by staleness)
         let users = index.users_by_staleness().await?;
         for user_pk in &users {
             crawl_user(storage.as_ref(), index.as_ref(), user_pk, config).await?;
         }
-
-        // 3. Update epoch state
-        sync_epoch_state(storage.as_ref(), index.as_ref()).await?;
-
-        // 4. Run watcher checks on newly crawled data
-        run_watcher_cycle(storage.as_ref(), index.as_ref()).await?;
 
         let elapsed = cycle_start.elapsed();
         tracing::info!(elapsed_ms = elapsed.as_millis(), users = users.len(), "crawl cycle complete");
@@ -84,31 +175,26 @@ pub async fn run_crawl_loop(
 
 ### Per-User Crawl
 
-For each known user, the crawler fetches all their Scratchpads using derived key addresses:
+For each known user, the crawler fetches their content Scratchpads using derived key addresses:
 
 ```rust
-/// Crawl a single user's data from Autonomi.
+/// Crawl a single user's content data from Autonomi.
 async fn crawl_user(
     storage: &dyn Storage,
     index: &IndexStore,
     user_pk: &PublicKey,
     config: &CrawlerConfig,
 ) -> Result<(), IndexerError> {
-    // Fetch all Scratchpads in parallel (independent reads)
-    let (profile, feed_index, follow_list, like_list, curation_record, y_balance, r_balance) =
+    // Fetch content Scratchpads in parallel (independent reads)
+    let (profile, feed_index, follow_list) =
         tokio::try_join!(
             fetch_scratchpad(storage, user_pk, ContentType::UserProfile),
             fetch_scratchpad(storage, user_pk, ContentType::FeedIndex),
             fetch_scratchpad(storage, user_pk, ContentType::FollowList),
-            fetch_scratchpad(storage, user_pk, ContentType::LikeList),
-            fetch_scratchpad(storage, user_pk, ContentType::CurationRecord),
-            fetch_scratchpad(storage, user_pk, ContentType::YBalance),
-            fetch_scratchpad(storage, user_pk, ContentType::RBalance),
         )?;
 
     // Verify signatures on all fetched data
-    verify_all_signatures(user_pk, &profile, &feed_index, &follow_list,
-                          &like_list, &curation_record, &y_balance, &r_balance)?;
+    verify_all_signatures(user_pk, &profile, &feed_index, &follow_list)?;
 
     // Fetch new posts (only those not yet in the index)
     if let Some(feed) = &feed_index {
@@ -130,26 +216,8 @@ async fn crawl_user(
         index.upsert_reply_link(entry).await?;
     }
 
-    // Walk Y receipt chain incrementally (stop at last-verified receipt)
-    if let Some(y) = &y_balance {
-        let payload: YScratchpadPayload = bincode::deserialize(&y.data)?;
-        let receipts = walk_receipt_chain_incremental(
-            storage,
-            &payload.latest_receipt,
-            index.last_verified_receipt(user_pk).await?,
-        ).await?;
-        // Verify new receipts and update last-verified
-        if let Some(latest) = receipts.first() {
-            let latest_addr = ContentAddress::from_data(
-                &bincode::serialize(latest)?
-            );
-            index.update_last_verified_receipt(user_pk, &latest_addr).await?;
-        }
-    }
-
-    // Update index with latest user state
-    index.upsert_user(user_pk, &profile, &follow_list, &like_list,
-                      &curation_record, &y_balance, &r_balance).await?;
+    // Update index with latest user content state
+    index.upsert_user(user_pk, &profile, &follow_list).await?;
 
     // Queue newly discovered users from follow list
     if let Some(follows) = &follow_list {
@@ -164,7 +232,7 @@ async fn crawl_user(
 
 ### Incremental Crawling
 
-The indexer tracks the `version` field of each user's Scratchpads. On subsequent crawl cycles, it compares the stored version against the fetched version and only processes data that has changed. This avoids re-indexing unchanged profiles, follow lists, and balance states.
+The indexer tracks the `version` field of each user's Scratchpads. On subsequent crawl cycles, it compares the stored version against the fetched version and only processes data that has changed. This avoids re-indexing unchanged profiles and follow lists.
 
 ```rust
 /// Check if a Scratchpad has been updated since we last indexed it.
@@ -181,15 +249,15 @@ Users are crawled in priority order:
 |---|---|---|
 | **1 (highest)** | Never crawled | New user, need initial data |
 | **2** | Known Scratchpad writes since last crawl | Active user, likely has new content |
-| **3** | High R balance | Influential user, feeds depend on their curations |
+| **3** | High bond/donation volume | Heavily engaged user, feeds depend on their content |
 | **4** | High follower count | Popular user, many feeds reference their posts |
-| **5 (lowest)** | Idle, low R | Inactive user, unlikely to have new data |
+| **5 (lowest)** | Idle, low engagement | Inactive user, unlikely to have new data |
 
 ## Internal Data Model (`models.rs`, `store.rs`)
 
 ### What Gets Indexed
 
-The indexer builds a local relational index from Autonomi's flat key-value data. The local store uses SQLite for persistence across restarts.
+The indexer builds a local relational index from two sources: Autonomi's flat key-value content data, and on-chain economic events. The local store uses SQLite for persistence across restarts.
 
 ### Schema
 
@@ -198,6 +266,8 @@ The indexer builds a local relational index from Autonomi's flat key-value data.
 pub struct IndexedUser {
     /// Primary identity.
     pub public_key: PublicKey,
+    /// Registered name (from on-chain NameRegistration events).
+    pub registered_name: Option<String>,
     /// Latest profile data.
     pub display_name: String,
     pub bio: String,
@@ -207,17 +277,18 @@ pub struct IndexedUser {
     pub follower_count: u64,
     pub following_count: u64,
     pub post_count: u64,
-    pub like_count: u64,
-    /// Token state.
+    /// Trust distance from seed users in the invitation graph.
+    pub trust_distance: u32,
+    /// Token state (from on-chain events).
     pub y_balance: u64,
     pub y_nonce: u64,
-    pub r_balance: u64,
-    pub r_computed_at_epoch: u64,
+    /// Aggregate donation stats (from on-chain events).
+    pub total_donations_received: u64,
+    pub total_donations_given: u64,
     /// Invitation chain.
     pub invited_by: Option<PublicKey>,
     pub invitation_depth: u32,
     /// Moderation state.
-    pub fraud_proof: Option<ContentAddress>,
     pub active_flags: u32,
     /// Crawl metadata.
     pub last_crawled_at: chrono::DateTime<chrono::Utc>,
@@ -229,10 +300,6 @@ pub struct ScratchpadVersions {
     pub profile: u64,
     pub feed_index: u64,
     pub follow_list: u64,
-    pub like_list: u64,
-    pub curation_record: u64,
-    pub y_balance: u64,
-    pub r_balance: u64,
 }
 
 /// A fully indexed post record.
@@ -250,12 +317,12 @@ pub struct IndexedPost {
     pub sequence: u64,
     /// Timestamp (informational).
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Engagement metrics (denormalized).
-    pub like_count: u64,
-    pub curation_count: u64,
-    pub diversity_score: Option<f64>,
-    /// Boost state.
-    pub y_burned_boost: u64,
+    /// Bond metrics (from on-chain events).
+    pub total_bonded: u64,
+    pub bond_count: u64,
+    /// Donation metrics (from on-chain events).
+    pub total_donated: u64,
+    pub unique_donors: u32,
     /// Moderation state.
     pub flag_count: u32,
     pub moderation_verdict: Option<ModerationVerdict>,
@@ -264,22 +331,20 @@ pub struct IndexedPost {
 /// Engagement detail for a post.
 pub struct IndexedEngagement {
     pub post_address: ContentAddress,
-    pub likers: Vec<PublicKey>,
-    pub curations: Vec<IndexedCuration>,
-    pub boost_burns: Vec<IndexedBoost>,
+    pub bonds: Vec<IndexedBond>,
+    pub donations: Vec<IndexedDonation>,
 }
 
-pub struct IndexedCuration {
-    pub curator: PublicKey,
-    pub r_staked: u64,
-    pub y_staked: u64,
-    pub staked_at_epoch: u64,
-    pub outcome: Option<CurationOutcome>,
+pub struct IndexedBond {
+    pub bonder: PublicKey,
+    pub amount: u64,
+    pub block_number: u64,
 }
 
-pub struct IndexedBoost {
-    pub booster: PublicKey,
-    pub y_burned: u64,
+pub struct IndexedDonation {
+    pub donor: PublicKey,
+    pub amount: u64,
+    pub block_number: u64,
 }
 
 /// A thread is a root post plus all its nested replies.
@@ -294,25 +359,15 @@ pub struct IndexedThreadReply {
     pub parent_address: ContentAddress,
 }
 
-/// Epoch state tracked by the indexer.
-pub struct IndexedEpoch {
-    pub epoch: u64,
-    pub boundary_address: ContentAddress,
-    pub curation_count: u64,
-    pub total_r_earned: u64,
-    pub y_emission: u64,
-    pub publisher: PublicKey,
-}
-
 /// Moderation verdict as determined by this indexer's policy.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ModerationVerdict {
     /// No flags, content visible.
     Clean,
     /// Flagged but below threshold, content visible with warning.
-    Warned { flag_count: u32, flaggers_total_r: u64 },
+    Warned { flag_count: u32 },
     /// Flags exceed threshold, content hidden by this indexer.
-    Hidden { flag_count: u32, flaggers_total_r: u64 },
+    Hidden { flag_count: u32 },
 }
 ```
 
@@ -323,15 +378,14 @@ pub enum ModerationVerdict {
 | `users` | `public_key` | User profiles, stats, token balances |
 | `posts` | `address` | Post content, engagement counts |
 | `follows` | `(follower, followee)` | Follow relationships |
-| `likes` | `(liker, post_address)` | Like records |
-| `curations` | `(curator, post_address)` | Curation stakes and outcomes |
+| `bonds` | `(bonder, post_address, block_number)` | Bond records (from chain) |
+| `donations` | `(donor, post_address, block_number)` | Donation records (from chain) |
+| `names` | `name` | Name-to-public-key resolution (from chain) |
 | `reply_links` | `(parent_address, child_address)` | Thread structure |
 | `invitations` | `(inviter, invitee)` | Invitation graph |
 | `flags` | `(flagger, post_address)` | Content flags |
-| `fraud_proofs` | `offender` | Proven fraud |
-| `epochs` | `epoch` | Epoch boundaries |
-| `boost_burns` | `(booster, post_address)` | Y burn boosts |
-| `crawl_state` | `public_key` | Per-user crawl metadata (includes `last_verified_receipt` address) |
+| `chain_state` | singleton | Last indexed block number, block hashes for reorg detection |
+| `crawl_state` | `public_key` | Per-user crawl metadata |
 | `posts_fts` | (virtual) | Full-text search index on `posts.content` |
 
 ### Index Store Trait
@@ -343,15 +397,25 @@ pub enum ModerationVerdict {
 pub trait IndexStore: Send + Sync {
     // --- Write operations (used by crawler) ---
     async fn upsert_user(&self, pk: &PublicKey, profile: &Option<UserProfile>,
-                         follows: &Option<FollowList>, likes: &Option<LikeList>,
-                         curations: &Option<CurationRecord>,
-                         y: &Option<YScratchpadPayload>, r: &Option<RBalance>) -> Result<(), IndexerError>;
+                         follows: &Option<FollowList>) -> Result<(), IndexerError>;
     async fn upsert_post(&self, post: &SignedPost) -> Result<(), IndexerError>;
     async fn upsert_reply_link(&self, entry: &GraphEntryData) -> Result<(), IndexerError>;
     async fn ensure_user_known(&self, pk: &PublicKey) -> Result<(), IndexerError>;
-    async fn record_fraud_proof(&self, proof: &FraudProof) -> Result<(), IndexerError>;
     async fn update_moderation_verdict(&self, post: &ContentAddress,
                                         verdict: ModerationVerdict) -> Result<(), IndexerError>;
+
+    // --- Write operations (used by chain listener) ---
+    async fn upsert_bond(&self, user: &PublicKey, post: &ContentAddress,
+                         amount: u64, block_number: u64) -> Result<(), IndexerError>;
+    async fn upsert_donation(&self, donor: &PublicKey, post: &ContentAddress,
+                             author: &PublicKey, amount: u64, block_number: u64) -> Result<(), IndexerError>;
+    async fn upsert_name(&self, user: &PublicKey, name: &str) -> Result<(), IndexerError>;
+    async fn record_invitation(&self, inviter: &PublicKey, invitee: &PublicKey) -> Result<(), IndexerError>;
+    async fn add_y_balance(&self, user: &PublicKey, amount: u64) -> Result<(), IndexerError>;
+    async fn transfer_y_balance(&self, from: &PublicKey, to: &PublicKey, amount: u64) -> Result<(), IndexerError>;
+    async fn rollback_to_block(&self, block_number: u64) -> Result<(), IndexerError>;
+    async fn last_indexed_block(&self) -> Result<Option<u64>, IndexerError>;
+    async fn update_last_indexed_block(&self, block_number: u64) -> Result<(), IndexerError>;
 
     // --- Read operations (used by API) ---
     async fn get_user(&self, pk: &PublicKey) -> Result<Option<IndexedUser>, IndexerError>;
@@ -364,13 +428,12 @@ pub trait IndexStore: Send + Sync {
     async fn search_posts(&self, query: &str, cursor: Option<u64>,
                           limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
     async fn get_engagement(&self, post: &ContentAddress) -> Result<IndexedEngagement, IndexerError>;
+    async fn get_bonds_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedBond>, IndexerError>;
+    async fn get_donations_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedDonation>, IndexerError>;
     async fn get_moderation_status(&self, post: &ContentAddress) -> Result<ModerationVerdict, IndexerError>;
     async fn get_flagged_posts(&self, min_flags: u32, cursor: Option<u64>,
                                 limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
-
-    // --- Receipt chain tracking ---
-    async fn last_verified_receipt(&self, pk: &PublicKey) -> Result<Option<ContentAddress>, IndexerError>;
-    async fn update_last_verified_receipt(&self, pk: &PublicKey, receipt: &ContentAddress) -> Result<(), IndexerError>;
+    async fn resolve_name(&self, name: &str) -> Result<Option<PublicKey>, IndexerError>;
 
     // --- Crawl coordination ---
     async fn users_by_staleness(&self) -> Result<Vec<PublicKey>, IndexerError>;
@@ -381,10 +444,11 @@ pub trait IndexStore: Send + Sync {
 pub struct CrawlStats {
     pub total_users: u64,
     pub total_posts: u64,
-    pub total_epochs: u64,
+    pub total_bonds: u64,
+    pub total_donations: u64,
     pub last_crawl_completed: Option<chrono::DateTime<chrono::Utc>>,
     pub last_crawl_duration_ms: u64,
-    pub fraud_proofs_found: u64,
+    pub last_indexed_block: u64,
 }
 ```
 
@@ -399,15 +463,15 @@ Clients choose a ranking strategy when requesting feeds. The indexer supports mu
 pub enum FeedRanking {
     /// Reverse chronological. No algorithmic sorting.
     Chronological,
-    /// Weighted by DiversityScore (curated quality signal).
-    Curated,
-    /// Weighted by Y burn boosts (paid visibility).
-    Boosted,
-    /// Combined: Curated score + recency + boost, with configurable weights.
+    /// Weighted by donation volume and donor diversity.
+    Donated,
+    /// Weighted by bond volume (staked visibility).
+    Bonded,
+    /// Combined: donations + bonds + recency, with configurable weights.
     Blended {
         recency_weight: f64,
-        curation_weight: f64,
-        boost_weight: f64,
+        donation_weight: f64,
+        bond_weight: f64,
     },
 }
 ```
@@ -447,17 +511,16 @@ pub fn blended_score(
     let age_hours = (now - post.created_at).num_hours().max(0) as f64;
     let recency = (-age_hours / 24.0).exp();
 
-    // Curation: log-scaled DiversityScore
-    let curation = post.diversity_score
-        .map(|ds| (1.0 + ds).ln())
-        .unwrap_or(0.0);
+    // Donation signal: log-scaled total donated, weighted by donor diversity
+    let donation = (1.0 + post.total_donated as f64).ln()
+        * (1.0 + post.unique_donors as f64).ln();
 
-    // Boost: log-scaled Y burned
-    let boost = (1.0 + post.y_burned_boost as f64).ln();
+    // Bond signal: log-scaled total bonded
+    let bond = (1.0 + post.total_bonded as f64).ln();
 
     recency * weights.recency_weight
-        + curation * weights.curation_weight
-        + boost * weights.boost_weight
+        + donation * weights.donation_weight
+        + bond * weights.bond_weight
 }
 ```
 
@@ -497,6 +560,7 @@ GET /api/v1/profiles/:user_pk
 Response:
 {
     "public_key": "hex...",
+    "registered_name": "alice" | null,
     "display_name": "Alice",
     "bio": "...",
     "avatar": "content_address_hex or null",
@@ -504,9 +568,10 @@ Response:
     "following_count": 15,
     "post_count": 128,
     "y_balance": 5000,
-    "r_balance": 250,
-    "invited_by": "hex or null",
-    "fraud_proof": null
+    "trust_distance": 2,
+    "total_donations_received": 12000,
+    "total_donations_given": 3500,
+    "invited_by": "hex or null"
 }
 ```
 
@@ -540,7 +605,7 @@ GET /api/v1/posts/:content_address
 Response:
 {
     "post": IndexedPost,
-    "author_profile": { "display_name": "...", "r_balance": 250 }
+    "author_profile": { "display_name": "...", "registered_name": "alice" | null }
 }
 ```
 
@@ -586,23 +651,97 @@ GET /api/v1/engagement/:post_address
 Response:
 {
     "post_address": "hex...",
-    "like_count": 15,
-    "likers": ["pk_hex_1", "pk_hex_2", ...],
-    "curation_count": 3,
-    "curations": [
+    "total_bonded": 1500,
+    "bond_count": 3,
+    "bonds": [
         {
-            "curator": "pk_hex",
-            "r_staked": 50,
-            "y_staked": 100,
-            "staked_at_epoch": 12,
-            "outcome": "Success" | "Failure" | null
+            "bonder": "pk_hex",
+            "amount": 500,
+            "block_number": 12345
         }
     ],
-    "diversity_score": 24.5,
-    "boost_burns": [
-        { "booster": "pk_hex", "y_burned": 500 }
+    "total_donated": 2000,
+    "unique_donors": 8,
+    "donations": [
+        {
+            "donor": "pk_hex",
+            "amount": 250,
+            "block_number": 12340
+        }
+    ]
+}
+```
+
+### Names
+
+```
+GET /api/v1/names/:name
+
+Response:
+{
+    "name": "alice",
+    "public_key": "hex...",
+    "display_name": "Alice",
+    "registered_block": 10500
+}
+```
+
+### Bonds and Donations per User/Post
+
+```
+GET /api/v1/users/:pk/bonds?cursor=0&limit=20
+
+Response:
+{
+    "bonds": [
+        {
+            "post_address": "hex...",
+            "amount": 500,
+            "block_number": 12345
+        }
     ],
-    "total_y_burned": 500
+    "next_cursor": 20,
+    "has_more": false
+}
+```
+
+```
+GET /api/v1/users/:pk/donations?cursor=0&limit=20
+
+Response:
+{
+    "donations": [
+        {
+            "post_address": "hex...",
+            "author": "pk_hex",
+            "amount": 250,
+            "block_number": 12340
+        }
+    ],
+    "next_cursor": 20,
+    "has_more": false
+}
+```
+
+```
+GET /api/v1/posts/:addr/bonds?cursor=0&limit=20
+
+Response:
+{
+    "bonds": [IndexedBond],
+    "next_cursor": 20,
+    "has_more": false
+}
+```
+
+```
+GET /api/v1/posts/:addr/donations?cursor=0&limit=20
+
+Response:
+{
+    "donations": [IndexedDonation],
+    "next_cursor": 20,
+    "has_more": false
 }
 ```
 
@@ -616,11 +755,9 @@ Response:
     "post_address": "hex...",
     "verdict": "Clean" | "Warned" | "Hidden",
     "flag_count": 2,
-    "flaggers_total_r": 180,
     "flags": [
         {
             "flagger": "pk_hex",
-            "flagger_r": 100,
             "reason_hash": "hex..."
         }
     ],
@@ -649,71 +786,23 @@ Response:
 ```
 
 ```
-GET /api/v1/spotcheck/balance/:user_pk/y
-
-Response:
-{
-    "indexed_y_balance": 5000,
-    "indexed_y_nonce": 42,
-    "receipt_chain_depth": 42,
-    "latest_receipt_address": "hex...",
-    "autonomi_proof": {
-        "raw_scratchpad_data_b64": "base64...",
-        "y_balance_from_source": 5000,
-        "y_nonce_from_source": 42,
-        "signature_valid": true,
-        "hash_chain_valid": true,
-        "receipt_chain_valid": true
-    },
-    "match": true
-}
-```
-
-```
-GET /api/v1/spotcheck/balance/:user_pk/r
-
-Response:
-{
-    "indexed_r_balance": 250,
-    "autonomi_proof": {
-        "raw_scratchpad_data_b64": "base64...",
-        "r_balance_from_source": 250,
-        "r_computed_at_epoch": 15,
-        "signature_valid": true,
-        "recomputed_r": 250,
-        "recomputation_matches": true
-    },
-    "match": true
-}
-```
-
-```
 GET /api/v1/spotcheck/engagement/:post_address
 
 Response:
 {
-    "indexed_like_count": 15,
-    "sampled_likers": [
-        {
-            "liker_pk": "hex...",
-            "found_in_autonomi_like_list": true
-        },
-        ...
-    ],
-    "indexed_curation_count": 3,
-    "sampled_curations": [
-        {
-            "curator_pk": "hex...",
-            "found_in_autonomi_curation_record": true
-        },
-        ...
-    ],
-    "sample_size": 5,
-    "all_samples_verified": true
+    "indexed_bond_count": 3,
+    "indexed_donation_count": 8,
+    "chain_proof": {
+        "bonds_on_chain": 3,
+        "donations_on_chain": 8,
+        "bonds_match": true,
+        "donations_match": true
+    },
+    "match": true
 }
 ```
 
-The spot-check API lets any client verify that the indexer is not fabricating or omitting data. For engagement metrics, the indexer samples a subset of claimed likers/curators and provides proof that they exist in the source Autonomi data.
+The spot-check API lets any client verify that the indexer is not fabricating or omitting data. For content, the indexer provides the raw Autonomi data. For engagement metrics, the indexer's counts can be verified against on-chain events.
 
 ### Health
 
@@ -727,10 +816,11 @@ Response:
     "crawl_stats": {
         "total_users": 1250,
         "total_posts": 48000,
-        "total_epochs": 16,
+        "total_bonds": 5200,
+        "total_donations": 31000,
         "last_crawl_completed": "2026-03-03T12:00:00Z",
         "last_crawl_duration_ms": 45000,
-        "fraud_proofs_found": 2
+        "last_indexed_block": 128500
     },
     "moderation_policy": "default-v1",
     "uptime_seconds": 86400
@@ -753,16 +843,21 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         // Posts & Threads
         .route("/api/v1/posts/:address", get(posts::get_post))
         .route("/api/v1/posts/:address/thread", get(posts::get_thread))
+        .route("/api/v1/posts/:address/bonds", get(engagement::get_post_bonds))
+        .route("/api/v1/posts/:address/donations", get(engagement::get_post_donations))
         // Search
         .route("/api/v1/search", get(search::search_posts))
+        // Names
+        .route("/api/v1/names/:name", get(names::resolve_name))
+        // Users — bonds & donations
+        .route("/api/v1/users/:pk/bonds", get(engagement::get_user_bonds))
+        .route("/api/v1/users/:pk/donations", get(engagement::get_user_donations))
         // Engagement
         .route("/api/v1/engagement/:address", get(engagement::get_engagement))
         // Moderation
         .route("/api/v1/moderation/:address", get(moderation::get_status))
         // Spot-check
         .route("/api/v1/spotcheck/post/:address", get(spotcheck::verify_post))
-        .route("/api/v1/spotcheck/balance/:user_pk/y", get(spotcheck::verify_y_balance))
-        .route("/api/v1/spotcheck/balance/:user_pk/r", get(spotcheck::verify_r_balance))
         .route("/api/v1/spotcheck/engagement/:address", get(spotcheck::verify_engagement))
         // Health
         .route("/api/v1/health", get(health::health_check))
@@ -780,117 +875,6 @@ pub struct AppState {
 }
 ```
 
-## Watcher Integration (`watcher.rs`)
-
-The indexer is a **full watcher** by default. During every crawl cycle, it performs verification checks on the data it ingests. This is not a separate process -- it is integrated into the crawl pipeline.
-
-### What the Watcher Verifies
-
-| Check | When | Action on Failure |
-|---|---|---|
-| **Post signature** | On every post fetch | Skip post, log warning |
-| **Profile signature** | On every profile fetch | Skip profile update, log warning |
-| **Y balance signature** | On every Y Scratchpad fetch | Flag user, log error |
-| **Y hash chain integrity** | On every Y Scratchpad fetch | Walk receipt chain from `latest_receipt`; flag user, generate fraud proof if fork detected |
-| **Y nonce monotonicity** | On every Y Scratchpad fetch | Flag user, investigate for double-spend |
-| **Receipt chain completeness** | On every Y Scratchpad fetch | Flag user if receipt chain has gaps or missing genesis |
-| **R balance correctness** | Periodically (configurable) | Record discrepancy, mark R as unverified |
-| **Claim amount correctness** | On every new epoch claim | Flag overclaim, publish fraud proof |
-| **Double-spend detection** | On every Y balance update | Publish fraud proof as immutable Chunk |
-| **Invitation chain validity** | On new user discovery | Reject user if invitation is invalid |
-| **Content flag aggregation** | On every flag GraphEntry | Update moderation verdict per policy |
-
-### Watcher Cycle
-
-```rust
-/// Run watcher verification on recently crawled data.
-pub async fn run_watcher_cycle(
-    storage: &dyn Storage,
-    index: &IndexStore,
-) -> Result<WatcherReport, IndexerError> {
-    let mut report = WatcherReport::default();
-
-    // 1. Check all Y balances updated since last watcher cycle
-    let updated_y_users = index.users_with_updated_y_since_last_watch().await?;
-    for user_pk in &updated_y_users {
-        let verdict = verify_y_balance(storage, user_pk).await?;
-        match verdict {
-            WatcherVerdict::Valid => report.y_valid += 1,
-            WatcherVerdict::FraudDetected(proof) => {
-                // Publish fraud proof to Autonomi (permanent record)
-                let proof_bytes = bincode::serialize(&proof)?;
-                storage.put(&proof_bytes).await?;
-                index.record_fraud_proof(&proof).await?;
-                report.fraud_proofs_published += 1;
-                tracing::error!(offender = ?proof.offender, "FRAUD PROOF PUBLISHED");
-            }
-            other => {
-                tracing::warn!(user = ?user_pk, verdict = ?other, "Y balance verification failed");
-                report.y_invalid += 1;
-            }
-        }
-    }
-
-    // 2. Spot-check R balances (random sample per cycle)
-    let sample = index.random_user_sample(config.r_spotcheck_sample_size).await?;
-    for user_pk in &sample {
-        let r_verdict = verify_r_balance(storage, user_pk).await?;
-        match r_verdict {
-            RVerdict::Valid => report.r_valid += 1,
-            RVerdict::Invalid { claimed, correct } => {
-                tracing::warn!(
-                    user = ?user_pk, claimed, correct,
-                    "R balance mismatch"
-                );
-                report.r_mismatches += 1;
-                // R mismatches are not fraud (R is self-claimed) but the indexer
-                // uses the recomputed value for its own rankings
-                index.override_r_balance(user_pk, correct).await?;
-            }
-        }
-    }
-
-    // 3. Verify epoch claims
-    let latest_epoch = index.latest_epoch().await?;
-    if let Some(epoch) = latest_epoch {
-        let claim_verdicts = verify_epoch_claims(storage, epoch.epoch).await?;
-        for verdict in &claim_verdicts {
-            match verdict {
-                ClaimVerdict::Overclaim { claimer, claimed, correct } => {
-                    tracing::error!(
-                        claimer = ?claimer, claimed, correct,
-                        "Y overclaim detected"
-                    );
-                    report.overclaims += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(report)
-}
-
-#[derive(Default)]
-pub struct WatcherReport {
-    pub y_valid: u64,
-    pub y_invalid: u64,
-    pub r_valid: u64,
-    pub r_mismatches: u64,
-    pub fraud_proofs_published: u64,
-    pub overclaims: u64,
-}
-```
-
-### R Balance Override Strategy
-
-Since R is deterministically computable, the indexer does NOT blindly trust the R value in a user's Scratchpad. The indexer:
-
-1. Reads the self-claimed R balance from the Scratchpad
-2. Periodically recomputes R from scratch using `compute_r_from_scratch()` from `dsn-token-r`
-3. Uses the **recomputed value** for feed ranking and API responses
-4. Reports discrepancies but does not publish fraud proofs for R (R is self-claimed, not a fraud-proof-able offense -- the indexer simply ignores incorrect values)
-
 ## Configuration (`config.rs`)
 
 ```rust
@@ -901,6 +885,9 @@ pub struct IndexerConfig {
     pub bind_address: String,          // default: "0.0.0.0:3000"
     /// Port for the REST API.
     pub bind_port: u16,                // default: 3000
+
+    /// Blockchain settings.
+    pub chain: ChainConfig,
 
     /// Crawler settings.
     pub crawler: CrawlerConfig,
@@ -916,6 +903,24 @@ pub struct IndexerConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// RPC endpoint for the blockchain node.
+    pub rpc_url: String,               // e.g. "https://rpc.example.com"
+
+    /// Contract address for DSN events.
+    pub contract_address: String,      // e.g. "0xabc..."
+
+    /// How often to poll for new blocks, in seconds.
+    pub chain_poll_interval_secs: u64, // default: 12
+
+    /// Block number to start indexing from.
+    pub start_block: u64,              // default: 0
+
+    /// Number of confirmations before considering events final.
+    pub confirmation_depth: u64,       // default: 12
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CrawlerConfig {
     /// Duration between crawl cycles.
     pub crawl_interval: Duration,      // default: 60 seconds
@@ -927,13 +932,6 @@ pub struct CrawlerConfig {
     /// Maximum number of concurrent Autonomi reads.
     pub max_concurrent_reads: usize,   // default: 50
 
-    /// Number of R balances to spot-check per cycle.
-    pub r_spotcheck_sample_size: usize, // default: 100
-
-    /// Whether to publish fraud proofs when detected.
-    /// Operators may disable this if they want read-only mode.
-    pub publish_fraud_proofs: bool,    // default: true
-
     /// Seed users: public keys to bootstrap discovery.
     /// At least one seed user is needed for a fresh indexer.
     pub seed_users: Vec<String>,       // hex-encoded public keys
@@ -944,17 +942,14 @@ pub struct ModerationPolicyConfig {
     /// Policy name (for display in /health endpoint).
     pub policy_name: String,           // default: "default-v1"
 
-    /// Minimum total R of flaggers required to trigger a "Warned" verdict.
-    pub warn_threshold_r: u64,         // default: 50
+    /// Minimum number of flags required to trigger a "Warned" verdict.
+    pub warn_threshold_flags: u32,     // default: 3
 
-    /// Minimum total R of flaggers required to trigger a "Hidden" verdict.
-    pub hide_threshold_r: u64,         // default: 200
+    /// Minimum number of flags required to trigger a "Hidden" verdict.
+    pub hide_threshold_flags: u32,     // default: 10
 
-    /// Minimum number of unique flaggers required (regardless of R).
+    /// Minimum number of unique flaggers required (regardless of count).
     pub min_unique_flaggers: u32,      // default: 3
-
-    /// Whether to hide posts from users with active fraud proofs.
-    pub hide_fraudulent_users: bool,   // default: true
 
     /// Custom blocked public keys (operator-level override).
     /// Posts from these users are always hidden.
@@ -989,22 +984,26 @@ bind_address = "0.0.0.0"
 bind_port = 3000
 db_path = "./indexer.db"
 
+[chain]
+rpc_url = "https://rpc.example.com"
+contract_address = "0xabc123..."
+chain_poll_interval_secs = 12
+start_block = 0
+confirmation_depth = 12
+
 [crawler]
 crawl_interval_secs = 60
 max_users_per_cycle = 0
 max_concurrent_reads = 50
-r_spotcheck_sample_size = 100
-publish_fraud_proofs = true
 seed_users = [
     "a1b2c3d4..."
 ]
 
 [moderation]
 policy_name = "default-v1"
-warn_threshold_r = 50
-hide_threshold_r = 200
+warn_threshold_flags = 3
+hide_threshold_flags = 10
 min_unique_flaggers = 3
-hide_fraudulent_users = true
 blocked_users = []
 blocked_posts = []
 ```
@@ -1016,7 +1015,7 @@ Each indexer operator chooses their own moderation policy. This is a feature, no
 - **Strict indexers** may set low thresholds and aggressively hide flagged content
 - **Permissive indexers** may set high thresholds and show everything
 - **Community indexers** may maintain curated block lists for specific communities
-- **Unmoderated indexers** may disable moderation entirely (set thresholds to `u64::MAX`)
+- **Unmoderated indexers** may disable moderation entirely (set thresholds to `u32::MAX`)
 
 Clients choose which indexer to use based on the moderation policy they prefer. The `/health` endpoint exposes the policy name so clients can make informed choices.
 
@@ -1034,11 +1033,17 @@ pub enum IndexerError {
     #[error("database error: {0}")]
     Database(String),
 
+    #[error("chain listener error: {0}")]
+    ChainError(String),
+
     #[error("user not found: {pk}")]
     UserNotFound { pk: String },
 
     #[error("post not found: {address}")]
     PostNotFound { address: String },
+
+    #[error("name not found: {name}")]
+    NameNotFound { name: String },
 
     #[error("invalid public key: {0}")]
     InvalidPublicKey(String),
@@ -1048,9 +1053,6 @@ pub enum IndexerError {
 
     #[error("crawl error for user {user}: {reason}")]
     CrawlError { user: String, reason: String },
-
-    #[error("watcher error: {0}")]
-    WatcherError(String),
 
     #[error("configuration error: {0}")]
     ConfigError(String),
@@ -1072,7 +1074,7 @@ impl IndexerError {
     /// Map to an HTTP status code for API responses.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::UserNotFound { .. } | Self::PostNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::UserNotFound { .. } | Self::PostNotFound { .. } | Self::NameNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidPublicKey(_) | Self::InvalidContentAddress(_) => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1091,7 +1093,7 @@ pub struct ApiErrorResponse {
 ## Service Entrypoint (`lib.rs`)
 
 ```rust
-/// The top-level indexer service. Owns the crawler, index store, and API server.
+/// The top-level indexer service. Owns the chain listener, crawler, index store, and API server.
 pub struct IndexerService {
     config: IndexerConfig,
     storage: Arc<dyn Storage>,
@@ -1102,8 +1104,16 @@ impl IndexerService {
     /// Create a new indexer service with the given configuration.
     pub async fn new(config: IndexerConfig) -> Result<Self, IndexerError>;
 
-    /// Start the indexer: launches the crawl loop and API server concurrently.
+    /// Start the indexer: launches the chain listener, crawl loop, and API server concurrently.
     pub async fn run(&self) -> Result<(), IndexerError> {
+        let chain_handle = tokio::spawn({
+            let index = self.index.clone();
+            let config = self.config.chain.clone();
+            async move {
+                run_chain_listener(index, &config).await
+            }
+        });
+
         let crawler_handle = tokio::spawn({
             let storage = self.storage.clone();
             let index = self.index.clone();
@@ -1124,8 +1134,11 @@ impl IndexerService {
             }
         });
 
-        // Both tasks run indefinitely. If either exits, shut down.
+        // All three tasks run indefinitely. If any exits, shut down.
         tokio::select! {
+            result = chain_handle => {
+                tracing::error!("chain listener exited: {:?}", result);
+            }
             result = crawler_handle => {
                 tracing::error!("crawler exited: {:?}", result);
             }
@@ -1145,9 +1158,9 @@ The indexer is an **untrusted convenience layer**. Its trust model is:
 
 | Property | Guarantee |
 |---|---|
-| **Data integrity** | Every indexed item traces back to a signed Autonomi object. Clients can verify any item via the spot-check API or by reading Autonomi directly. |
+| **Data integrity** | Every indexed content item traces back to a signed Autonomi object. Every indexed economic event traces back to an on-chain transaction. Clients can verify any item via the spot-check API, by reading Autonomi directly, or by querying the blockchain. |
 | **Completeness** | NOT guaranteed. An indexer may omit posts (censorship). Clients detect this by querying multiple indexers or checking a user's FeedIndex Scratchpad directly. |
 | **Ranking fairness** | NOT guaranteed. An indexer may bias feed rankings. Clients can request `Chronological` ranking as a neutral baseline. |
 | **Moderation accuracy** | Subjective by design. Each indexer applies its own moderation policy. Clients choose the indexer whose policy they agree with. |
-| **Fraud detection** | Best-effort. Indexers as full watchers increase fraud detection probability. Multiple indexers running simultaneously make fraud nearly impossible to hide. |
-| **Availability** | NOT guaranteed by any single indexer. Multiple competing indexers provide redundancy. The source data on Autonomi is always available independently. |
+| **Economic accuracy** | On-chain events are the source of truth for bonds, donations, emissions, and transfers. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
+| **Availability** | NOT guaranteed by any single indexer. Multiple competing indexers provide redundancy. The source data on Autonomi and the blockchain is always available independently. |

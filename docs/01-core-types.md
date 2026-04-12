@@ -8,11 +8,12 @@ crates/core/src/
 ├── identity.rs         # BLS key wrappers, user identity
 ├── post.rs             # Post, reply, thread types
 ├── profile.rs          # User profile
-├── social.rs           # Follow, like, curation stake types
-├── token.rs            # Y balance, R balance, transfer types
-├── epoch.rs            # Event-based epoch definitions
+├── social.rs           # Follow list, feed index
+├── token.rs            # Bond, Donation, NameRegistration (on-chain types)
+├── epoch.rs            # Block-based epoch definitions, emission schedule
+├── chain_events.rs     # ChainEvent enum (smart contract events)
 ├── crypto.rs           # Hashing, signing helpers
-├── address.rs          # Content addresses, Scratchpad addresses
+├── address.rs          # Content addresses, key addresses
 └── error.rs            # Shared error types
 ```
 
@@ -39,13 +40,15 @@ pub struct SecretKey(pub [u8; 32]);
 pub struct Signature(pub [u8; 96]);
 
 /// A user identity combining key material with a human-readable handle.
-/// The handle is NOT unique or verified — it's purely cosmetic.
-/// The PublicKey is the only canonical identity.
+/// The display_name is purely cosmetic. The PublicKey is the only canonical identity.
+/// An optional `registered_name` can be claimed on-chain via NameRegistration
+/// (unique, verified, costs Y to register).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub public_key: PublicKey,
-    pub display_name: String,   // max 64 chars
-    pub bio: String,            // max 256 chars
+    pub display_name: String,           // max 64 chars, cosmetic
+    pub bio: String,                    // max 256 chars
+    pub registered_name: Option<String>, // on-chain unique name, if registered
 }
 ```
 
@@ -62,7 +65,7 @@ impl SecretKey {
     /// Sign arbitrary bytes.
     pub fn sign(&self, message: &[u8]) -> Signature;
 
-    /// Derive a child key for a specific purpose (e.g., "y-balance", "curation").
+    /// Derive a child key for a specific purpose (e.g., "feed", "profile").
     /// Uses HKDF or similar KDF.
     pub fn derive_child(&self, purpose: &[u8]) -> SecretKey;
 
@@ -101,7 +104,7 @@ This is NOT cryptographically secure — it's structurally correct for testing p
 
 ```rust
 /// Content-addressed location (32 bytes, like Autonomi's XorName).
-/// Used for immutable data (Chunks).
+/// Used for immutable data (Chunks on IPFS/Autonomi).
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentAddress(pub [u8; 32]);
 
@@ -135,7 +138,7 @@ impl From<&PublicKey> for KeyAddress {
 
 ```rust
 /// A single post (analogous to a tweet).
-/// Stored as an immutable Chunk on Autonomi.
+/// Stored as an immutable Chunk on IPFS/Autonomi (off-chain content storage).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Post {
     /// Author's public key.
@@ -152,6 +155,10 @@ pub struct Post {
 
     /// Timestamp (informational, not trusted for protocol logic).
     pub created_at: chrono::DateTime<chrono::Utc>,
+
+    /// The amount of Y the author bonds on this post at creation time.
+    /// This is the mandatory first bond — recorded on-chain via a Bond transaction.
+    pub initial_bond_amount: u64,
 
     /// BLS signature over all fields above.
     pub signature: Signature,
@@ -175,6 +182,7 @@ impl Post {
         content: String,
         reply_to: Option<ContentAddress>,
         sequence: u64,
+        initial_bond_amount: u64,
     ) -> Self;
 
     /// Verify the post's signature.
@@ -195,12 +203,13 @@ impl Post {
 - `signature` must verify against `author` and `signable_bytes()`
 - `sequence` must be strictly greater than the author's last known sequence
 - `reply_to`, if present, must reference an existing post
+- `initial_bond_amount > 0` (every post must have a non-zero creator bond)
 
 ## Profile Types (`profile.rs`)
 
 ```rust
-/// User profile stored in a Scratchpad.
-/// Mutable — user can update freely.
+/// User profile stored in a Scratchpad (off-chain, mutable).
+/// User can update freely.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     /// The owner's public key (also the Scratchpad address).
@@ -226,7 +235,7 @@ pub struct UserProfile {
 ## Social Types (`social.rs`)
 
 ```rust
-/// A user's follow list, stored in a Scratchpad.
+/// A user's follow list, stored in a Scratchpad (off-chain).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FollowList {
     pub owner: PublicKey,
@@ -235,7 +244,7 @@ pub struct FollowList {
     pub signature: Signature,
 }
 
-/// A user's feed index, stored in a Scratchpad.
+/// A user's feed index, stored in a Scratchpad (off-chain).
 /// Maps to the last N posts by this user (rolling window).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FeedIndex {
@@ -246,191 +255,122 @@ pub struct FeedIndex {
     pub version: u64,
     pub signature: Signature,
 }
-
-/// A user's like list, stored in a Scratchpad.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct LikeList {
-    pub owner: PublicKey,
-    pub likes: Vec<LikeEntry>,
-    pub version: u64,
-    pub signature: Signature,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct LikeEntry {
-    pub post_address: ContentAddress,
-    pub liked_at_sequence: u64, // author's like sequence counter
-}
-
-/// A curation stake record (user stakes R on a post).
-/// Stored in user's curation Scratchpad.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CurationStake {
-    /// The post being curated.
-    pub post_address: ContentAddress,
-    /// Amount of R staked.
-    pub r_staked: u64,
-    /// Optional: amount of Y staked alongside R (amplifier).
-    pub y_staked: u64,
-    /// Epoch number when stake was placed.
-    pub staked_at_epoch: u64,
-    /// Author's curation sequence counter.
-    pub sequence: u64,
-}
-
-/// A user's full curation record, stored in a Scratchpad.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CurationRecord {
-    pub owner: PublicKey,
-    pub stakes: Vec<CurationStake>,
-    pub version: u64,
-    pub signature: Signature,
-}
 ```
 
 ## Token Types (`token.rs`)
 
+All token operations happen on-chain via smart contracts. These types represent the on-chain data structures that the smart contract manages. Token Y is the sole token — there is no separate reputation token.
+
 ```rust
-/// Token Y balance stored in a Scratchpad (plaintext mode for public verifiability).
+/// A bond placed on a post (on-chain).
+/// Bonds are the primary curation signal. Bonding Y on a post signals
+/// belief in its quality. A fraction of the bond is burned (deflationary).
 #[derive(Clone, Serialize, Deserialize)]
-pub struct YBalance {
+pub struct Bond {
+    /// The user placing the bond.
+    pub bonder: PublicKey,
+    /// Content hash of the post being bonded on.
+    pub post_content_hash: ContentAddress,
+    /// Amount of Y bonded.
+    pub amount: u64,
+    /// True if this is the mandatory creator bond (first bond on the post).
+    pub is_first_bond: bool,
+}
+
+/// A donation to a post's creator (on-chain).
+/// Donations transfer Y to the creator with a fraction burned.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Donation {
+    /// The user making the donation.
+    pub donor: PublicKey,
+    /// Content hash of the post being donated to.
+    pub post_content_hash: ContentAddress,
+    /// The creator who receives the donation.
+    pub creator: PublicKey,
+    /// Total amount of Y donated.
+    pub amount: u64,
+    /// Fraction burned (e.g., 5%).
+    pub burn_amount: u64,
+    /// Remainder transferred to the creator.
+    pub creator_amount: u64,
+}
+
+/// A name registration (on-chain).
+/// Burns Y to claim a unique human-readable name.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NameRegistration {
+    /// The user claiming the name.
     pub owner: PublicKey,
-    /// Current balance in atomic units (no decimals, u64).
-    pub balance: u64,
-    /// Monotonic transaction counter (nonce). Incremented on every debit or credit.
-    pub nonce: u64,
-    /// Hash of the previous state (chain for tamper detection).
-    pub prev_hash: ContentAddress,
-    /// The most recent transaction that changed this balance.
-    pub last_tx: Option<YTransaction>,
-    /// Signature over all fields above.
-    pub signature: Signature,
+    /// The registered name (lowercase alphanumeric + hyphens, 1-32 chars).
+    pub name: String,
+    /// Amount of Y burned to register this name.
+    pub burn_cost: u64,
 }
 
-/// An immutable record of a Y state transition.
-/// Stored as a Chunk on Autonomi (permanent, content-addressed).
-/// Forms a linked list: each receipt points to the previous one.
+/// An invitation record (on-chain).
+/// Invitations form a web-of-trust tree rooted at genesis users.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct YReceipt {
-    /// The full YBalance state AFTER this transition.
-    pub state: YBalance,
-    /// Content address of the previous receipt (linked list).
-    /// None for the genesis receipt (nonce 0).
-    pub prev_receipt: Option<ContentAddress>,
-}
-
-/// What gets written to the Y Balance Scratchpad.
-/// Wraps the signed balance with a pointer to the latest receipt Chunk.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct YScratchpadPayload {
-    /// The signed Y balance (unchanged from current design).
-    pub balance: YBalance,
-    /// Content address of the latest receipt Chunk for this balance.
-    /// Not covered by YBalance.signature — it's metadata for discoverability.
-    pub latest_receipt: ContentAddress,
-}
-
-/// A single Y transaction (embedded in YBalance updates).
-#[derive(Clone, Serialize, Deserialize)]
-pub enum YTransaction {
-    /// Claim Y from epoch emission.
-    Claim {
-        epoch: u64,
-        amount: u64,
-        /// Hash of the computation proving correctness.
-        proof_hash: ContentAddress,
-    },
-    /// Debit: send Y to another user.
-    Debit {
-        recipient: PublicKey,
-        amount: u64,
-    },
-    /// Credit: receive Y from another user.
-    Credit {
-        sender: PublicKey,
-        amount: u64,
-        /// Reference to sender's debit nonce.
-        sender_debit_nonce: u64,
-        /// Content address of the sender's debit receipt.
-        /// Pins this credit to a specific, unambiguous debit state.
-        sender_debit_receipt: ContentAddress,
-    },
-    /// Burn: spend Y on boosting (deflationary).
-    Burn {
-        amount: u64,
-        purpose: BurnPurpose,
-    },
-    /// Reclaim: recover Y from expired pending transfer.
-    Reclaim {
-        original_debit_nonce: u64,
-        amount: u64,
-        /// Content address of the original debit receipt being reclaimed.
-        original_debit_receipt: ContentAddress,
-    },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum BurnPurpose {
-    PostBoost { post_address: ContentAddress },
-}
-
-/// Token R balance (soulbound reputation).
-/// Deterministically computable from public data — self-claimed, watcher-verified.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RBalance {
-    pub owner: PublicKey,
-    /// Current R balance.
-    pub balance: u64,
-    /// Epoch at which this R was last computed.
-    pub computed_at_epoch: u64,
-    /// Hash of the computation inputs (for verification).
-    pub computation_hash: ContentAddress,
-    /// Signature.
-    pub signature: Signature,
+pub struct OnChainInvitation {
+    /// The user issuing the invitation.
+    pub inviter: PublicKey,
+    /// The user being invited.
+    pub invitee: PublicKey,
+    /// Amount of Y burned to issue this invitation.
+    pub y_cost: u64,
+    /// Trust distance from genesis (inviter's distance + 1).
+    pub trust_distance: u32,
 }
 ```
 
+### Validation Rules
+
+**Bond:**
+- `amount > 0`
+- If `is_first_bond == true`, `bonder` must be the post author
+- A post must have exactly one first bond (the creator bond)
+- `bonder` must have sufficient Y balance on-chain
+
+**Donation:**
+- `amount > 0`
+- `burn_amount + creator_amount == amount`
+- `burn_amount` must match `amount * donation_burn_rate_bps / 10_000`
+- `donor` must have sufficient Y balance on-chain
+- `creator` must be the actual author of the referenced post
+
+**NameRegistration:**
+- `name` must match `^[a-z0-9-]{1,32}$`
+- `name` must not already be registered
+- `burn_cost` must meet the configured minimum
+- `owner` must have sufficient Y balance on-chain
+
+**OnChainInvitation:**
+- `inviter` must be an existing invited user (or genesis)
+- `invitee` must not already be invited
+- `y_cost` must match `EpochConfig::invitation_cost_y`
+- `trust_distance == inviter.trust_distance + 1`
+
 ## Epoch Types (`epoch.rs`)
 
+Epochs are block-based: the smart contract advances the epoch after a fixed number of blocks. Emission is distributed on-chain at epoch boundaries.
+
 ```rust
-/// An epoch boundary marker, stored as an immutable Chunk on Autonomi.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct EpochBoundary {
-    /// Epoch number (0-indexed).
-    pub epoch: u64,
-    /// Total curations since previous epoch boundary.
-    pub curation_count: u64,
-    /// Merkle root of all curation GraphEntries in this epoch.
-    pub curation_merkle_root: ContentAddress,
-    /// Address of the previous epoch boundary Chunk (forms a chain).
-    pub previous_epoch: Option<ContentAddress>,
-    /// Total R earned across all users this epoch.
-    pub total_r_earned: u64,
-    /// Y emission for this epoch (from the halving schedule).
-    pub y_emission: u64,
-    /// Publisher's public key + signature (anyone can publish, first valid wins).
-    pub publisher: PublicKey,
-    pub signature: Signature,
-}
-
-/// Configuration constants for epoch mechanics.
-/// These are FIXED at launch — changes only through voluntary software forks.
+/// Configuration constants for epoch mechanics (on-chain, set at contract deployment).
+/// Changes only through governance or contract migration.
 pub struct EpochConfig {
-    /// Number of curations per epoch.
-    pub curations_per_epoch: u64,           // e.g., 10_000
-    /// Cooling period in epochs (for curation evaluation).
-    pub cooling_period_epochs: u64,         // e.g., 2
-    /// R decay rate per epoch (basis points, e.g., 1000 = 10%).
-    pub r_decay_bps: u64,                   // e.g., 1000
-    /// Confirmation window for Y transfers (in network Scratchpad writes).
-    pub y_confirmation_window: u64,         // e.g., 5_000
-    /// Transfer expiry in epochs.
-    pub transfer_expiry_epochs: u64,        // e.g., 5
-    /// Maximum R any single user can hold.
-    pub r_cap: u64,                         // e.g., 1_000
+    /// Number of blockchain blocks per epoch.
+    pub epoch_duration_blocks: u64,
+    /// Burn rate for bonds (basis points, e.g., 1000 = 10%).
+    pub bond_burn_rate_bps: u64,
+    /// Burn rate for donations (basis points, e.g., 500 = 5%).
+    pub donation_burn_rate_bps: u64,
+    /// Y cost to issue an invitation.
+    pub invitation_cost_y: u64,
+    /// Maximum percentage of epoch emission any single creator can receive (basis points).
+    pub per_creator_emission_cap_bps: u64,
 }
 
-/// Y emission schedule — fixed at launch, halving-based.
+/// Y emission schedule — fixed at contract deployment, halving-based.
+/// Enforced on-chain by the smart contract.
 pub struct EmissionSchedule {
     /// Total supply of Y (in atomic units).
     pub total_supply: u64,                  // e.g., 21_000_000 * 10^6
@@ -446,6 +386,7 @@ pub struct EmissionSchedule {
 ```rust
 impl EmissionSchedule {
     /// Compute Y emission for a given epoch number.
+    /// This logic is mirrored in the smart contract.
     pub fn emission_for_epoch(&self, epoch: u64) -> u64 {
         let halvings = epoch / self.halving_interval;
         // After ~20 halvings, emission is effectively zero
@@ -455,6 +396,58 @@ impl EmissionSchedule {
 
     /// Compute total Y emitted up to (not including) a given epoch.
     pub fn total_emitted_before_epoch(&self, epoch: u64) -> u64;
+}
+```
+
+## Chain Events (`chain_events.rs`)
+
+Events emitted by the smart contracts, consumed by the off-chain indexer. These represent the canonical on-chain state transitions.
+
+```rust
+/// Events emitted by smart contracts, consumed by the indexer.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ChainEvent {
+    /// A Y token transfer between two accounts.
+    Transfer {
+        from: PublicKey,
+        to: PublicKey,
+        amount: u64,
+    },
+    /// A bond placed on a post.
+    Bond {
+        bonder: PublicKey,
+        post_hash: ContentAddress,
+        amount: u64,
+    },
+    /// A donation made to a post's creator.
+    Donation {
+        donor: PublicKey,
+        post_hash: ContentAddress,
+        amount: u64,
+    },
+    /// A unique name registered on-chain.
+    NameRegistered {
+        owner: PublicKey,
+        name: String,
+        cost: u64,
+    },
+    /// An invitation issued on-chain.
+    Invitation {
+        inviter: PublicKey,
+        invitee: PublicKey,
+        cost: u64,
+    },
+    /// The epoch counter advanced.
+    EpochAdvanced {
+        epoch: u64,
+        emission: u64,
+    },
+    /// Emission distributed to a creator for an epoch.
+    EmissionDistributed {
+        epoch: u64,
+        creator: PublicKey,
+        amount: u64,
+    },
 }
 ```
 
@@ -510,6 +503,12 @@ pub enum CoreError {
 
     #[error("invalid content address: {0}")]
     InvalidAddress(String),
+
+    #[error("invalid name: {0}")]
+    InvalidName(String),
+
+    #[error("insufficient balance: have {have}, need {need}")]
+    InsufficientBalance { have: u64, need: u64 },
 }
 ```
 
@@ -517,8 +516,9 @@ pub enum CoreError {
 
 | Context | Format | Why |
 |---|---|---|
-| Network storage (Chunks, Scratchpads) | `bincode` | Compact, fast, deterministic |
+| Off-chain content storage (IPFS/Autonomi Chunks) | `bincode` | Compact, fast, deterministic |
 | Signature computation | `bincode` | Must be deterministic across all clients |
+| On-chain data | ABI-encoded | Smart contract compatibility |
 | Indexer API responses | `serde_json` | Human-readable, web-compatible |
 | Local key storage | Hex strings | Easy to copy/paste, grep in files |
 | Debug/logging | `Debug` derive | Automatic from Rust derives |
@@ -531,7 +531,8 @@ pub enum CoreError {
 pub const MAX_POST_CONTENT_CHARS: usize = 4_000;
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 pub const MAX_BIO_CHARS: usize = 256;
-pub const MAX_SCRATCHPAD_SIZE: usize = 4 * 1024 * 1024; // 4MB
+pub const MAX_REGISTERED_NAME_CHARS: usize = 32;
+pub const MAX_SCRATCHPAD_SIZE: usize = 4 * 1024 * 1024; // 4MB (off-chain storage limit)
 pub const PUBLIC_KEY_SIZE: usize = 48;
 pub const SECRET_KEY_SIZE: usize = 32;
 pub const SIGNATURE_SIZE: usize = 96;

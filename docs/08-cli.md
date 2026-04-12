@@ -15,9 +15,9 @@ crates/cli/src/
 │   ├── profile.rs      # Profile create, update, view
 │   ├── post.rs         # Post create, read, reply, thread view
 │   ├── social.rs       # Follow, unfollow, feed view
-│   ├── curation.rs     # Stake R on posts, view curation results
-│   ├── token_y.rs      # Claim emissions, tip, boost, view balance
-│   ├── token_r.rs      # View R balance, view R history
+│   ├── token_y.rs      # Donate, tip, view balance, emission info
+│   ├── bond.rs         # Place bonds, view bonds, check prices
+│   ├── name.rs         # Register names, lookup, cost check
 │   ├── invitation.rs   # Invite users, view invitation chain
 │   └── moderation.rs   # Flag content, counter-flag, view flags
 ├── config.rs           # Configuration loading (file + env + flags)
@@ -68,14 +68,13 @@ pub enum Command {
     Post(PostCommand),
     /// Social graph
     Social(SocialCommand),
-    /// Curation staking
-    Curation(CurationCommand),
     /// Token Y operations
     #[command(name = "y")]
     TokenY(TokenYCommand),
-    /// Token R operations
-    #[command(name = "r")]
-    TokenR(TokenRCommand),
+    /// Bonding on posts
+    Bond(BondCommand),
+    /// Name registration
+    Name(NameCommand),
     /// Invitation management
     Invite(InviteCommand),
     /// Content moderation
@@ -218,38 +217,6 @@ pub enum SocialAction {
 }
 ```
 
-### Curation Subcommands (`curation.rs`)
-
-```rust
-#[derive(Subcommand)]
-pub enum CurationAction {
-    /// Stake R on a post (curate it)
-    Stake {
-        /// Content address of the post to curate
-        #[arg(long)]
-        post: String,
-        /// Amount of R to stake
-        #[arg(long)]
-        r_amount: u64,
-        /// Amount of Y to stake alongside R (optional amplifier)
-        #[arg(long, default_value = "0")]
-        y_amount: u64,
-    },
-    /// View your active curation stakes
-    Active,
-    /// View resolved curation results for a post
-    Results {
-        /// Content address of the post
-        post: String,
-    },
-    /// View DiversityScore for a post
-    Score {
-        /// Content address of the post
-        post: String,
-    },
-}
-```
-
 ### Token Y Subcommands (`token_y.rs`)
 
 ```rust
@@ -257,11 +224,14 @@ pub enum CurationAction {
 pub enum TokenYAction {
     /// View your Y balance
     Balance,
-    /// Claim Y from epoch emissions
-    Claim {
-        /// Epoch number to claim from
+    /// Donate Y to a post's creator
+    Donate {
+        /// Content address of the post
         #[arg(long)]
-        epoch: u64,
+        post: String,
+        /// Amount of Y to donate
+        #[arg(long)]
+        amount: u64,
     },
     /// Tip Y to another user
     Tip {
@@ -269,15 +239,6 @@ pub enum TokenYAction {
         #[arg(long)]
         to: String,
         /// Amount of Y to send
-        #[arg(long)]
-        amount: u64,
-    },
-    /// Boost a post by burning Y
-    Boost {
-        /// Content address of the post to boost
-        #[arg(long)]
-        post: String,
-        /// Amount of Y to burn
         #[arg(long)]
         amount: u64,
     },
@@ -292,26 +253,55 @@ pub enum TokenYAction {
 }
 ```
 
-### Token R Subcommands (`token_r.rs`)
+### Bond Subcommands (`bond.rs`)
 
 ```rust
 #[derive(Subcommand)]
-pub enum TokenRAction {
-    /// View your R balance (self-claimed + verified)
-    Balance,
-    /// View R balance for another user
-    BalanceOf {
-        /// Public key of the user
-        user: String,
+pub enum BondAction {
+    /// Place a bond on a post
+    Place {
+        /// Content address of the post to bond on
+        #[arg(long)]
+        post: String,
+        /// Amount of Y to bond
+        #[arg(long)]
+        amount: u64,
     },
-    /// View R earning history per epoch
-    History {
-        /// Number of epochs to show
-        #[arg(long, default_value = "10")]
-        limit: usize,
+    /// View bonds on a post
+    View {
+        /// Content address of the post
+        post: String,
     },
-    /// Recompute and update your R balance
-    Recompute,
+    /// View your active bond positions
+    Mine,
+    /// Check the current bond price for a post
+    Price {
+        /// Content address of the post
+        post: String,
+    },
+}
+```
+
+### Name Subcommands (`name.rs`)
+
+```rust
+#[derive(Subcommand)]
+pub enum NameAction {
+    /// Burn Y to claim a name
+    Register {
+        /// The name to register
+        name: String,
+    },
+    /// Resolve a name to a public key
+    Lookup {
+        /// The name to look up
+        name: String,
+    },
+    /// Check pricing for a name
+    Cost {
+        /// The name to check pricing for
+        name: String,
+    },
 }
 ```
 
@@ -320,19 +310,14 @@ pub enum TokenRAction {
 ```rust
 #[derive(Subcommand)]
 pub enum InviteAction {
-    /// Send an invitation to a new user (stakes your R)
+    /// Send an invitation to a new user (costs Y)
     Send {
         /// Public key of the invitee
         #[arg(long)]
         to: String,
-        /// Amount of R to stake on this invitation
-        #[arg(long)]
-        r_stake: u64,
     },
     /// View your invitation chain (who invited you, who you invited)
     Chain,
-    /// View your remaining invitation capacity
-    Capacity,
 }
 ```
 
@@ -533,22 +518,50 @@ impl IndexerClient {
         user: &PublicKey,
     ) -> Result<YBalanceSummary, IndexerError>;
 
-    /// Fetch R balance for a user (as reported by indexer).
-    pub async fn r_balance(
-        &self,
-        user: &PublicKey,
-    ) -> Result<RBalanceSummary, IndexerError>;
-
     /// Fetch epoch info (current epoch, emission schedule).
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
-    // --- Curation queries ---
+    // --- Bond queries ---
 
-    /// Fetch DiversityScore and curation list for a post.
-    pub async fn curation_info(
+    /// Fetch bonds placed on a post.
+    pub async fn get_bonds(
         &self,
         post: &ContentAddress,
-    ) -> Result<CurationInfo, IndexerError>;
+    ) -> Result<BondInfo, IndexerError>;
+
+    /// Fetch the current bond price for a post.
+    pub async fn bond_price(
+        &self,
+        post: &ContentAddress,
+    ) -> Result<BondPrice, IndexerError>;
+
+    /// Fetch a user's active bond positions.
+    pub async fn my_bonds(
+        &self,
+        user: &PublicKey,
+    ) -> Result<Vec<BondPosition>, IndexerError>;
+
+    // --- Name queries ---
+
+    /// Resolve a name to a public key.
+    pub async fn name_lookup(
+        &self,
+        name: &str,
+    ) -> Result<Option<PublicKey>, IndexerError>;
+
+    /// Fetch the cost to register a name.
+    pub async fn name_cost(
+        &self,
+        name: &str,
+    ) -> Result<NameCost, IndexerError>;
+
+    // --- Donation queries ---
+
+    /// Fetch donation totals for a post.
+    pub async fn post_donations(
+        &self,
+        post: &ContentAddress,
+    ) -> Result<DonationInfo, IndexerError>;
 
     // --- Moderation queries ---
 
@@ -577,9 +590,9 @@ pub struct FeedItem {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub curation_count: u64,
-    pub diversity_score: Option<f64>,
-    pub y_boosted: u64,
+    pub bond_count: u64,
+    pub total_bonded: u64,
+    pub donation_total: u64,
 }
 
 /// Detailed post view.
@@ -588,8 +601,9 @@ pub struct PostDetail {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub curations: Vec<CurationSummary>,
-    pub diversity_score: Option<f64>,
+    pub bonds: Vec<BondSummary>,
+    pub total_bonded: u64,
+    pub donation_total: u64,
     pub flags: Vec<FlagInfo>,
 }
 
@@ -602,13 +616,14 @@ pub struct ThreadView {
 
 ## Spot-Check Verification Flow (`spot_check.rs`)
 
-The CLI does not blindly trust indexer results. It performs probabilistic spot-checks by reading raw data from Autonomi (via dsn-data) and verifying the indexer's claims.
+The CLI does not blindly trust indexer results. It performs probabilistic spot-checks by reading raw data from Autonomi (via dsn-data) and on-chain data (via dsn-chain) and verifying the indexer's claims.
 
 ### Strategy
 
 ```rust
 pub struct SpotChecker {
     storage: Arc<dyn Storage>,
+    chain: Arc<dyn ChainReader>,
     /// Probability of spot-checking any given indexer result (0.0..=1.0).
     check_probability: f64,
     /// Results of recent spot-checks.
@@ -618,7 +633,11 @@ pub struct SpotChecker {
 }
 
 impl SpotChecker {
-    pub fn new(storage: Arc<dyn Storage>, check_probability: f64) -> Self;
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        chain: Arc<dyn ChainReader>,
+        check_probability: f64,
+    ) -> Self;
 
     /// Decide whether to spot-check a given item (probabilistic).
     fn should_check(&self) -> bool;
@@ -629,25 +648,18 @@ impl SpotChecker {
         indexer_post: &PostDetail,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
-    /// Verify a Y balance reported by the indexer.
-    pub async fn verify_y_balance(
-        &self,
-        user: &PublicKey,
-        indexer_balance: u64,
-    ) -> Result<SpotCheckResult, SpotCheckError>;
-
-    /// Verify an R balance reported by the indexer.
-    pub async fn verify_r_balance(
-        &self,
-        user: &PublicKey,
-        indexer_balance: u64,
-    ) -> Result<SpotCheckResult, SpotCheckError>;
-
-    /// Verify a DiversityScore reported by the indexer.
-    pub async fn verify_diversity_score(
+    /// Verify bond data reported by the indexer against on-chain records.
+    pub async fn verify_bonds(
         &self,
         post: &ContentAddress,
-        indexer_score: f64,
+        indexer_bonds: &BondInfo,
+    ) -> Result<SpotCheckResult, SpotCheckError>;
+
+    /// Verify donation data reported by the indexer against on-chain records.
+    pub async fn verify_donations(
+        &self,
+        post: &ContentAddress,
+        indexer_donations: &DonationInfo,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
     /// Return a summary of recent spot-check results.
@@ -665,27 +677,17 @@ impl SpotChecker {
 4. Compare author, content, and timestamp against the indexer's response
 5. If any field mismatches, flag the indexer result as untrustworthy
 
-**Y balance verification:**
+**Bond verification:**
 
-1. Derive the user's Y balance Scratchpad address: `derive_scratchpad_key(root_pk, YBalance)`
-2. Read the Scratchpad via `ScratchpadStore::get()`
-3. Deserialize into `YBalance`
-4. Validate the signature and hash chain via `dsn-token-y::validate_balance()`
-5. Compare the balance against the indexer's reported value
-6. Optionally check for fraud proofs via `dsn-token-y::check_for_fraud()`
+1. Read bond records for the post from on-chain data via `dsn-chain`
+2. Compare the total bonded amount and individual bond positions against the indexer's report
+3. If any values mismatch, flag the indexer result as untrustworthy
 
-**R balance verification:**
+**Donation verification:**
 
-1. Read the user's self-claimed R from their R balance Scratchpad
-2. Compare against the indexer's reported value
-3. Optionally recompute R from scratch via `dsn-token-r::compute_r_from_scratch()` (expensive, done infrequently)
-
-**DiversityScore verification:**
-
-1. Fetch all curation GraphEntries for the post from Autonomi
-2. Fetch each curator's R balance
-3. Recompute the DiversityScore via `dsn-token-r::diversity_score()`
-4. Compare against the indexer's reported score
+1. Read donation records for the post from on-chain data via `dsn-chain`
+2. Compare the total donated amount and individual donations against the indexer's report
+3. If any values mismatch, flag the indexer result as untrustworthy
 
 ### Result Types
 
@@ -714,9 +716,8 @@ pub enum SpotCheckResult {
 pub enum CheckType {
     PostContent,
     PostSignature,
-    YBalance,
-    RBalance,
-    DiversityScore,
+    BondData,
+    DonationData,
 }
 
 pub struct SpotCheckSummary {
@@ -828,7 +829,7 @@ Post by alice (a1b2c3d4...)
 
   This is my first post on the decentralized social network!
 
-  Replies: 3 | Curations: 7 | DiversityScore: 24.5
+  Replies: 3 | Bonds: 7 (1,250 Y) | Donations: 450 Y
   Address: 0xabcd1234...
 ```
 
@@ -840,8 +841,9 @@ Post by alice (a1b2c3d4...)
   "author": "a1b2c3d4...",
   "content": "This is my first post on the decentralized social network!",
   "reply_count": 3,
-  "curation_count": 7,
-  "diversity_score": 24.5,
+  "bond_count": 7,
+  "total_bonded": 1250,
+  "donation_total": 450,
   "created_at": "2026-01-15T10:32:00Z"
 }
 ```
@@ -849,9 +851,9 @@ Post by alice (a1b2c3d4...)
 **Table**: Compact tabular format for listing commands.
 
 ```
-ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  CURATIONS  SCORE
-abcd1234..   alice (a1b2) This is my first post on the decent..  3        7          24.5
-ef567890..   bob (e5f6)   Replying to the above — great to se..  1        2          8.1
+ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  BONDS   DONATED
+abcd1234..   alice (a1b2) This is my first post on the decent..  3        7       450 Y
+ef567890..   bob (e5f6)   Replying to the above — great to se..  1        2       120 Y
 ```
 
 ### Implementation
@@ -910,7 +912,7 @@ Post by Alice (a1b2c3d4...)
 
   Hello, decentralized world!
 
-  Replies: 0 | Curations: 0
+  Replies: 0 | Bonds: 0 | Donations: 0 Y
 
 # Reply to a post
 $ dsn post reply --to abcd1234efgh5678 "Welcome, Alice!"
@@ -938,34 +940,47 @@ Now following e5f6a7b8... (Bob)
 $ dsn social feed --limit 10
 [1] Bob (e5f6a7b8...) — 5 min ago
     Just deployed v0.2 of the indexer. Performance is 3x better!
-    Replies: 2 | Curations: 5 | Score: 18.3
+    Replies: 2 | Bonds: 5 (800 Y) | Donations: 320 Y
 
 [2] Charlie (c9d0e1f2...) — 20 min ago
     Interesting paper on sybil resistance: https://...
-    Replies: 7 | Curations: 12 | Score: 41.7
+    Replies: 7 | Bonds: 12 (3,400 Y) | Donations: 1,050 Y
 ```
 
-### Curation
+### Bonding
 
 ```bash
-# Stake R on a post you think is valuable
-$ dsn curation stake --post abcd1234efgh5678 --r-amount 10 --y-amount 50
-Enter passphrase: ********
-Curation stake placed.
-  Post: abcd1234efgh5678
-  R staked: 10
-  Y staked: 50
-  Cooling period ends: epoch 47
-
-# View DiversityScore
-$ dsn curation score abcd1234efgh5678
+# Check the current bond price for a post
+$ dsn bond price abcd1234efgh5678
 Post: abcd1234efgh5678
-DiversityScore: 24.5 (threshold: 10.0) — PASSING
-Curators: 7 unique
-Top curators:
-  a1b2c3d4... (R: 120) — staked 10 R
-  e5f6a7b8... (R: 85)  — staked 5 R
-  c9d0e1f2... (R: 340) — staked 20 R, 100 Y
+Current bond price: 15 Y
+Total bonded: 800 Y
+Bond count: 5
+
+# Place a bond on a post
+$ dsn bond place --post abcd1234efgh5678 --amount 100
+Enter passphrase: ********
+Bond placed.
+  Post: abcd1234efgh5678
+  Amount: 100 Y
+  Your Y after bond: 1,150 Y
+
+# View bonds on a post
+$ dsn bond view abcd1234efgh5678
+Post: abcd1234efgh5678
+Total bonded: 900 Y
+Bonders: 6
+  a1b2c3d4... (Alice) — 100 Y
+  e5f6a7b8... (Bob)   — 200 Y
+  c9d0e1f2... (Charlie) — 350 Y
+  [3 more]
+
+# View your active bond positions
+$ dsn bond mine
+Your bond positions:
+  abcd1234efgh5678 — 100 Y (placed epoch 43)
+  5678dcba4321...   — 50 Y  (placed epoch 41)
+Total bonded: 150 Y
 ```
 
 ### Token Operations
@@ -975,54 +990,72 @@ Top curators:
 $ dsn y balance
 Y Balance: 1,250.000000
 Nonce: 14
-Last tx: Claim (epoch 42, amount 87.500000)
 
-# Claim Y from an epoch
-$ dsn y claim --epoch 43
+# Donate Y to a post's creator
+$ dsn y donate --post abcd1234efgh5678 --amount 25000000
 Enter passphrase: ********
-Claimed 92.300000 Y from epoch 43.
-New balance: 1,342.300000
+Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
 
 # Tip a user
 $ dsn y tip --to e5f6a7b8... --amount 25000000
 Enter passphrase: ********
 Tip sent: 25.000000 Y to e5f6a7b8... (Bob)
-Awaiting confirmation window...
-Transfer will be confirmed after ~5,000 Scratchpad writes.
 
-# View R balance
-$ dsn r balance
-R Balance: 142
-Computed at epoch: 43
-Rank: top 12% of active users (via indexer)
+# View Y transaction history
+$ dsn y history --limit 5
+TYPE      AMOUNT       TO/POST                  EPOCH
+donate    25.000000    abcd1234efgh5678         43
+tip       25.000000    e5f6a7b8... (Bob)        43
+bond      100.000000   abcd1234efgh5678         43
+emission  87.500000    (auto)                   42
+tip       10.000000    c9d0e1f2... (Charlie)    41
 
-# View R history
-$ dsn r history --limit 5
-EPOCH  R START  EARNED  DECAYED  SLASHED  R END
-  43      148      12      -15        0    142 (current, recomputed pending)
-  42      155       8      -15        0    148
-  41      160      10      -16        0    155 (curation success: 2 posts)
-  40      140      36      -14        0    160 (discovery bonus: 1 post)
-  39      120      34      -12        0    140
+# View emission info
+$ dsn y emission
+Current epoch: 43
+Epoch emission rate: 1,000 Y
+Your share (last epoch): 87.500000 Y
+Distribution: automatic per epoch
+```
+
+### Name Registration
+
+```bash
+# Check cost to register a name
+$ dsn name cost alice
+Name: alice
+Cost: 500 Y (short name premium)
+
+# Register a name (burns Y)
+$ dsn name register alice
+Enter passphrase: ********
+Name registered.
+  Name: alice
+  Burned: 500 Y
+  Your Y after: 750 Y
+
+# Look up a name
+$ dsn name lookup alice
+Name: alice
+Owner: a1b2c3d4e5f6a7b8...
 ```
 
 ### Invitations
 
 ```bash
-# Invite a new user (stakes your R)
-$ dsn invite send --to f3a4b5c6... --r-stake 20
+# Invite a new user (costs Y)
+$ dsn invite send --to f3a4b5c6...
 Enter passphrase: ********
 Invitation sent.
   Invitee: f3a4b5c6...
-  R staked: 20
-  Your R after stake: 122
+  Y cost deducted from balance.
 
 # View your invitation chain
 $ dsn invite chain
 You (a1b2c3d4...) — invited by d7e8f9a0... (epoch 12)
-├── e5f6a7b8... (Bob) — invited epoch 20, R staked: 15
-├── c9d0e1f2... (Charlie) — invited epoch 25, R staked: 10
-│   └── f3a4b5c6... (Dave) — invited epoch 38, R staked: 20
+├── e5f6a7b8... (Bob) — invited epoch 20
+├── c9d0e1f2... (Charlie) — invited epoch 25
+│   └── f3a4b5c6... (Dave) — invited epoch 38
 └── [2 more invitees]
 ```
 
@@ -1035,18 +1068,17 @@ Enter passphrase: ********
 Flag submitted.
   Post: abcd1234efgh5678
   Reason: spam
-  Your R weight: 142
 
 # View flags on a post
 $ dsn mod flags abcd1234efgh5678
 Post: abcd1234efgh5678
-Flags: 3 (total R weight: 285)
-  [spam]   by a1b2c3d4... (R: 142) — epoch 43
-  [spam]   by e5f6a7b8... (R: 85)  — epoch 43
-  [abuse]  by c9d0e1f2... (R: 58)  — epoch 44
+Flags: 3
+  [spam]   by a1b2c3d4... — epoch 43
+  [spam]   by e5f6a7b8... — epoch 43
+  [abuse]  by c9d0e1f2... — epoch 44
 
-Counter-flags: 1 (total R weight: 340)
-  by g1h2i3j4... (R: 340) — epoch 44
+Counter-flags: 1
+  by g1h2i3j4... — epoch 44
 ```
 
 ## Error Handling Strategy
@@ -1090,12 +1122,13 @@ pub enum CliError {
     #[error("network storage error: {0}")]
     Storage(#[from] DataError),
 
+    // --- Chain errors ---
+    #[error("chain error: {0}")]
+    ChainError(String),
+
     // --- Protocol errors ---
     #[error("token Y error: {0}")]
     TokenY(#[from] TokenYError),
-
-    #[error("token R error: {0}")]
-    TokenR(#[from] CurationError),
 
     #[error("moderation error: {0}")]
     Moderation(String),
@@ -1147,7 +1180,7 @@ async fn main() {
 | Wrong passphrase | Allow up to 3 retries, then exit |
 | Indexer unreachable | Warn and fall back to direct Autonomi reads where possible |
 | Indexer data fails spot-check | Warn user, show both indexer and on-chain values |
-| Insufficient Y/R balance | Show current balance and required amount |
+| Insufficient Y balance | Show current balance and required amount |
 | Post content too long | Show character count and maximum |
 | Network timeout | Retry once with doubled timeout, then fail with suggestion |
 | Conflicting nonce (concurrent update) | Re-read current state, reapply, retry up to 3 times |
@@ -1167,14 +1200,13 @@ async fn main() {
               │ (local    │   │ client    │   │ check     │
               │  keyfile) │   │ (reqwest) │   │ (verify)  │
               └───────────┘   └─────┬─────┘   └─────┬─────┘
-                                    │               │
-                              ┌─────┴─────┐   ┌─────┴─────┐
-                              │  Indexer   │   │ dsn-data  │
-                              │  REST API  │   │ (Storage  │
-                              │  (remote)  │   │  traits)  │
-                              └───────────┘   └─────┬─────┘
-                                                    │
-                                              ┌─────┴─────┐
+                                    │           ┌───┴───┐
+                              ┌─────┴─────┐  ┌──┴──┐ ┌──┴──┐
+                              │  Indexer   │  │dsn- │ │dsn- │
+                              │  REST API  │  │data │ │chain│
+                              │  (remote)  │  └──┬──┘ └──┬──┘
+                              └───────────┘     │       │
+                                              ┌─┴───────┴─┐
                                               │ Autonomi  │
                                               │ Network   │
                                               └───────────┘
@@ -1195,7 +1227,7 @@ async fn main() {
 2. CLI loads config, reads public key from keyfile (no passphrase needed)
 3. `commands/social.rs` calls `IndexerClient::feed()` with the public key
 4. Indexer returns a list of `FeedItem` objects
-5. `spot_check.rs` probabilistically verifies a subset of results against Autonomi
+5. `spot_check.rs` probabilistically verifies a subset of results against Autonomi and on-chain data
 6. CLI renders the feed via `output.rs` in the selected format
 
 ## Workspace Dependencies
@@ -1217,7 +1249,7 @@ async fn main() {
 | `rand` | latest | Spot-check probability, nonce generation |
 | `dsn-core` | workspace | Core types, crypto primitives |
 | `dsn-data` | workspace | Storage trait abstractions |
-| `dsn-token-y` | workspace | Y balance validation, claim verification |
-| `dsn-token-r` | workspace | R computation, DiversityScore verification |
+| `dsn-chain` | workspace | On-chain data reading (bonds, donations, names) |
+| `dsn-token-y` | workspace | Y balance validation, transfer verification |
 | `dsn-invitation` | workspace | Invitation chain operations |
 | `dsn-moderation` | workspace | Content flagging operations |
