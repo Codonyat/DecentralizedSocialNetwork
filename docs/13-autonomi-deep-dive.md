@@ -52,9 +52,17 @@ exceptional; the delivery risk is exactly as exceptional.
 The 1.0 collapse was not an accident or an attack. It was a **controlled
 natural experiment on Autonomi's core economic claim**, and the claim failed:
 
-1. **The subsidy was the network.** Emissions paid ~54,000 ANT/day to random
-   nodes. Official site counter on 6 Jan 2026: **~1,548,400 nodes**
+1. **The subsidy was the network — by design.** Emissions (~54,000 ANT/day)
+   were a **uniform-random per-node lottery** (rounds every 120 s selecting
+   100 random nodes each), completely decoupled from bytes stored — so every
+   extra empty node was another lottery ticket. Peak: **~3,374,700 nodes /
+   ~103 PB offered** (Oct 2025,
+   [forum](https://forum.autonomi.community/t/update-2nd-october-2025/42457/59));
+   still ~1.55M on the official counter on 6 Jan 2026
    ([forum](https://forum.autonomi.community/t/network-size-today/42723)).
+   A Nov 2025 vulnerability let nodes wipe and re-register as fresh
+   identities to farm harder, and large farms ran modified code that blocked
+   network upgrades.
 2. **The fees were negligible.** A user who uploaded ~1 TB in Feb 2026 paid
    **~$0.10 in ANT storage fees** (plus ~$200 in Arbitrum gas — 99.95% of
    the cost leaking to Ethereum, not to storage providers)
@@ -69,8 +77,13 @@ natural experiment on Autonomi's core economic claim**, and the claim failed:
 5. **The data died with them.** 1.0 shipped without working replication; the
    team had already posted *"Data Persistence Is Not Guaranteed Yet"* in Dec
    2025 ([forum](https://forum.autonomi.community/t/important-notice-data-persistence-is-not-guaranteed-yet/42666)).
-   19 Feb 2026: final 1.0 update; ~5 Mar: official sunset. **No 1.0 data
-   migrated to 2.0.** The ANT token (ERC-20 on Arbitrum) was unaffected.
+   19 Feb 2026: final 1.0 update; ~5 Mar: official sunset. The team stated
+   1.0→2.0 data transfer was **"not possible"** and retro-framed 1.0 uploads
+   as made "without guarantee of permanence"
+   ([team](https://autonomi.com/publications/autonomi-2026-built-for-this-moment));
+   no refund program was found, and no "last reset" pledge or 2.0→3.0
+   migration guarantee exists. The ANT token (ERC-20 on Arbitrum) was
+   unaffected.
 6. **2.0 launched 7 Apr 2026**: post-quantum crypto (ML-DSA-65/ML-KEM-768),
    working automatic replication, geographic diversity in the DHT, Merkle
    batch payments (100 chunks per gas transaction — a real fix for the gas
@@ -123,7 +136,7 @@ As of July 2026, "pay once, store forever" remains the marketed model.
 | # | Problem | Verdict | Reasoning |
 |---|---|---|---|
 | 1 | **Pay-once economics without an endowment** | **FIXABLE-BUT-BREAKS-PROMISE** | The Jan 2026 experiment proved fees-as-designed don't sustain nodes. Fixes exist — rent, renewal, an Arweave-style endowment, or resuming emissions as a permanent subsidy from the 233M pool — but every durable fix either abandons "pay once, store forever" or turns it into "subsidized until the pool runs out." The team has so far chosen neither. |
-| 2 | **Emission farming (sybil node inflation)** | FIXABLE | Reward-per-node invited farming; a redesigned reward tied to proven useful storage + the 2.0 geographic-diversity enforcement plausibly fixes it. Unproven, since emissions haven't resumed. |
+| 2 | **Emission farming (sybil node inflation)** | FIXABLE — and 2.0 changed the design | The 1.0 flaw was a uniform per-node lottery decoupled from stored bytes. 2.0 replaced it: node income now comes from upload payments tied to actually storing data, with fullness-based dynamic pricing and geographic-diversity anti-sybil in the DHT. Plausible fix, unproven at scale — and emissions themselves remain paused (their future "undecided"), so the fixed mechanism has never run. |
 | 3 | **Gas coupling to Arbitrum** | LARGELY FIXED | Merkle batch payments (Mar 2026) collapse 100 chunk payments into one transaction — the 99.95%-leak problem is addressed. The deeper "native token without a blockchain" promise (historically DBCs) remains unshipped after two decades and is genuinely hard without consensus: treat as UNKNOWN/aspirational. |
 | 4 | **The reset precedent** | **STRUCTURAL (reputational)** | Not a code problem and not fixable by code: a network that sunset its "permanent" mainnet once cannot re-earn permanence credibility except by years of not doing it again. Any future 2.0→3.0 break re-runs the same destruction unless a data-migration guarantee is engineered and honored; none has been committed to. |
 | 5 | **Mutable-data consistency (Pointer/Scratchpad staleness, lost updates)** | FIXABLE | Quorum/replication tuning, CRDT semantics, or version-history are ordinary distributed-systems engineering; 2.0's working replication is a prerequisite it now has. Still unproven at scale, and our MutableStore depends on exactly this. |
