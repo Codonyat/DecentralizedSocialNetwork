@@ -142,29 +142,32 @@ signal destroyed). Every channel below passes it — the worst case of each
 degrades into "a token sale at market price" or "a fee discount for early
 users," never into theft or signal corruption.
 
-### 3.2 Allocation — **PURE FAIR LAUNCH** (superseded per doc 14, D5)
+### 3.2 Allocation — fair launch + one disclosed treasury (doc 14, D5 revised)
 
-> **Decision record:** the original strawman here included sale, treasury,
-> team, and retroactive-drop buckets. The founder decision (doc 14, D3/D5)
-> is a pure fair launch: **no sale, and 100% of supply is earned.**
+> **Decision record:** the original strawman included sale, treasury, team,
+> and retroactive-drop buckets. D5 first removed all of them (pure fair
+> launch), then was revised to reinstate **exactly one**: a sunsetting
+> treasury, because a network whose client, audits, and hosting nobody can
+> fund is a purity that ships nothing. Still: **no sale, no team
+> allocation, no discretionary drops.**
 
-| Bucket | % | Amount | Mechanism | Schedule |
+| Bucket | % | Amount | Mechanism | Schedule / discipline |
 |---|---|---|---|---|
-| **Usage rebate pool** | 75% | 15.75M | pro-rata fee rebate per epoch (§3.2.1) | halving every ~2y |
-| **Service provider pool** | 25% | 5.25M | per-epoch to staked, proven-live service nodes (§3.2.2) | same shape, 1/3 size |
+| **Usage rebate pool** | 60% | 12.6M | pro-rata fee rebate per epoch (§3.2.1) | halving every ~2y |
+| **Service provider pool** | 20% | 4.2M | per-epoch to staked, proven-live service nodes (§3.2.2) | same shape, 1/3 size |
+| **Treasury** | 20% | 4.2M | client development, hosting, audits, grants (incl. seeding the doc 12 archive bounty) | **5y linear unlock; unspent burns at y8**; tokens not powers; disclosed spending |
 
-No team, treasury, foundation, sale, or discretionary bucket exists. The
-deployer holds zero tokens and zero keys after genesis. Development,
-hosting, and audits are self-funded or externally funded (grants are
-compatible with fair launch; protocol allocations are not); public-goods
-needs previously assigned to the treasury are served by **on-chain bounty
-escrows anyone can fund** (e.g. the doc 12 archive bounty).
+The deployer/steward holds no keys over monetary rules after genesis; the
+treasury is the single, named, expiring exception to "everything earned,"
+and its burn deadline makes it provably temporary (doc 09 §3's honest-
+centralization covenant). Founders take no separate allocation — they are
+paid, if at all, as disclosed treasury contributors like anyone else.
 
 Why usage-linked pools at all, given §1.4 says appreciation is the main
 reward? Because a network where only buyers hold tokens aligns *investors*,
-not *users*. Under fair launch this becomes total: **every token in
-existence was earned by using or serving the network** — the alignment
-pillar made literal.
+not *users*. Here, **80% of supply can only be obtained by using or serving
+the network** — the alignment pillar made literal — and the remaining 20%
+exists to make sure there is a network to use.
 
 #### 3.2.1 Usage rebate pool — distribution by fees burned
 
@@ -235,17 +238,18 @@ fee before the remaining 90% burns).
 - Depth 1 + fixed 10% + fixed term keeps it a referral program, structurally
   incapable of MLM dynamics (no compounding tree income).
 
-### 3.4 The honest centralized components (superseded per doc 14, D5)
+### 3.4 The honest centralized component, with an expiry date (doc 14, D5 revised)
 
-Under pure fair launch, the treasury and discretionary-drop buckets this
-section originally described **do not exist**. What remains of human
-judgment at genesis is exactly one act: the deployer publishes the contracts
-and seeds the genesis invitation accounts (doc 05), then retains nothing —
-no tokens, no keys, no upgrade path. 100% of supply distributes by formula
-from block 1. The bootstrap-era reward for early adopters is structural
-rather than discretionary: while `drop > fees`, usage is rebated at >100%
-(§3.2.1), so the founding cohort earns cheap tokens by using and serving the
-network early — no committee decides who deserved what.
+Exactly one bucket involves human judgment: the **treasury** (20%, §3.2).
+Its defensibility rests on discipline, not trust: linear unlock over 5
+years, unspent balance burned at year 8, spending disclosed, and — the
+constitutional point — it holds *tokens, never powers* (§2): no vote, key,
+or budget line can alter monetary rules. Discretionary retroactive drops
+remain removed; the bootstrap-era reward for early adopters is structural,
+not discretionary — while `drop > fees`, usage is rebated at >100%
+(§3.2.1), so the founding cohort earns cheap tokens by using and serving
+the network early. No committee decides who deserved what; the committee
+only pays for the software everyone uses to participate.
 
 ### 3.5 Day-one user onboarding (how a normal person first touches Y)
 
@@ -267,7 +271,7 @@ value to the user.
 
 | Pillar | X | Y |
 |---|---|---|
-| Alignment | Value accrues to $TWTR/xAI shareholders; users are inventory | Users, inviters, and service operators hold the appreciating asset; **100% of supply reaches them by formula — there is no other way to obtain it at genesis** |
+| Alignment | Value accrues to $TWTR/xAI shareholders; users are inventory | Users, inviters, and service operators hold the appreciating asset; **80% of supply is obtainable only by using or serving the network, and the other 20% burns if not spent building it** |
 | Arbitrary change | API pricing, reach algorithms, monetization terms, bans — changeable overnight by one owner | Monetary constitution is admin-keyless and immutable; subjective layers are per-indexer *choices* users can exit individually |
 | Predictability | Platform risk is unhedgeable | Supply, schedule, fees, slash conditions are computable to the year 2040 by anyone |
 
@@ -278,8 +282,8 @@ treasury can do to a user is inconvenience them into switching providers.
 ## 5. Open decisions (status per doc 14)
 
 1. **Exact allocation ratios and constants** — structure decided (fair
-   launch, 75/25, doc 14 D5); the split and drop constants remain tunable
-   strawmen until genesis.
+   launch + sunsetting treasury, 60/20/20, doc 14 D5 revised); the split
+   and drop constants remain tunable strawmen until genesis.
 2. **Sale mechanics** — RESOLVED: there is no sale (D3/D5). Legal review of
    the fair-launch shape (fee sinks, no profit-share, no sale, no promises
    by an issuer) is still prudent but the surface is far smaller.
@@ -292,9 +296,11 @@ treasury can do to a user is inconvenience them into switching providers.
    therefore be finalized before launch, not after.
 
 *One-line summary: Y is social money + resource money + security money on an
-immutable monetary constitution; under the doc 14 fair launch it distributes
-**100% by formula** — fee rebates that Sybils can't game and service proofs,
-on a fixed halving schedule, with no sale, no premine, and no discretionary
-bucket — so early adopters are rewarded by cheap acquisition, fee subsidies,
-referral annuities, and appreciation, and nobody, ever, has a lever to
-change the rules or a privileged bag to dump.*
+immutable monetary constitution; it distributes **80% by formula** — fee
+rebates that Sybils can't game and service proofs, on a fixed halving
+schedule, with no sale, no team allocation, and no discretionary drops —
+and **20% through one disclosed treasury that unlocks linearly and burns
+whatever it hasn't spent by year 8** — so early adopters are rewarded by
+cheap acquisition, fee subsidies, referral annuities, and appreciation;
+builders are fundable; and nobody, ever, has a lever to change the rules or
+a permanent privileged bag.*

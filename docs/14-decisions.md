@@ -10,42 +10,51 @@ superseded as noted.
 | D2 | **Wedge community** (doc 09 §8.1) | Decentralization believers (Autonomi / Nostr / crypto-native communities) | Whitepaper voice + reference client target this audience; the Autonomi founding-cohort play (doc 13 §7) is the go-to-community motion |
 | D3 | **Token timing** | Token live at genesis — **with no sale of any kind** | The token is present from block 1; all circulation is earned (D5); price discovery is fully organic |
 | D4 | **Launch shape** | Service registry **open/permissionless from day 1** | No trust-us phase for infrastructure; anyone can stake and run storage/indexer nodes at genesis. We may still *also* run nodes — as ordinary registrants with no privileges |
-| D5 | **Genesis allocation** | **Pure fair launch: 100% of supply is earned** | No team, treasury, foundation, sale, or discretionary-drop buckets. Doc 10 §3.2/§3.4 superseded (see below). Development, hosting, and audits are self-/externally funded, never protocol-funded |
+| D5 | **Genesis allocation** *(revised — see D5 history below)* | **Fair launch + one disclosed treasury: 80% of supply earned, 20% sunsetting treasury** | No team allocation, no sale, no discretionary drops. A single treasury premine funds the client, infrastructure, and audits under sunset-and-burn discipline. Doc 10 §3.2/§3.4 amended accordingly |
 | D6 | **Chain** | Ethereum L1 or a **maximally trustless L2** (criteria below) | Contract suite deploys where our admin-keyless constitution isn't undermined by someone else's admin keys |
 | D7 | **Reference client** | **Hosted web client** (plus the spec'd CLI as the power tool) | Lowest onboarding friction; hosting is a self-funded goodwill act with no protocol privileges — the client speaks only public protocol, and anyone can host a rival |
 | D8 | **Next deliverables** | Reconcile the spec + write the whitepaper | Simulation and production crates deferred |
 
-## D5 in detail: the fair-launch allocation
+## D5 in detail: the allocation (revised)
 
-The doc 10 §3.2 strawman (sale/treasury/team/genesis-drop buckets) is
-**superseded**. New allocation of the 21M, preserving the 3:1 ratio between
-the two earned pools:
+**Decision history:** D5 was first taken as a pure fair launch (100%
+earned). On reflection — the "nobody pays for the client" tension of D7 —
+it was revised the same day to reinstate **one treasury premine** while
+keeping the rest of the fair-launch posture (no sale, no team allocation,
+no discretionary drops). Parameters below use the recommended defaults
+(20%, sunset-and-burn); they are strawmen until genesis.
 
-| Pool | % | Amount | Mechanism (unchanged) |
+| Pool | % | Amount | Mechanism |
 |---|---|---|---|
-| **Usage rebate pool** | 75% | 15,750,000 Y | per-epoch drop pro-rata to eligible fees burned (doc 10 §3.2.1) |
-| **Service provider pool** | 25% | 5,250,000 Y | per-epoch to staked, proven-live service nodes (doc 10 §3.2.2) |
+| **Usage rebate pool** | 60% | 12,600,000 Y | per-epoch drop pro-rata to eligible fees burned (doc 10 §3.2.1) |
+| **Service provider pool** | 20% | 4,200,000 Y | per-epoch to staked, proven-live service nodes (doc 10 §3.2.2) |
+| **Treasury** | 20% | 4,200,000 Y | client development, hosting, audits, grants — under the discipline below |
 
-- Referral annuities remain fee-redistribution (doc 10 §3.3) — they need no
-  allocation.
-- **What founders get**: exactly what any early user gets — cheap early
-  acquisition, fee rebates, referral annuities, service-pool income if they
-  run nodes, and appreciation. Nothing else.
-- **What disappears with the treasury**: protocol-funded client development,
-  grants, audits, and discretionary retroactive drops. Replacements:
-  self-funding, external grants (e.g. the Autonomi Foundation angle of
-  doc 13 §7 — external money is compatible with fair launch; protocol
-  allocations are not), and on-chain **bounty escrows** anyone can fund
-  (e.g. the archive bounty of doc 12 Tier 3, previously treasury-seeded).
-- **Steward role shrinks to deployer**: someone must deploy the contracts
-  and seed genesis invitation accounts (doc 05). That role holds zero
-  tokens and zero keys post-deployment — the constitution (doc 10 §2) is
-  admin-keyless, so the deployer's power ends at block 1.
-- **Bootstrapping the wedge cohort without a drop**: the early-network
-  subsidy is structural, not discretionary — while `drop > fees`, usage is
-  rebated at >100% (doc 10 §3.2.1), so the founding cohort's reward is
-  earning cheap tokens by using and serving the network early. No committee
-  decides who deserves what.
+**Treasury discipline (what makes a premine defensible):**
+
+- **Linear unlock over 5 years; anything unspent burns at year 8.** The
+  treasury provably cannot become a perpetual foundation or an indefinite
+  overhang.
+- **Tokens, not powers**: the monetary constitution (doc 10 §2) remains
+  admin-keyless; the treasury can spend its budget, never alter rules.
+- **Disclosed control**: held by the steward (founder) initially — named,
+  visible, with spending published; migrate to a multisig as contributors
+  materialize. Honest centralization with an expiry beats pretended
+  neutrality (doc 09 §3).
+- **What it funds**: the reference web client (D7), infrastructure
+  bootstrapping, security audits, and grants — including seeding the
+  doc 12 archive bounty escrow.
+
+Unchanged from the original D5:
+
+- No sale, ever; no team allocation — founders are compensated by treasury
+  *salary/grants like any contributor* (disclosed), plus what any early
+  user earns: rebates, referral annuities, service income, appreciation.
+- Referral annuities remain fee-redistribution — no allocation needed.
+- The early-adopter subsidy stays structural (rebates >100% while
+  `drop > fees`), not discretionary.
+- External grants (e.g. the Autonomi Foundation angle, doc 13 §7) remain
+  welcome and compatible.
 
 ## D6 in detail: chain criteria
 

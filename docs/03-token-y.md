@@ -37,17 +37,19 @@ All modules are **pure functions** over their inputs. No I/O, no storage, no asy
 ```rust
 pub const TOTAL_SUPPLY: u64 = 21_000_000_000_000; // 21M with 6 decimals
 
-/// Pure fair launch (doc 14, D5): 100% of supply is earned. There are NO
-/// team, treasury, foundation, sale, or discretionary-drop buckets.
+/// Fair launch + one disclosed treasury (doc 14, D5 revised): 80% of supply
+/// is earned; 20% is a sunsetting treasury. There is NO sale, NO team
+/// allocation, and NO discretionary-drop bucket.
 /// Ratios are constitutional; minted once at genesis into their contracts.
-pub const USAGE_REBATE_POOL: u64   = 15_750_000_000_000; // 75% — RebatePool contract
-pub const SERVICE_POOL: u64        =  5_250_000_000_000; // 25% — ServiceRegistry reward pool
+pub const USAGE_REBATE_POOL: u64   = 12_600_000_000_000; // 60% — RebatePool contract
+pub const SERVICE_POOL: u64        =  4_200_000_000_000; // 20% — ServiceRegistry reward pool
+pub const TREASURY: u64            =  4_200_000_000_000; // 20% — 5y linear unlock; unspent burns at y8
 ```
 
-There is no mint function outside these two pools. Once they are exhausted,
-distribution is over; from then on supply only shrinks (burns). The contract
-deployer (the "steward" of doc 09 §3) receives zero tokens and retains zero
-keys after deployment.
+There is no mint function outside these three buckets. Once the two earned
+pools are exhausted, distribution is over; from then on supply only shrinks
+(burns). The treasury holds tokens, never powers (doc 10 §2): the contract
+deployer/steward retains no keys over monetary rules after deployment.
 
 ### Rebate Drop Schedule
 
@@ -55,12 +57,12 @@ Epochs are block-based, targeting ~1 week (doc 00). The usage rebate pool
 pays a scheduled per-epoch drop with 2-year halvings:
 
 ```rust
-pub const INITIAL_REBATE_DROP: u64 = 75_000_000_000; // 75,000 Y/epoch
+pub const INITIAL_REBATE_DROP: u64 = 60_000_000_000; // 60,000 Y/epoch
 pub const REBATE_HALVING_INTERVAL: u64 = 104;        // epochs (~2 years)
 pub const MAX_REBATE_HALVINGS: u64 = 20;
 
 /// Service pool drop follows the same halving shape at 1/3 the size.
-pub const INITIAL_SERVICE_DROP: u64 = 25_000_000_000; // 25,000 Y/epoch
+pub const INITIAL_SERVICE_DROP: u64 = 20_000_000_000; // 20,000 Y/epoch
 
 /// Y dropped by the rebate pool in a given epoch.
 pub fn rebate_drop_for_epoch(epoch: u64) -> u64 {
@@ -75,11 +77,11 @@ pub fn total_dropped_before_epoch(epoch: u64) -> u64;
 
 | Epoch Range | Rebate Y/Epoch | Cumulative Rebates | Service Y/Epoch |
 |---|---|---|---|
-| 0–103 | 75,000 | 7,800,000 | 25,000 |
-| 104–207 | 37,500 | 11,700,000 | 12,500 |
-| 208–311 | 18,750 | 13,650,000 | 6,250 |
-| 312–415 | 9,375 | 14,625,000 | 3,125 |
-| 416–519 | 4,687.5 | 15,112,500 | 1,562.5 |
+| 0–103 | 60,000 | 6,240,000 | 20,000 |
+| 104–207 | 30,000 | 9,360,000 | 10,000 |
+| 208–311 | 15,000 | 10,920,000 | 5,000 |
+| 312–415 | 7,500 | 11,700,000 | 2,500 |
+| 416–519 | 3,750 | 12,090,000 | 1,250 |
 
 Geometric-series dust remaining in the pool after `MAX_REBATE_HALVINGS` is
 burned in the final epoch (deterministic close-out).

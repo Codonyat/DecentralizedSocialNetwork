@@ -7,9 +7,11 @@ announcement. Full specification in `/docs`.**
 
 ## Abstract
 
-Y is a decentralized social network with a fixed-supply token whose every
-unit is earned — no sale, no premine, no team or foundation allocation, no
-discretionary drops. Its design rests on one rule learned from a decade of
+Y is a decentralized social network with a fixed-supply token distributed
+with no sale, no team allocation, and no discretionary drops: 80% of supply
+can only be earned by using or serving the network, and the remaining 20% is
+a single disclosed treasury that unlocks linearly to fund the client and
+infrastructure — and burns whatever it has not spent by year 8. Its design rests on one rule learned from a decade of
 failed token-social experiments: **the money layer must measure nothing
 subjective.** On-chain contracts enforce only objective facts — balances,
 burns, unique names, invitations, service stakes — while everything
@@ -90,10 +92,11 @@ unfakeable.
 
 ## 4. The economy: everything earned, everything burned
 
-**Supply.** 21,000,000 Y, fixed forever. 100% of it is distributed by
-formula through two pools on a halving schedule (~2-year halvings):
+**Supply.** 21,000,000 Y, fixed forever. 80% is distributed by formula
+through two earned pools on a halving schedule (~2-year halvings); 20% is a
+disciplined treasury:
 
-- **Usage rebate pool — 75%.** Each epoch's drop is divided pro-rata among
+- **Usage rebate pool — 60%.** Each epoch's drop is divided pro-rata among
   accounts by the protocol fees they burned that epoch. Sybil-splitting a
   pro-rata share changes nothing — no personhood oracle exists or is
   needed. The only "attack" is burning fees to harvest the drop, which is
@@ -103,14 +106,20 @@ formula through two pools on a halving schedule (~2-year halvings):
   fees, real usage is rebated at more than 100% — the young network is
   effectively free, decaying smoothly to full price as it grows. The
   subsidy is a formula, not a committee.
-- **Service pool — 25%.** Split each epoch among staked service operators
+- **Service pool — 20%.** Split each epoch among staked service operators
   (indexers, storage nodes, media hosts, archivers) that answered
   liveness challenges drawn from chain randomness. Emission attached to
   verifiable work — never to social metrics.
+- **Treasury — 20%.** The single, named exception to "everything earned":
+  it funds the reference client, infrastructure, audits, and grants. Its
+  discipline is what makes it defensible — linear unlock over five years,
+  public spending, **anything unspent burns at year 8**, and it holds
+  tokens, never powers: no key or vote it controls can change a monetary
+  rule. It is provably temporary.
 
-No sale. No premine. No team, treasury, or foundation bucket. The deployer
-publishes the contracts, seeds the first invitations, and walks away owning
-nothing but what they go on to earn like everyone else. Markets form
+No sale, ever. No separate team allocation — contributors, founders
+included, are paid from the treasury in the open or earn like any user. The
+deployer retains no keys over the rules after genesis. Markets form
 organically from earned supply, as Bitcoin's did.
 
 **Flows.** All social money *moves*; only fees *mint against the schedule*:
@@ -141,7 +150,8 @@ nothing propping it. Heavy usage → shrinking float against fixed supply.
 The token cannot be worth much while the network is worthless, and cannot
 stay cheap while the network is indispensable. That is the entire trick,
 and it requires no oracle, no committee, and no faith in the founders —
-who, having no allocation, have nothing to dump.
+whose only privileged bag is a public-budget treasury that self-destructs
+on schedule.
 
 ## 5. Enforced honesty: staked services and fraud proofs
 
