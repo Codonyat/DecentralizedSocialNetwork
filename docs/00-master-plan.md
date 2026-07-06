@@ -34,7 +34,10 @@ DecentralizedSocialNetwork/
 │   ├── 08-cli.md
 │   ├── 09-first-principles-review.md
 │   ├── 10-token-economy.md
-│   └── 11-service-registry-staking.md
+│   ├── 11-service-registry-staking.md
+│   ├── 12-data-layer-implementation.md
+│   ├── 13-autonomi-deep-dive.md
+│   └── 14-decisions.md
 ├── crates/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction

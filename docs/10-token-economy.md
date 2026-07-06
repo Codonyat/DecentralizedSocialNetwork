@@ -142,22 +142,29 @@ signal destroyed). Every channel below passes it — the worst case of each
 degrades into "a token sale at market price" or "a fee discount for early
 users," never into theft or signal corruption.
 
-### 3.2 Allocation (strawman numbers — ratios are the proposal, exact values to be debated)
+### 3.2 Allocation — **PURE FAIR LAUNCH** (superseded per doc 14, D5)
 
-| Bucket | % | Amount | Mechanism | Unlock |
+> **Decision record:** the original strawman here included sale, treasury,
+> team, and retroactive-drop buckets. The founder decision (doc 14, D3/D5)
+> is a pure fair launch: **no sale, and 100% of supply is earned.**
+
+| Bucket | % | Amount | Mechanism | Schedule |
 |---|---|---|---|---|
-| **Usage rebate pool** | 30% | 6.3M | pro-rata fee rebate per epoch (§3.2.1) | ~12y, halving every 2y |
-| **Service provider pool** | 10% | 2.1M | per-epoch to staked, proven-live indexers (§3.2.2) | same schedule |
-| **Treasury** | 20% | 4.2M | client dev, grants, retroactive rewards (§3.4) | 5y linear; **unspent burns at y8** |
-| **Founders/team** | 15% | 3.15M | genesis grant | 1y cliff, 4y vest |
-| **Liquidity + public sale** | 15% | 3.15M | DEX liquidity + open sale at genesis | immediate |
-| **Genesis community drops** | 10% | 2.1M | retroactive drops by treasury during bootstrap | sunsets at y3; remainder → burn |
+| **Usage rebate pool** | 75% | 15.75M | pro-rata fee rebate per epoch (§3.2.1) | halving every ~2y |
+| **Service provider pool** | 25% | 5.25M | per-epoch to staked, proven-live service nodes (§3.2.2) | same shape, 1/3 size |
 
-Why a usage-linked pool at all, given §1.4 says appreciation is the main
+No team, treasury, foundation, sale, or discretionary bucket exists. The
+deployer holds zero tokens and zero keys after genesis. Development,
+hosting, and audits are self-funded or externally funded (grants are
+compatible with fair launch; protocol allocations are not); public-goods
+needs previously assigned to the treasury are served by **on-chain bounty
+escrows anyone can fund** (e.g. the doc 12 archive bounty).
+
+Why usage-linked pools at all, given §1.4 says appreciation is the main
 reward? Because a network where only buyers hold tokens aligns *investors*,
-not *users*. The two on-chain pools put Y specifically into the hands of
-people who used and served the network — the alignment pillar made literal —
-and they are the two channels engineered below.
+not *users*. Under fair launch this becomes total: **every token in
+existence was earned by using or serving the network** — the alignment
+pillar made literal.
 
 #### 3.2.1 Usage rebate pool — distribution by fees burned
 
@@ -228,23 +235,17 @@ fee before the remaining 90% burns).
 - Depth 1 + fixed 10% + fixed term keeps it a referral program, structurally
   incapable of MLM dynamics (no compounding tree income).
 
-### 3.4 The honest centralized components, with expiry dates
+### 3.4 The honest centralized components (superseded per doc 14, D5)
 
-Two buckets involve human judgment, and both are engineered to disappear:
-
-- **Treasury (20%)**: funds the flagship client, infrastructure grants, and
-  audits. It holds tokens, not powers (§2). Its discipline is the burn
-  clause: unspent balance is destroyed at year 8, so it cannot become a
-  perpetual foundation.
-- **Genesis community drops (10%)**: retroactive rewards to early
-  contributors/users decided by the treasury during years 0–3 (the Optimism
-  RPGF pattern). This is the bootstrap-era answer to "reward early adopters
-  by criteria too subjective for a formula" — done by a visible, named,
-  expiring party instead of a gameable algorithm. Sunsets at year 3;
-  remainder burns.
-
-Everything else — 70% of supply — distributes by formula or market from
-block 1.
+Under pure fair launch, the treasury and discretionary-drop buckets this
+section originally described **do not exist**. What remains of human
+judgment at genesis is exactly one act: the deployer publishes the contracts
+and seeds the genesis invitation accounts (doc 05), then retains nothing —
+no tokens, no keys, no upgrade path. 100% of supply distributes by formula
+from block 1. The bootstrap-era reward for early adopters is structural
+rather than discretionary: while `drop > fees`, usage is rebated at >100%
+(§3.2.1), so the founding cohort earns cheap tokens by using and serving the
+network early — no committee decides who deserved what.
 
 ### 3.5 Day-one user onboarding (how a normal person first touches Y)
 
@@ -252,8 +253,10 @@ block 1.
    (client default: "invite + starter tip" as one action) — rational for the
    inviter, who owns the referral annuity on this person's future fees.
 2. Reading is free; posting is free; earning tips requires nothing.
-3. First Y earned via tips received; first Y bought via the DEX pool only if
-   and when they want a name or promotion.
+3. First Y earned via tips received (or rebates/service income); bought on
+   the open market only if and when they want a name or promotion. There is
+   no protocol-provided liquidity (fair launch, doc 14 D5) — markets form
+   organically from earned supply, as Bitcoin's did.
 
 No step requires an exchange account before the network has demonstrated
 value to the user.
@@ -264,7 +267,7 @@ value to the user.
 
 | Pillar | X | Y |
 |---|---|---|
-| Alignment | Value accrues to $TWTR/xAI shareholders; users are inventory | Users, inviters, and service operators hold the appreciating asset; 40% of supply reaches them by formula, more via tips/sale |
+| Alignment | Value accrues to $TWTR/xAI shareholders; users are inventory | Users, inviters, and service operators hold the appreciating asset; **100% of supply reaches them by formula — there is no other way to obtain it at genesis** |
 | Arbitrary change | API pricing, reach algorithms, monetization terms, bans — changeable overnight by one owner | Monetary constitution is admin-keyless and immutable; subjective layers are per-indexer *choices* users can exit individually |
 | Predictability | Platform risk is unhedgeable | Supply, schedule, fees, slash conditions are computable to the year 2040 by anyone |
 
@@ -272,26 +275,26 @@ And the fourth, implicit pillar from doc 09 §4: **exit rights**. Identity,
 graph, and money are user-held; the worst any indexer, client, or the
 treasury can do to a user is inconvenience them into switching providers.
 
-## 5. Open decisions
+## 5. Open decisions (status per doc 14)
 
-1. **Exact allocation ratios and constants** (§3.2 numbers are strawmen; the
-   *structure* — pass/fail under §3.1 — is the proposal).
-2. **Sale mechanics** (fixed-price, LBP, or auction) and jurisdictional
-   review — a utility-shaped token with fee sinks and no profit-share is
-   deliberately far from Howey, but §3.2.2/§3.3 need counsel review.
-3. **Chain choice** (doc 09 §8.2) — sub-cent fees are a hard requirement for
-   tip-sized transactions; this decides L2 vs app-chain before any contract
-   is written.
+1. **Exact allocation ratios and constants** — structure decided (fair
+   launch, 75/25, doc 14 D5); the split and drop constants remain tunable
+   strawmen until genesis.
+2. **Sale mechanics** — RESOLVED: there is no sale (D3/D5). Legal review of
+   the fair-launch shape (fee sinks, no profit-share, no sale, no promises
+   by an issuer) is still prudent but the surface is far smaller.
+3. **Chain choice** — narrowed (D6): Ethereum L1 or a maximally trustless L2
+   meeting the doc 14 criteria (permissionless proving, no/timelocked
+   upgrades, forced inclusion, tip-economical fees).
 4. **Epoch length and halving cadence** — pick once, forever (constitution).
-5. **Whether the service pool ships at genesis** or activates in a later
-   versioned contract once spot-check proof formats are battle-tested
-   (recommendation: later; start with 40% usage-rebate pool split 30/10 held
-   in a timelocked reserve for it).
+5. **Service pool at genesis** — implied by D4 (registry open from day 1):
+   the pool ships at genesis alongside the registry; its proof formats must
+   therefore be finalized before launch, not after.
 
 *One-line summary: Y is social money + resource money + security money on an
-immutable monetary constitution; it distributes 70% by formula and market
-(fee rebates that Sybils can't game, service proofs, sale, schedule), 30% by
-visible humans whose mandates expire and unspent balances burn — so early
-adopters are rewarded by cheap acquisition, fee subsidies, referral
-annuities, and appreciation, and nobody, ever, has a lever to change the
-rules.*
+immutable monetary constitution; under the doc 14 fair launch it distributes
+**100% by formula** — fee rebates that Sybils can't game and service proofs,
+on a fixed halving schedule, with no sale, no premine, and no discretionary
+bucket — so early adopters are rewarded by cheap acquisition, fee subsidies,
+referral annuities, and appreciation, and nobody, ever, has a lever to
+change the rules or a privileged bag to dump.*

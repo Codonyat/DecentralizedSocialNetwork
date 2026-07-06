@@ -173,8 +173,10 @@ Arweave (tweet-sized objects are free-to-negligible via bundlers; a year of
 1M-posts/day text is ~365 GB ≈ \$700–3,000 one-time at 2026 prices). This
 restores the censorship-resistance story the rent model gives up: even if
 every storage node prunes or dies, the signed history exists somewhere
-nobody can edit, and anyone can re-seed Tier 1 from it. Fund it from the
-treasury initially; later, an on-chain "archive bounty" fee anyone can pay.
+nobody can edit, and anyone can re-seed Tier 1 from it. Funding: an on-chain
+**archive bounty** escrow anyone can pay into (no treasury exists under the
+doc 14 fair launch); at 2026 prices a single motivated donor covers a year
+of whole-network text archival.
 
 ### Adapters — Autonomi 2.0 and Walrus (feature-gated, non-blocking)
 
