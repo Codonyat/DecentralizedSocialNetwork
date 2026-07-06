@@ -129,7 +129,41 @@ As of July 2026, "pay once, store forever" remains the marketed model.
   as a cash signal it is loud.
 - Unresolved: a community post claims the company was "dissolved" while a
   Companies House snippet (SC297540) still shows "active" — check directly
-  from an unblocked network before treating either as fact.
+  from an unblocked network before treating either as fact. The successor is
+  **Autonomi Labs Ltd** (SC809904, inc. May 2024); the 2.0 core libraries
+  come from a third Irvine company, **Saorsa Labs Ltd** (SC813551, inc. June
+  2024). The Swiss **Autonomi Foundation** that docs say holds the token and
+  IP has **no register entry findable** — treat its operational existence as
+  unverified.
+
+### 5b. Control points (measured first-hand from the 2.0 repos)
+
+The network's *evolution* is not merely single-vendor — it is operationally
+remote-controlled:
+
+- **Protocol = a Rust crate.** No independent implementation exists and no
+  wire spec exists outside the code; the
+  [ant-protocol](https://github.com/WithAutonomi/ant-protocol) README notes
+  2.x is "not wire-compatible with 1.x." When the team changes the crate,
+  the protocol has changed.
+- **Bootstrap = 7 hardcoded company IPs** shipped in the binary
+  ([bootstrap_peers.toml](https://github.com/WithAutonomi/ant-node/blob/main/config/bootstrap_peers.toml));
+  the previous decentralized bootstrap-cache mechanism was **removed** in
+  May 2026.
+- **One key upgrades the fleet.** ant-node ships default-on auto-upgrade:
+  nodes poll GitHub releases, verify against a **single ML-DSA-65 project
+  key compiled into the binary**, and self-replace within a randomized
+  0–24 h window ([ant-node README](https://github.com/WithAutonomi/ant-node#auto-upgrade-system)).
+  Whoever holds that key can push arbitrary code to essentially the whole
+  network in a day.
+- **Single-author core.** The 2.0 node crate lists David Irvine as sole
+  author, atop Saorsa Labs' `saorsa-core`/`saorsa-transport`/`saorsa-pqc`.
+- The 1.0 sunset itself was "a considered call by the team" — no community
+  vote or RFC preceded it.
+
+The data-replication layer is autonomous; everything that decides what the
+network *is* — bootstrap, release signing, protocol definition, treasury,
+docs — sits with one founder-centered company cluster.
 
 ## 6. Fixable vs unfixable
 
@@ -137,11 +171,11 @@ As of July 2026, "pay once, store forever" remains the marketed model.
 |---|---|---|---|
 | 1 | **Pay-once economics without an endowment** | **FIXABLE-BUT-BREAKS-PROMISE** | The Jan 2026 experiment proved fees-as-designed don't sustain nodes. Fixes exist — rent, renewal, an Arweave-style endowment, or resuming emissions as a permanent subsidy from the 233M pool — but every durable fix either abandons "pay once, store forever" or turns it into "subsidized until the pool runs out." The team has so far chosen neither. |
 | 2 | **Emission farming (sybil node inflation)** | FIXABLE — and 2.0 changed the design | The 1.0 flaw was a uniform per-node lottery decoupled from stored bytes. 2.0 replaced it: node income now comes from upload payments tied to actually storing data, with fullness-based dynamic pricing and geographic-diversity anti-sybil in the DHT. Plausible fix, unproven at scale — and emissions themselves remain paused (their future "undecided"), so the fixed mechanism has never run. |
-| 3 | **Gas coupling to Arbitrum** | LARGELY FIXED | Merkle batch payments (Mar 2026) collapse 100 chunk payments into one transaction — the 99.95%-leak problem is addressed. The deeper "native token without a blockchain" promise (historically DBCs) remains unshipped after two decades and is genuinely hard without consensus: treat as UNKNOWN/aspirational. |
+| 3 | **Gas coupling to Arbitrum** | FIX IN PROGRESS, not shipped | Merkle batch payments are the answer to the 99.95% gas leak, but as of the current main branch `evmlib`'s batch-payment module is explicitly a "disk-based mock smart contract" awaiting the real on-chain contract. The deeper "native token" promise is 12 years old (Safecoin 2014 → DBC/RingCT, dead Sept 2023 → EVM pivot Oct 2024, no technical post-mortem) and is now explicitly punted to the community; independent academic work on DHT-sharded ledgers ([arXiv:2405.14991](https://arxiv.org/abs/2405.14991)) finds you can't escape consensus, only shard it — treat consensus-free native currency as unsolved. |
 | 4 | **The reset precedent** | **STRUCTURAL (reputational)** | Not a code problem and not fixable by code: a network that sunset its "permanent" mainnet once cannot re-earn permanence credibility except by years of not doing it again. Any future 2.0→3.0 break re-runs the same destruction unless a data-migration guarantee is engineered and honored; none has been committed to. |
-| 5 | **Mutable-data consistency (Pointer/Scratchpad staleness, lost updates)** | FIXABLE | Quorum/replication tuning, CRDT semantics, or version-history are ordinary distributed-systems engineering; 2.0's working replication is a prerequisite it now has. Still unproven at scale, and our MutableStore depends on exactly this. |
-| 6 | **No deletion (illegal-content/GDPR liability)** | STRUCTURAL by design | Content-addressed, replicated, owner-less storage is deliberately deletion-proof; node-level ingest blocklists could be added but conflict with the network's founding ideology, and nothing on the roadmap suggests them. |
-| 7 | **Single company, single implementation** | STRUCTURAL today, mitigable | Open source (GPL) means the code outlives the company, and the community core is real — but there is no second implementation, no independent protocol spec, and the company is winding down into a foundation. Survival currently equals "the ~same small team keeps shipping." |
+| 5 | **Mutable-data consistency (Pointer/Scratchpad staleness, lost updates)** | STRUCTURAL to the DHT design — and the team agrees | Code-level reality: last-writer-wins by counter across a 5-node close group with **no inter-node consensus**; same-counter concurrent writes fork permanently until the owner writes again; old versions are destroyed; official docs say conflict resolution "is your application's problem"; the canonical stale-read issue ([#2751](https://github.com/maidsafe/autonomi/issues/2751)) stayed open into the 2.0 era. MaidSafe's actual 2.0 answer was **repositioning, not fixing**: the official guide now calls Autonomi "immutable by design" and directs mutable/collaborative state to **x0x**, a separate CRDT gossip overlay. Single-writer LWW remains usable (our profiles/follows are single-owner), but multi-device same-account writes fork by construction. |
+| 6 | **No deletion (illegal-content/GDPR liability)** | STRUCTURAL by design | No delete RPC exists anywhere in the node; Irvine on record: "replication will 'restore' anything you think is deleted," and apps faking deletable storage are "bad apps." The only blocklists in the codebase are for misbehaving *peers*, not content — no hash-ban or ingest-filter hook exists, and no team statement on GDPR was found at all. |
+| 7 | **Single company, single implementation, single key** | STRUCTURAL today | No second implementation, no wire spec outside the Rust crates, bootstrap defaults to 7 company IPs, and a single compiled-in signing key auto-upgrades the entire fleet within ~24 h (§5b). Open licenses make a fork *possible*, but no community entity currently demonstrates the capability, and the 2.0 core is effectively single-author. Survival currently equals "the founder keeps shipping." |
 
 **Net: the two problems that killed 1.0 (economics, farming) are fixable on
 paper but unfixed in fact; the two deepest problems (reset-credibility and
@@ -155,6 +189,14 @@ foundation-funded team with an externally invisible project.**
    direct empirical validation of our Tier-1 choice (staked, *rent-paid*
    storage nodes — doc 10 reserved storage rent as a first-class fee for
    exactly this reason) over pay-once permanence.
+   **Convergence note:** Autonomi's own 2.0 repositioning — "immutable by
+   design," mutable state directed to a separate overlay — means the role
+   Autonomi now claims for itself is exactly our **Tier 3 archive role**
+   (doc 12 §4), not the hot layer, and not the MutableStore our doc 02
+   originally imagined on it. Its identity-breaking migration for mutable
+   types (owner-indexed data does not survive the PQC transition; only
+   content-addressed chunks do) independently confirms that only immutable
+   archival data should ever rest there.
 2. **The community-as-founding-cohort play (doc 12 §6) is still real** —
    arguably more so: a loyal, technically literate community whose company
    just defunded their forum is a community looking for a new project to
