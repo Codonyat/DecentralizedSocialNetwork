@@ -226,7 +226,111 @@ node, carry the hard-permanence tradeoff, and they can apply hash blocklists
   cheap calldata, since storage-rent payments are frequent small
   transactions.
 
-## 6. Bottom line
+## 6. The Autonomi partnership question
+
+Raised after the study: *Autonomi needs a success story on top — could Y be
+it?* The opportunity is real, but its shape matters.
+
+**What the partnership genuinely offers:**
+
+- **A wedge community.** Doc 09 §8.1's hardest question is "who is user
+  #1,000?" The Autonomi forum community is one concrete answer: thousands of
+  people who have waited ~two decades for exactly this category of app,
+  ideologically pre-sold on decentralization, technically literate, and with
+  no flagship app to rally around (current apps are hobby projects). A
+  network that launches *with* that community starts warm.
+- **Mutual need.** Autonomi needs proof-of-utility; we need storage and a
+  founding population. MaidSafe support, co-marketing, and grants are
+  plausible.
+- **Costs that mostly work.** ~\$0.0008 gas/record ≈ \$800 per million
+  posts; batching posts into shared chunks (Walrus-Quilt-style, via a
+  batcher role) and the promised paymasters would cut it further. Scratchpad
+  updates are free.
+
+**Why it must be a partnership, not a dependency:** the risk is
+asymmetric. A success story helps *them*; it does not protect *us* from
+their failure modes (a 19-person company, ~\$26M token, one network reset
+already). If Y's data lives only on Autonomi and a 3.0 reset happens, Y
+dies with it. And note the quiet architectural fact: users never touch the
+storage network directly — indexers serve every interactive read regardless
+(§1 performance). So "being on Autonomi" is about where authoritative bytes
+rest and who gets paid for resting them, not about user experience. That
+both shrinks the cost of adopting it and shrinks the benefit — which is
+exactly why non-exclusivity is cheap.
+
+**Recommended structure:** engage the community as a founding cohort
+(genesis-drop criteria could include it); ship the Autonomi adapter as a
+first-class Tier 1 *option* for storage-node operators (an operator may
+satisfy possession challenges by resting bytes on Autonomi) and/or as an
+alternative Tier 3 archive; co-market the launch; keep the trait abstraction
+and the Arweave archive so a network reset is a re-seeding event, not an
+extinction event. Promotion trigger as in §4.
+
+## 7. Signatures, revisited (a partial retraction)
+
+"Autonomi 2.0 broke BLS" is **not** by itself a strong argument against
+Autonomi — signature schemes are an engineering decision, and A5 (versioned
+signature scheme bound through the IdentityRegistry) is worth doing
+regardless. Two specific consequences are real, though:
+
+1. **Loss of BLS public-key child derivation.** Doc 02's
+   `mutable_address_for(root_pk, purpose)` — any client computing another
+   user's derived storage addresses from their root public key — relies on
+   BLS's homomorphic key derivation. ML-DSA has no equivalent. The fix is
+   mundane: derive *addresses* by hashing `(root_pk || purpose)` and have
+   the owner publish signed pointer records there, or publish a signed
+   key-manifest. Doc 02 needs that amendment whichever backend we choose.
+2. **Signature size.** ML-DSA-65 signatures are ~3.3 KB vs BLS's 96 bytes —
+   for a tweet-sized post the signature would be ~10× the content. On
+   flat-priced chunks this costs nothing; on bandwidth and any per-byte
+   layer it's real. Mitigation: sign batches/manifests rather than
+   individual tiny objects, or keep app-layer signatures in a compact
+   classical scheme (ed25519/BLS) with the PQ layer being Autonomi's
+   transport concern, accepting a future PQ migration via key rotation
+   (doc 01) — which is the industry-wide posture anyway.
+
+Separately (and independently of Autonomi): the L2 contract suite will use
+EVM accounts, so a dual-key identity (chain key + content-signing keys bound
+via the IdentityRegistry, Farcaster's custody-plus-signers pattern) was
+already implied. A5 stands; "signatures are a problem with Autonomi" mostly
+does not.
+
+## 8. Autonomi's actual problem list, ranked
+
+1. **Continuity.** The "permanent" 1.0 network was sunset 13 months after
+   launch without confirmed data migration. Everything else is secondary to
+   this: pay-once-forever has already been broken once by the operator
+   itself.
+2. **Unproven node economics.** Emissions paused; node revenue ~\$0.0001/GB
+   in ANT one-time. Perpetual storage from one-time payments requires
+   perpetual network growth or perpetually falling hardware costs; if either
+   stalls, nodes quit and data follows. (Arweave at least formalizes this
+   bet as an endowment; Autonomi's version is vaguer.)
+3. **Small-network fragility.** Post-emission node count collapsed ~99%+;
+   replication storms followed; 2.0 counts are unpublished. A social
+   network's data should not sit on a storage network smaller than its own
+   service layer would be.
+4. **Mutable-data consistency.** Quorum staleness, lost-update windows, no
+   version history — exactly where our profiles/follows/feed indices live.
+   Free updates are only valuable if they're reliable.
+5. **Latency.** Fine for blob fetch, not interactive; forces full indexer
+   caching (which we planned — but it means Autonomi adds no serving value,
+   only resting value).
+6. **EVM gas coupling.** Per-record Arbitrum transactions; paymasters
+   promised, unshipped; "native token later" still a promise after 20 years.
+7. **Ecosystem thinness.** One ~19-person company, 0.x SDK mid-rename, docs
+   gaps on precisely our types (Pointer/GraphEntry), no production app
+   precedent, bus-factor risk.
+8. **Legal posture.** Permanence-without-deletion concentrates CSAM/GDPR
+   liability on node operators with no ingest blocklist mechanism — a
+   problem our Tier 1/Tier 3 split handles and pure Autonomi doesn't.
+
+None of these is "signatures." Most of them are versions of one meta-point:
+Autonomi's value proposition to us is *authoritative resting bytes plus a
+payment rail for storage* — and §4's Tier 1 + archive provides the same
+with components that are either under our economic control or battle-proven.
+
+## 9. Bottom line
 
 Build the boring thing the evidence supports: **our own staked, rent-paid,
 slashable storage/media nodes as the hot layer** (the shape every surviving
