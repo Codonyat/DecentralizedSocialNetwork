@@ -5,12 +5,12 @@
 ```
 crates/core/src/
 ├── lib.rs              # Re-exports all public types
-├── identity.rs         # BLS key wrappers, user identity
+├── identity.rs         # BLS key wrappers, user identity, identity registry types
 ├── post.rs             # Post, reply, thread types
 ├── profile.rs          # User profile
 ├── social.rs           # Follow list, feed index
-├── token.rs            # Bond, Donation, NameRegistration (on-chain types)
-├── epoch.rs            # Block-based epoch definitions, emission schedule
+├── token.rs            # Tip, Promotion, NameRegistration/Renewal (on-chain types)
+├── epoch.rs            # Block-based epoch definitions, rebate drop schedule
 ├── chain_events.rs     # ChainEvent enum (smart contract events)
 ├── crypto.rs           # Hashing, signing helpers
 ├── address.rs          # Content addresses, key addresses
@@ -42,7 +42,9 @@ pub struct Signature(pub [u8; 96]);
 /// A user identity combining key material with a human-readable handle.
 /// The display_name is purely cosmetic. The PublicKey is the only canonical identity.
 /// An optional `registered_name` can be claimed on-chain via NameRegistration
-/// (unique, verified, costs Y to register).
+/// (unique, verified, costs Y to register and renew annually). The registered
+/// name resolves to the *identity* (see Identity Registry Types below), not the
+/// raw key, so key rotation does not orphan names.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub public_key: PublicKey,
@@ -100,6 +102,44 @@ For development and simulation, we use a simplified BLS:
 
 This is NOT cryptographically secure — it's structurally correct for testing protocol logic. When integrating with Autonomi, these types will convert to/from real BLS types via the data layer.
 
+## Identity Registry Types (`identity.rs`)
+
+One key = total loss is not acceptable for ordinary humans (doc 09 §2.6). The on-chain `IdentityRegistry` contract (doc 00 contract list) gives every account a **stable identity id** — the genesis public key — that can be re-pointed to a new key:
+
+- **Rotation**: `rotate(new_key)`, signed by the *current* key, re-points the identity to `new_key`.
+- **Social recovery (opt-in)**: M-of-N guardians can initiate a recovery rotation if the current key is lost. A veto window (`RECOVERY_VETO_EPOCHS`) follows, during which the current key can cancel — so a compromised guardian set cannot silently steal an identity whose owner still holds the key.
+- **Signature semantics**: content signatures verify against the key that was *current at write time* — the chain records the block of every rotation, so any verifier can determine which key was valid when. Indexers resolve identity → current key for display and addressing.
+
+```rust
+/// Epochs during which the current key can cancel a pending guardian recovery.
+pub const RECOVERY_VETO_EPOCHS: u64 = 2;
+
+/// A key rotation record (on-chain).
+/// Re-points a stable identity to a new key. Signed by the current key
+/// (or executed by the IdentityRegistry after an unvetoed guardian recovery).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct KeyRotation {
+    /// The stable identity id (the genesis public key).
+    pub identity: PublicKey,
+    /// The key being rotated away from (must be the current key).
+    pub old_key: PublicKey,
+    /// The new current key.
+    pub new_key: PublicKey,
+    /// Signature by `old_key` over the fields above.
+    pub signature: Signature,
+}
+
+/// Opt-in M-of-N social recovery configuration (on-chain).
+/// `threshold` of `guardians` can initiate a recovery rotation; the current
+/// key can veto within RECOVERY_VETO_EPOCHS. The invitation tree provides
+/// natural guardian candidates (doc 09 §2.6).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RecoveryConfig {
+    pub guardians: Vec<PublicKey>,
+    pub threshold: u8,
+}
+```
+
 ## Address Types (`address.rs`)
 
 ```rust
@@ -156,10 +196,6 @@ pub struct Post {
     /// Timestamp (informational, not trusted for protocol logic).
     pub created_at: chrono::DateTime<chrono::Utc>,
 
-    /// The amount of Y the author bonds on this post at creation time.
-    /// This is the mandatory first bond — recorded on-chain via a Bond transaction.
-    pub initial_bond_amount: u64,
-
     /// BLS signature over all fields above.
     pub signature: Signature,
 }
@@ -182,7 +218,6 @@ impl Post {
         content: String,
         reply_to: Option<ContentAddress>,
         sequence: u64,
-        initial_bond_amount: u64,
     ) -> Self;
 
     /// Verify the post's signature.
@@ -203,7 +238,8 @@ impl Post {
 - `signature` must verify against `author` and `signable_bytes()`
 - `sequence` must be strictly greater than the author's last known sequence
 - `reply_to`, if present, must reference an existing post
-- `initial_bond_amount > 0` (every post must have a non-zero creator bond)
+
+Posting carries no protocol fee — costs sit on amplification and scarce namespace, never on existence (doc 10 §1.2).
 
 ## Profile Types (`profile.rs`)
 
@@ -262,96 +298,124 @@ pub struct FeedIndex {
 All token operations happen on-chain via smart contracts. These types represent the on-chain data structures that the smart contract manages. Token Y is the sole token — there is no separate reputation token.
 
 ```rust
-/// A bond placed on a post (on-chain).
-/// Bonds are the primary curation signal. Bonding Y on a post signals
-/// belief in its quality. A fraction of the bond is burned (deflationary).
+/// A tip to a post's creator (on-chain).
+/// Tips transfer existing Y from sender to creator with a small flat burn.
+/// Nothing is minted against tips (doc 10 §1.1).
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Bond {
-    /// The user placing the bond.
-    pub bonder: PublicKey,
-    /// Content hash of the post being bonded on.
-    pub post_content_hash: ContentAddress,
-    /// Amount of Y bonded.
-    pub amount: u64,
-    /// True if this is the mandatory creator bond (first bond on the post).
-    pub is_first_bond: bool,
-}
-
-/// A donation to a post's creator (on-chain).
-/// Donations transfer Y to the creator with a fraction burned.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Donation {
-    /// The user making the donation.
-    pub donor: PublicKey,
-    /// Content hash of the post being donated to.
-    pub post_content_hash: ContentAddress,
-    /// The creator who receives the donation.
+pub struct Tip {
+    /// The user sending the tip. May be a one-time derived key for privacy
+    /// (doc 09 §2.7).
+    pub sender: PublicKey,
+    /// 32-byte memo: content address of the post being rewarded, so indexers
+    /// can attribute tips to content.
+    pub post_ref: ContentAddress,
+    /// The creator who receives the tip.
     pub creator: PublicKey,
-    /// Total amount of Y donated.
+    /// Total amount of Y tipped.
     pub amount: u64,
-    /// Fraction burned (e.g., 5%).
+    /// Fraction burned (1%, TIP_BURN_RATE_BPS).
     pub burn_amount: u64,
     /// Remainder transferred to the creator.
     pub creator_amount: u64,
 }
 
+/// A promotion burn on a post (on-chain).
+/// Pay-to-amplify: the amount is a protocol fee routed through the referral
+/// split — ≥90% burned, with no return path. An advertising cost, not an
+/// investment (replaces bonding, doc 09 §2.3).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Promotion {
+    /// The user paying to promote the post.
+    pub promoter: PublicKey,
+    /// Content hash of the post being promoted.
+    pub post_hash: ContentAddress,
+    /// Amount of Y paid (fee-split, then burned).
+    pub amount: u64,
+}
+
 /// A name registration (on-chain).
-/// Burns Y to claim a unique human-readable name.
+/// Pays Y (via the fee split) to claim a unique human-readable name for one
+/// term. Names lapse past a grace period and recycle (doc 03 §D).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NameRegistration {
     /// The user claiming the name.
     pub owner: PublicKey,
     /// The registered name (lowercase alphanumeric + hyphens, 1-32 chars).
     pub name: String,
-    /// Amount of Y burned to register this name.
+    /// Amount of Y paid to register this name.
     pub burn_cost: u64,
+    /// The epoch through which this registration is paid
+    /// (registration epoch + NAME_TERM_EPOCHS).
+    pub paid_through_epoch: u64,
+}
+
+/// A name renewal (on-chain).
+/// Pays the tier price to extend a name's exclusivity by one term.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NameRenewal {
+    /// The current owner of the name.
+    pub owner: PublicKey,
+    /// The name being renewed.
+    pub name: String,
+    /// Amount of Y paid (the tier price, doc 03 §D).
+    pub cost: u64,
+    /// The new paid-through epoch (previous paid_through + NAME_TERM_EPOCHS).
+    pub new_paid_through_epoch: u64,
 }
 
 /// An invitation record (on-chain).
-/// Invitations form a web-of-trust tree rooted at genesis users.
+/// The registry records who vouched for whom; `invited_at_epoch` anchors the
+/// referral term (doc 05).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OnChainInvitation {
     /// The user issuing the invitation.
     pub inviter: PublicKey,
     /// The user being invited.
     pub invitee: PublicKey,
-    /// Amount of Y burned to issue this invitation.
-    pub y_cost: u64,
-    /// Trust distance from genesis (inviter's distance + 1).
-    pub trust_distance: u32,
+    /// Y fee paid to issue this invitation (routed through the fee split).
+    pub y_fee: u64,
+    /// The epoch in which the invitation was recorded.
+    pub invited_at_epoch: u64,
 }
 ```
 
 ### Validation Rules
 
-**Bond:**
-- `amount > 0`
-- If `is_first_bond == true`, `bonder` must be the post author
-- A post must have exactly one first bond (the creator bond)
-- `bonder` must have sufficient Y balance on-chain
-
-**Donation:**
+**Tip:**
 - `amount > 0`
 - `burn_amount + creator_amount == amount`
-- `burn_amount` must match `amount * donation_burn_rate_bps / 10_000`
-- `donor` must have sufficient Y balance on-chain
-- `creator` must be the actual author of the referenced post
+- `burn_amount` must match `amount * TIP_BURN_RATE_BPS / 10_000` (1%, doc 03 §B)
+- `sender` must have sufficient Y balance on-chain
+- `post_ref` is an informational memo; indexers attribute tips to content by it
+
+**Promotion:**
+- `amount` must meet the configured minimum promotion (doc 03 §C)
+- `promoter` must have sufficient Y balance on-chain
+- The full amount is fee-split (≥90% burned); nothing is returned
 
 **NameRegistration:**
 - `name` must match `^[a-z0-9-]{1,32}$`
-- `name` must not already be registered
-- `burn_cost` must meet the configured minimum
+- `name` must not be registered, or its previous registration must be expired
+  (past `paid_through_epoch + NAME_GRACE_PERIOD_EPOCHS`, doc 03 §D)
+- `burn_cost` must match the tier price for the name's length
+- `paid_through_epoch == registration_epoch + NAME_TERM_EPOCHS`
+- `owner` must have sufficient Y balance on-chain
+
+**NameRenewal:**
+- `name` must be registered to `owner` and within its term or grace period
+- `cost` must match the tier price for the name's length
+- `new_paid_through_epoch == paid_through_epoch + NAME_TERM_EPOCHS`
 - `owner` must have sufficient Y balance on-chain
 
 **OnChainInvitation:**
 - `inviter` must be an existing invited user (or genesis)
 - `invitee` must not already be invited
-- `y_cost` must match `EpochConfig::invitation_cost_y`
-- `trust_distance == inviter.trust_distance + 1`
+- `y_fee` must match `EpochConfig::invitation_cost_y`
+- `invited_at_epoch` must be the current epoch at inclusion
 
 ## Epoch Types (`epoch.rs`)
 
-Epochs are block-based: the smart contract advances the epoch after a fixed number of blocks. Emission is distributed on-chain at epoch boundaries.
+Epochs are block-based: the smart contract advances the epoch after a fixed number of blocks. The usage rebate drop is distributed on-chain at epoch boundaries, **pro-rata to eligible protocol fees burned that epoch** (doc 03 §E) — not to creators by any social metric.
 
 ```rust
 /// Configuration constants for epoch mechanics (on-chain, set at contract deployment).
@@ -359,43 +423,45 @@ Epochs are block-based: the smart contract advances the epoch after a fixed numb
 pub struct EpochConfig {
     /// Number of blockchain blocks per epoch.
     pub epoch_duration_blocks: u64,
-    /// Burn rate for bonds (basis points, e.g., 1000 = 10%).
-    pub bond_burn_rate_bps: u64,
-    /// Burn rate for donations (basis points, e.g., 500 = 5%).
-    pub donation_burn_rate_bps: u64,
+    /// Burn rate for tips (basis points, 100 = 1%, doc 03 §B).
+    pub tip_burn_rate_bps: u64,
+    /// Share of protocol fees paid to the payer's direct inviter (basis points, 1000 = 10%).
+    pub referral_share_bps: u64,
+    /// Epochs during which an invitee's fees pay their inviter (208 ≈ 4 years).
+    pub referral_term_epochs: u64,
     /// Y cost to issue an invitation.
     pub invitation_cost_y: u64,
-    /// Maximum percentage of epoch emission any single creator can receive (basis points).
-    pub per_creator_emission_cap_bps: u64,
+    /// Y bond required to participate in moderation (10 Y, doc 06).
+    pub moderation_bond_y: u64,
 }
 
-/// Y emission schedule — fixed at contract deployment, halving-based.
-/// Enforced on-chain by the smart contract.
-pub struct EmissionSchedule {
-    /// Total supply of Y (in atomic units).
-    pub total_supply: u64,                  // e.g., 21_000_000 * 10^6
-    /// Y emitted per epoch (before any halving).
-    pub initial_emission_per_epoch: u64,    // e.g., 10_000
-    /// Number of epochs between halvings.
-    pub halving_interval: u64,              // e.g., 52
+/// Usage rebate drop schedule — fixed at contract deployment, halving-based.
+/// Enforced on-chain by the RebatePool contract (doc 11 §1.1).
+pub struct RebateSchedule {
+    /// Total Y in the usage rebate pool (in atomic units).
+    pub total_pool: u64,                 // 6_300_000 * 10^6 (30% of supply, doc 10 §3.2)
+    /// Y dropped per epoch (before any halving).
+    pub initial_drop_per_epoch: u64,     // 30_000 * 10^6
+    /// Number of epochs between halvings (~2 years).
+    pub halving_interval: u64,           // 104
 }
 ```
 
-### Emission Calculation
+### Rebate Drop Calculation
 
 ```rust
-impl EmissionSchedule {
-    /// Compute Y emission for a given epoch number.
-    /// This logic is mirrored in the smart contract.
-    pub fn emission_for_epoch(&self, epoch: u64) -> u64 {
+impl RebateSchedule {
+    /// Compute the rebate drop for a given epoch number.
+    /// This logic is mirrored in dsn-token-y and the smart contract (doc 03 §A).
+    pub fn rebate_drop_for_epoch(&self, epoch: u64) -> u64 {
         let halvings = epoch / self.halving_interval;
-        // After ~20 halvings, emission is effectively zero
+        // After ~20 halvings, the drop is effectively zero
         if halvings >= 20 { return 0; }
-        self.initial_emission_per_epoch >> halvings
+        self.initial_drop_per_epoch >> halvings
     }
 
-    /// Compute total Y emitted up to (not including) a given epoch.
-    pub fn total_emitted_before_epoch(&self, epoch: u64) -> u64;
+    /// Compute total Y dropped up to (not including) a given epoch.
+    pub fn total_dropped_before_epoch(&self, epoch: u64) -> u64;
 }
 ```
 
@@ -413,40 +479,79 @@ pub enum ChainEvent {
         to: PublicKey,
         amount: u64,
     },
-    /// A bond placed on a post.
-    Bond {
-        bonder: PublicKey,
+    /// A promotion burn on a post (pay-to-amplify).
+    Promotion {
+        promoter: PublicKey,
         post_hash: ContentAddress,
         amount: u64,
     },
-    /// A donation made to a post's creator.
-    Donation {
-        donor: PublicKey,
-        post_hash: ContentAddress,
+    /// A tip sent to a post's creator (transfer + flat burn).
+    Tip {
+        sender: PublicKey,
+        post_ref: ContentAddress,
+        creator: PublicKey,
         amount: u64,
+        burn: u64,
     },
     /// A unique name registered on-chain.
     NameRegistered {
         owner: PublicKey,
         name: String,
         cost: u64,
+        paid_through_epoch: u64,
+    },
+    /// A name renewed for another term.
+    NameRenewed {
+        owner: PublicKey,
+        name: String,
+        cost: u64,
+        new_paid_through_epoch: u64,
+    },
+    /// A name lapsed past its grace period and became registrable again.
+    NameExpired {
+        name: String,
     },
     /// An invitation issued on-chain.
     Invitation {
         inviter: PublicKey,
         invitee: PublicKey,
-        cost: u64,
+        fee: u64,
+        epoch: u64,
+    },
+    /// A referral cut paid to an inviter from a direct invitee's protocol fee.
+    ReferralPaid {
+        inviter: PublicKey,
+        invitee: PublicKey,
+        amount: u64,
     },
     /// The epoch counter advanced.
     EpochAdvanced {
         epoch: u64,
-        emission: u64,
+        drop: u64,
     },
-    /// Emission distributed to a creator for an epoch.
-    EmissionDistributed {
+    /// Usage rebate distributed to an account for an epoch
+    /// (pro-rata to eligible fees burned, doc 03 §E).
+    RebateDistributed {
         epoch: u64,
-        creator: PublicKey,
+        account: PublicKey,
         amount: u64,
+    },
+    /// An identity re-pointed to a new key (IdentityRegistry).
+    KeyRotated {
+        identity: PublicKey,
+        old_key: PublicKey,
+        new_key: PublicKey,
+    },
+    /// A service (indexer) registered with a stake (doc 11).
+    ServiceRegistered {
+        service_key: PublicKey,
+        stake: u64,
+    },
+    /// A service slashed on a verified fraud proof (doc 11 §3.4).
+    ServiceSlashed {
+        service_key: PublicKey,
+        burned: u64,
+        bounty: u64,
     },
 }
 ```

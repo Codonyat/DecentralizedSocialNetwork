@@ -1,17 +1,50 @@
-# Invitation Tree & Trust Distance (`dsn-invitation`)
+# Invitation Registry & Referral Annuity (`dsn-invitation`)
 
 ## Purpose
 
-The invitation system provides Sybil resistance via an on-chain invitation tree. Each invitation burns Y (flat cost), creating an auditable tree structure. Trust distance (graph distance between accounts) is used to weight donations for emission calculation.
+The invitation system is the network's **membership registry and growth
+engine**. Each invitation is an on-chain record (invitee → inviter) created by
+paying a flat Y fee. The registry serves three roles:
+
+1. **Membership & discovery** — every legitimate account enters through an
+   invitation (or genesis). Indexers bootstrap user discovery from these
+   events (doc 07).
+2. **Accountability data** — the tree records who vouched for whom. Clients
+   and indexers may use it for *informational* purposes (display, trust-
+   informed filtering, spam heuristics). It is **never consulted by any
+   monetary contract** — see "What the tree is NOT" below.
+3. **Referral annuity** — the inviter earns 10% of the protocol fees their
+   direct invitees burn for ~4 years (doc 10 §3.3). This is the early-adopter
+   reward mechanism: it pays for recruiting people who *actually use* the
+   network.
+
+## What the tree is NOT (design history)
+
+An earlier revision weighted donations by graph distance in this tree for
+Sybil resistance and emission calculation. That design was removed (doc 09
+§2.1–2.2): tree distance measures topology, not identity — invite markets
+place an attacker's purchased accounts far apart (full weight) while genuine
+friends sit close together (penalized), inverting the intended incentive; and
+per-donation shortest-path computation is impractical on-chain, which would
+have smuggled a trusted weight-oracle into the money layer.
+
+Consequences in the current design:
+
+- No graph-distance weighting exists anywhere in the monetary layer.
+- Sybil resistance is not this module's job. Accounts are cheap by design;
+  what Sybils could once *earn* (emission) no longer exists (doc 10 §3.2.3),
+  and pro-rata rebates are Sybil-invariant (doc 03 §E).
+- Graph utilities remain available for **edge-layer** consumers only
+  (indexer display, client-side trust heuristics).
 
 ## Module Structure
 
 ```
 crates/invitation/src/
   lib.rs
-  invite.rs            # Invitation logic
-  trust_distance.rs    # Trust distance + graph distance computation
-  donation_weight.rs   # Trust-distance-based donation weighting
+  invite.rs            # Invitation validation logic
+  referral.rs          # Referral annuity queries (term, cut, attribution)
+  tree.rs              # Informational tree queries (chain, depth, subtree) — edge-layer only
   error.rs
 ```
 
@@ -19,28 +52,30 @@ crates/invitation/src/
 
 ```
 dsn-invitation depends on:
-  - dsn-core    (PublicKey, ContentAddress, etc.)
-  - dsn-chain   (ChainClient trait for on-chain operations)
+  - dsn-core     (PublicKey, ContentAddress, etc.)
+  - dsn-chain    (ChainClient trait for on-chain operations)
+  - dsn-token-y  (INVITATION_COST_Y, referral math)
 ```
 
 ## Core Concepts
 
-### Invitation Tree
+### Invitation Registry
 
-- Invitations are ON-CHAIN smart contract calls
-- Each invitation burns Y (flat cost, defined in EpochConfig::invitation_cost_y)
-- Tree structure: each account has exactly one inviter (except genesis accounts)
-- Genesis accounts seeded by contract deployer at distance 0
+- Invitations are ON-CHAIN calls to the `InvitationRegistry` contract (doc 11 §1.1).
+- Each invitation costs a flat fee (`INVITATION_COST_Y`, doc 03 §C), routed
+  through the standard fee split: 10% to the *inviter's own* inviter if
+  within term, remainder burned. The fee is rebate-eligible (doc 03 §E).
+- Tree structure: each account has exactly one inviter (except genesis
+  accounts, seeded at deployment by the steward role — doc 09 §3).
+- The registry records `invited_at_epoch`, which anchors the referral term
+  and the account-age criterion used by moderation eligibility (doc 06).
 
-### Two Distinct Distance Concepts
+### Onboarding Convention
 
-1. **Depth** = hops from genesis (each account has exactly one). Property of the tree, not used directly for weighting.
-2. **Graph distance** = shortest path between two accounts in the invitation tree. This is what weights donations. Sock puppets created by the same inviter have graph distance 2 from each other (very close), making cross-puppet donations low-weight.
-
-### Trust Distance
-
-- `trust_distance(account) = inviter's trust_distance + 1`
-- Genesis accounts have trust_distance = 0
+Clients SHOULD bundle "invite + starter tip" as one action (doc 10 §3.5):
+the inviter pays the invite fee and gifts pocket Y, which is individually
+rational — the inviter owns the referral annuity on this person's future
+fees. This is how a new user first touches Y without an exchange.
 
 ## Types
 
@@ -49,19 +84,19 @@ dsn-invitation depends on:
 pub struct OnChainInvitation {
     pub inviter: PublicKey,
     pub invitee: PublicKey,
-    pub y_cost: u64,
-    pub trust_distance: u32,  // invitee's trust distance (inviter's + 1)
+    pub y_fee: u64,
+    pub invited_at_epoch: u64,
 }
 ```
 
-## Invitation Creation (invite.rs)
+## Invitation Creation (`invite.rs`)
 
 ```rust
 /// Validate an invitation before submitting on-chain.
 /// Preconditions:
-/// - Inviter must be an existing on-chain account
-/// - Invitee must NOT already exist in the invitation tree
-/// - Inviter must have sufficient Y balance >= invitation_cost_y
+/// - Inviter must be an existing on-chain account (invited or genesis)
+/// - Invitee must NOT already exist in the registry
+/// - Inviter must have Y balance >= INVITATION_COST_Y
 /// - Cannot self-invite
 pub fn validate_invitation(
     inviter: &PublicKey,
@@ -72,64 +107,68 @@ pub fn validate_invitation(
 ) -> Result<(), InvitationError>;
 ```
 
-### Anti-Sybil Economics
+## Referral Annuity (`referral.rs`)
 
-- Creating sock puppets costs Y per invite
-- Sock puppets are CLOSE in trust tree (low donation weight when self-donating)
-- Y cost is the natural limiter (optionally also per-epoch cap in contract)
-
-## Trust Distance Computation (trust_distance.rs)
+The fee-routing itself is enforced by the `ReferralRouter` contract at burn
+time (doc 11 §1.1); this module provides the matching pure math and queries.
 
 ```rust
-/// Compute the trust distance (depth) of an account from genesis.
-/// Returns None if the account is not in the invitation tree.
-pub fn trust_distance(
-    invitee: &PublicKey,
-    invitation_tree: &HashMap<PublicKey, PublicKey>, // invitee -> inviter
-) -> Option<u32>;
+/// Re-exported constants (canonical values in dsn-token-y, doc 03 §C):
+///   REFERRAL_SHARE_BPS = 1_000  (10%)
+///   REFERRAL_TERM_EPOCHS = 208  (~4 years)
 
-/// Compute the graph distance between two accounts in the invitation tree.
-/// This is the shortest path through the tree (going up to common ancestor, then down).
-pub fn graph_distance(
-    account_a: &PublicKey,
-    account_b: &PublicKey,
-    invitation_tree: &HashMap<PublicKey, PublicKey>,
-) -> Option<u32>;
+/// Whether fees paid by `invitee` currently route a cut to their inviter.
+pub fn referral_active(invitation: &OnChainInvitation, current_epoch: u64) -> bool;
+
+/// Total referral earnings of an inviter, computed from chain events.
+/// (Convenience for clients/indexers; the chain is the source of truth.)
+pub fn referral_earnings(
+    inviter: &PublicKey,
+    fee_events: &[FeeEvent], // (payer, fee, epoch) from the chain listener
+    registry: &HashMap<PublicKey, OnChainInvitation>,
+    current_epoch: u64,
+) -> u64;
 ```
 
-## Donation Weighting (donation_weight.rs)
+Properties (doc 10 §3.3): depth 1 only — an inviter earns from direct
+invitees, never from invitees-of-invitees, so income cannot compound down the
+tree (referral program, not MLM). Objective and oracle-free: eligibility is a
+registry lookup plus epoch arithmetic.
+
+## Informational Tree Queries (`tree.rs`) — edge-layer only
+
+These functions support display ("your invitation chain"), analytics, and
+optional client-side trust heuristics. **No monetary contract consumes their
+output.**
 
 ```rust
-/// Weight a donation based on the graph distance between donor and creator.
-/// Greater distance = more weight (harder to fake with sock puppets).
-///
-/// | Graph Distance | Weight |
-/// |----------------|--------|
-/// | 0 (self)       | 0.0    |
-/// | 1              | 0.5    |
-/// | 2              | 0.75   |
-/// | 3+             | 1.0    |
-pub fn donation_weight_from_distance(graph_distance: u32) -> f64;
+/// Depth of an account from genesis (hops up the inviter chain).
+pub fn invitation_depth(
+    account: &PublicKey,
+    registry: &HashMap<PublicKey, PublicKey>, // invitee -> inviter
+) -> Option<u32>;
+
+/// The inviter chain from an account up to its genesis root.
+pub fn invitation_chain(
+    account: &PublicKey,
+    registry: &HashMap<PublicKey, PublicKey>,
+) -> Vec<PublicKey>;
+
+/// Direct invitees of an account.
+pub fn direct_invitees(
+    account: &PublicKey,
+    registry: &HashMap<PublicKey, PublicKey>,
+) -> Vec<PublicKey>;
 ```
-
-### Why This Works Against Sock Puppets
-
-- Attacker creates accounts A and B via the same inviter
-- A and B have graph distance 2 (A->inviter->B)
-- Donations from A to B get weight 0.75 (reduced)
-- Attacker creates A, then A invites B
-- A and B have graph distance 1
-- Donations from A to B get weight 0.5 (heavily reduced)
-- Self-donations (distance 0) get weight 0.0
 
 ## Constants
 
 ```rust
-/// Default invitation cost in Y (can be overridden in EpochConfig).
-pub const DEFAULT_INVITATION_COST_Y: u64 = 100_000_000; // 100 Y
+/// Canonical fee lives in dsn-token-y (doc 03 §C).
+pub use dsn_token_y::INVITATION_COST_Y; // 100 Y
 
-/// Maximum depth for graph distance computation.
-pub const MAX_GRAPH_DISTANCE_DEPTH: u32 = 100;
+/// Safety bound for chain walks in tree.rs.
+pub const MAX_CHAIN_DEPTH: u32 = 1_000;
 ```
 
 ## Error Types
@@ -143,10 +182,10 @@ pub enum InvitationError {
     #[error("cannot invite yourself")]
     SelfInvitation,
 
-    #[error("invitee already exists in the invitation tree")]
+    #[error("invitee already exists in the invitation registry")]
     AlreadyInvited,
 
-    #[error("inviter not found in invitation tree")]
+    #[error("inviter not found in invitation registry")]
     InviterNotFound,
 
     #[error("chain error: {0}")]
@@ -156,12 +195,25 @@ pub enum InvitationError {
 
 ## Anti-Gaming Analysis
 
-### Sybil via Invitation Chains
+### Referral self-dealing
 
-**Attack**: Attacker creates a chain of puppet accounts.
-**Defense**: Each invitation costs Y (burned). Creating 10 puppets costs 10 x invitation_cost Y. And all puppets are close in the tree, making cross-puppet donations low-weight.
+**Attack**: Invite your own Sybil account, then route your fee spending
+through it to collect the 10% referral cut.
+**Outcome**: You paid the invite fee, and the "cut" returns 10% of money that
+was already 100% yours while 90% burns. Strictly lossy. (Doc 10 §3.3.)
 
-### Self-Donation Rings
+### Invite-market Sybils
 
-**Attack**: A invites B, B donates to A's posts.
-**Defense**: Graph distance A<->B = 1, donation weight = 0.5. The donation costs Y (5% burned), so it's a net loss for the attacker.
+**Attack**: Buy invitations from strangers to mass-create accounts.
+**Outcome**: Accounts are obtainable at the invite price — by design. There
+is nothing account-multiplication can earn: rebates are pro-rata to fees
+burned (account count is irrelevant, doc 03 §E), tips mint nothing, and
+emission-by-social-metric no longer exists. The invite fee is a growth
+throttle and fee sink, not a Sybil proof (doc 09 §2.2).
+
+### MLM shaping
+
+**Attack**: Build a deep recruiting tree expecting compounding income.
+**Outcome**: Referral income is depth-1 only and time-limited per invitee.
+There is no downline. Recruiting many *active* users directly is exactly the
+behavior the mechanism intends to pay for.

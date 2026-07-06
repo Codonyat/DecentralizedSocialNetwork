@@ -11,13 +11,13 @@ crates/cli/src/
 ├── main.rs             # Entry point, tokio runtime, clap dispatch
 ├── commands/
 │   ├── mod.rs          # Command enum re-exports
-│   ├── key.rs          # Key generation, import, export
+│   ├── key.rs          # Key generation, import, export, rotation, social recovery
 │   ├── profile.rs      # Profile create, update, view
 │   ├── post.rs         # Post create, read, reply, thread view
 │   ├── social.rs       # Follow, unfollow, feed view
-│   ├── token_y.rs      # Donate, tip, view balance, emission info
-│   ├── bond.rs         # Place bonds, view bonds, check prices
-│   ├── name.rs         # Register names, lookup, cost check
+│   ├── token_y.rs      # Tip, view balance, rebate info, referral earnings
+│   ├── promote.rs      # Boost posts (promotion burns), view promotion totals
+│   ├── name.rs         # Register and renew names, lookup, cost check
 │   ├── invitation.rs   # Invite users, view invitation chain
 │   └── moderation.rs   # Flag content, counter-flag, view flags
 ├── config.rs           # Configuration loading (file + env + flags)
@@ -71,8 +71,8 @@ pub enum Command {
     /// Token Y operations
     #[command(name = "y")]
     TokenY(TokenYCommand),
-    /// Bonding on posts
-    Bond(BondCommand),
+    /// Promotion (pay-to-amplify burns) on posts
+    Promote(PromoteCommand),
     /// Name registration
     Name(NameCommand),
     /// Invitation management
@@ -115,6 +115,22 @@ pub enum KeyAction {
     },
     /// Show key info (public key, short ID, derived addresses)
     Info,
+    /// Rotate to a new key: generates a new keyfile and submits the rotation
+    /// via the on-chain IdentityRegistry, signed by the current key (doc 09 §2.6)
+    Rotate {
+        /// Path to write the new keyfile (default: ~/.dsn/key.enc)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Configure M-of-N social recovery guardians with a veto window (doc 01, doc 09 §2.6)
+    RecoverySetup {
+        /// Guardian public keys (hex); the invitation tree is a natural source
+        #[arg(long, required = true)]
+        guardians: Vec<String>,
+        /// Number of guardians required to approve a recovery
+        #[arg(long)]
+        threshold: u32,
+    },
 }
 ```
 
@@ -224,16 +240,7 @@ pub enum SocialAction {
 pub enum TokenYAction {
     /// View your Y balance
     Balance,
-    /// Donate Y to a post's creator
-    Donate {
-        /// Content address of the post
-        #[arg(long)]
-        post: String,
-        /// Amount of Y to donate
-        #[arg(long)]
-        amount: u64,
-    },
-    /// Tip Y to another user
+    /// Tip Y to a user (transfer + 1% burn)
     Tip {
         /// Recipient public key
         #[arg(long)]
@@ -241,6 +248,11 @@ pub enum TokenYAction {
         /// Amount of Y to send
         #[arg(long)]
         amount: u64,
+        /// Optional post to tip: the creator receives the tip and the post's
+        /// content address rides along as the on-chain 32-byte memo, so
+        /// indexers can attribute it. Without --post it's a plain tip.
+        #[arg(long)]
+        post: Option<String>,
     },
     /// View Y transaction history
     History {
@@ -248,37 +260,38 @@ pub enum TokenYAction {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
-    /// View the current epoch emission info
-    Emission,
+    /// View rebate info: current epoch drop, your eligible fees burned this
+    /// epoch, projected/received rebates (doc 10 §3.2.1)
+    Rebate,
+    /// View your referral earnings (10% of direct invitees' fees, doc 10 §3.3)
+    Earnings,
 }
 ```
 
-### Bond Subcommands (`bond.rs`)
+### Promote Subcommands (`promote.rs`)
+
+Promotion is a pay-to-amplify burn (doc 09 §2.3, doc 10 §1.2): the Y is
+destroyed, there is no curve, no position, and no return path.
 
 ```rust
 #[derive(Subcommand)]
-pub enum BondAction {
-    /// Place a bond on a post
-    Place {
-        /// Content address of the post to bond on
+pub enum PromoteAction {
+    /// Burn Y to amplify a post's distribution
+    Boost {
+        /// Content address of the post to promote
         #[arg(long)]
         post: String,
-        /// Amount of Y to bond
+        /// Amount of Y to burn
         #[arg(long)]
         amount: u64,
     },
-    /// View bonds on a post
+    /// View promotion totals for a post
     View {
         /// Content address of the post
         post: String,
     },
-    /// View your active bond positions
+    /// View your promotion history
     Mine,
-    /// Check the current bond price for a post
-    Price {
-        /// Content address of the post
-        post: String,
-    },
 }
 ```
 
@@ -287,17 +300,22 @@ pub enum BondAction {
 ```rust
 #[derive(Subcommand)]
 pub enum NameAction {
-    /// Burn Y to claim a name
+    /// Burn Y to claim a name (includes the first year)
     Register {
         /// The name to register
         name: String,
     },
-    /// Resolve a name to a public key
+    /// Burn Y to renew a name for another year (doc 03 §D)
+    Renew {
+        /// The name to renew
+        name: String,
+    },
+    /// Resolve a name to a public key; shows expiry (paid_through, grace period)
     Lookup {
         /// The name to look up
         name: String,
     },
-    /// Check pricing for a name
+    /// Check pricing for a name (registration and annual renewal); shows expiry if taken
     Cost {
         /// The name to check pricing for
         name: String,
@@ -348,14 +366,27 @@ pub enum ModAction {
     },
     /// View your flagging history
     History,
+    /// Lock the 10 Y moderation bond required for flag/review eligibility (doc 06)
+    Bond {
+        /// Amount of Y to lock (the required moderation bond)
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Unlock and refund your moderation bond (ends flag/review eligibility)
+    Unbond,
 }
 
+/// Protocol-level flag vocabulary (doc 06). Misinformation was removed from
+/// the protocol vocabulary (doc 09 §2.5); indexers may define their own
+/// policy-specific categories.
 #[derive(Clone, clap::ValueEnum)]
 pub enum FlagReason {
     Spam,
-    Abuse,
+    Harassment,
+    Violence,
     Illegal,
-    Impersonation,
+    Nsfw,
+    Other,
 }
 ```
 
@@ -518,50 +549,55 @@ impl IndexerClient {
         user: &PublicKey,
     ) -> Result<YBalanceSummary, IndexerError>;
 
-    /// Fetch epoch info (current epoch, emission schedule).
+    /// Fetch epoch info (current epoch, rebate drop schedule).
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
-    // --- Bond queries ---
+    /// Fetch rebate info: current epoch drop, the user's eligible fees
+    /// burned this epoch, projected/received rebates (doc 10 §3.2.1).
+    pub async fn rebate_info(&self) -> Result<RebateInfo, IndexerError>;
 
-    /// Fetch bonds placed on a post.
-    pub async fn get_bonds(
-        &self,
-        post: &ContentAddress,
-    ) -> Result<BondInfo, IndexerError>;
-
-    /// Fetch the current bond price for a post.
-    pub async fn bond_price(
-        &self,
-        post: &ContentAddress,
-    ) -> Result<BondPrice, IndexerError>;
-
-    /// Fetch a user's active bond positions.
-    pub async fn my_bonds(
+    /// Fetch a user's referral earnings (from ReferralPaid events).
+    pub async fn referral_earnings(
         &self,
         user: &PublicKey,
-    ) -> Result<Vec<BondPosition>, IndexerError>;
+    ) -> Result<ReferralEarnings, IndexerError>;
+
+    // --- Promotion queries ---
+
+    /// Fetch promotions placed on a post.
+    pub async fn get_promotions(
+        &self,
+        post: &ContentAddress,
+    ) -> Result<PromotionInfo, IndexerError>;
+
+    /// Fetch a user's promotion history.
+    pub async fn my_promotions(
+        &self,
+        user: &PublicKey,
+    ) -> Result<Vec<PromotionRecord>, IndexerError>;
 
     // --- Name queries ---
 
-    /// Resolve a name to a public key.
+    /// Resolve a name. The response includes expiry data
+    /// (`paid_through_epoch`, grace period); expired names resolve to None.
     pub async fn name_lookup(
         &self,
         name: &str,
-    ) -> Result<Option<PublicKey>, IndexerError>;
+    ) -> Result<Option<NameRecord>, IndexerError>;
 
-    /// Fetch the cost to register a name.
+    /// Fetch the cost to register or renew a name.
     pub async fn name_cost(
         &self,
         name: &str,
     ) -> Result<NameCost, IndexerError>;
 
-    // --- Donation queries ---
+    // --- Tip queries ---
 
-    /// Fetch donation totals for a post.
-    pub async fn post_donations(
+    /// Fetch tip totals for a post (attributed via the on-chain post_ref memo).
+    pub async fn post_tips(
         &self,
         post: &ContentAddress,
-    ) -> Result<DonationInfo, IndexerError>;
+    ) -> Result<TipInfo, IndexerError>;
 
     // --- Moderation queries ---
 
@@ -578,8 +614,30 @@ impl IndexerClient {
         &self,
         user: &PublicKey,
     ) -> Result<InvitationChain, IndexerError>;
+
+    // --- Claim verification (doc 11 §3.2) ---
+
+    /// Verify the signed claim carried by an indexer response
+    /// (`X-DSN-Claim` header or `claim` envelope field) against the
+    /// indexer's registered service key from the on-chain ServiceRegistry.
+    pub fn verify_claim(
+        &self,
+        response: &SignedResponse,
+        service_key: &PublicKey,
+    ) -> Result<VerifiedClaim, ClaimError>;
 }
 ```
+
+### Signed Claim Verification
+
+Every response from a registered indexer carries a signature over a canonical
+claim commitment `(request_hash, merkle_root(items), chain_height, epoch,
+expiry)` (doc 11 §3.2). The client fetches the indexer's service key from the
+on-chain `ServiceRegistry` (cached, refreshed on rotation) and verifies the
+signature on every response. On an invalid or missing signature, the client
+treats the response as **untrusted** — anonymous gossip, excluded from any
+trust-score accounting and flagged in the output. Valid signed claims are
+retained: they are the raw material for fraud proofs (see SpotChecker below).
 
 ### Indexer Response Types
 
@@ -590,9 +648,9 @@ pub struct FeedItem {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub bond_count: u64,
-    pub total_bonded: u64,
-    pub donation_total: u64,
+    pub promotion_count: u64,
+    pub total_promoted: u64,
+    pub tip_total: u64,
 }
 
 /// Detailed post view.
@@ -601,9 +659,9 @@ pub struct PostDetail {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub bonds: Vec<BondSummary>,
-    pub total_bonded: u64,
-    pub donation_total: u64,
+    pub promotions: Vec<PromotionSummary>,
+    pub total_promoted: u64,
+    pub tip_total: u64,
     pub flags: Vec<FlagInfo>,
 }
 
@@ -648,24 +706,40 @@ impl SpotChecker {
         indexer_post: &PostDetail,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
-    /// Verify bond data reported by the indexer against on-chain records.
-    pub async fn verify_bonds(
+    /// Verify promotion data reported by the indexer against on-chain records.
+    pub async fn verify_promotions(
         &self,
         post: &ContentAddress,
-        indexer_bonds: &BondInfo,
+        indexer_promotions: &PromotionInfo,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
-    /// Verify donation data reported by the indexer against on-chain records.
-    pub async fn verify_donations(
+    /// Verify tip data reported by the indexer against on-chain records.
+    pub async fn verify_tips(
         &self,
         post: &ContentAddress,
-        indexer_donations: &DonationInfo,
+        indexer_tips: &TipInfo,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
     /// Return a summary of recent spot-check results.
     pub fn summary(&self) -> SpotCheckSummary;
+
+    /// Escalate a provable lie: if a signed claim contains forged content
+    /// (the item's alleged author signature is invalid), submit the claim,
+    /// Merkle branch, and item to the ServiceRegistry contract for a slash
+    /// bounty (doc 11 §3.4 — 50% of the stake burns, 50% goes to the prover).
+    pub async fn submit_fraud_proof(
+        &self,
+        claim: &SignedClaim,
+        merkle_branch: &MerkleBranch,
+        item: &ClaimItem,
+    ) -> Result<FraudProofReceipt, SpotCheckError>;
 }
 ```
+
+A spot-check mismatch on an *unsigned* response is only grounds for
+switching indexers. A mismatch inside a **signed claim** is a
+confession-in-advance: `submit_fraud_proof` turns it into an on-chain slash
+against the indexer's stake, so watchdog verification pays for itself.
 
 ### Spot-Check Verification Steps
 
@@ -677,16 +751,16 @@ impl SpotChecker {
 4. Compare author, content, and timestamp against the indexer's response
 5. If any field mismatches, flag the indexer result as untrustworthy
 
-**Bond verification:**
+**Promotion verification:**
 
-1. Read bond records for the post from on-chain data via `dsn-chain`
-2. Compare the total bonded amount and individual bond positions against the indexer's report
+1. Read promotion records for the post from on-chain data via `dsn-chain`
+2. Compare the total promoted amount and individual promotions against the indexer's report
 3. If any values mismatch, flag the indexer result as untrustworthy
 
-**Donation verification:**
+**Tip verification:**
 
-1. Read donation records for the post from on-chain data via `dsn-chain`
-2. Compare the total donated amount and individual donations against the indexer's report
+1. Read tip records referencing the post (via the on-chain post_ref memo) from `dsn-chain`
+2. Compare the total tipped amount and individual tips against the indexer's report
 3. If any values mismatch, flag the indexer result as untrustworthy
 
 ### Result Types
@@ -716,8 +790,8 @@ pub enum SpotCheckResult {
 pub enum CheckType {
     PostContent,
     PostSignature,
-    BondData,
-    DonationData,
+    PromotionData,
+    TipData,
 }
 
 pub struct SpotCheckSummary {
@@ -829,7 +903,7 @@ Post by alice (a1b2c3d4...)
 
   This is my first post on the decentralized social network!
 
-  Replies: 3 | Bonds: 7 (1,250 Y) | Donations: 450 Y
+  Replies: 3 | Boosts: 1,250 Y | Tips: 450 Y
   Address: 0xabcd1234...
 ```
 
@@ -841,9 +915,9 @@ Post by alice (a1b2c3d4...)
   "author": "a1b2c3d4...",
   "content": "This is my first post on the decentralized social network!",
   "reply_count": 3,
-  "bond_count": 7,
-  "total_bonded": 1250,
-  "donation_total": 450,
+  "promotion_count": 7,
+  "total_promoted": 1250,
+  "tip_total": 450,
   "created_at": "2026-01-15T10:32:00Z"
 }
 ```
@@ -851,9 +925,9 @@ Post by alice (a1b2c3d4...)
 **Table**: Compact tabular format for listing commands.
 
 ```
-ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  BONDS   DONATED
-abcd1234..   alice (a1b2) This is my first post on the decent..  3        7       450 Y
-ef567890..   bob (e5f6)   Replying to the above — great to se..  1        2       120 Y
+ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  BOOSTS   TIPS
+abcd1234..   alice (a1b2) This is my first post on the decent..  3        1,250 Y  450 Y
+ef567890..   bob (e5f6)   Replying to the above — great to se..  1        200 Y    120 Y
 ```
 
 ### Implementation
@@ -912,7 +986,7 @@ Post by Alice (a1b2c3d4...)
 
   Hello, decentralized world!
 
-  Replies: 0 | Bonds: 0 | Donations: 0 Y
+  Replies: 0 | Boosts: 0 Y | Tips: 0 Y
 
 # Reply to a post
 $ dsn post reply --to abcd1234efgh5678 "Welcome, Alice!"
@@ -940,47 +1014,40 @@ Now following e5f6a7b8... (Bob)
 $ dsn social feed --limit 10
 [1] Bob (e5f6a7b8...) — 5 min ago
     Just deployed v0.2 of the indexer. Performance is 3x better!
-    Replies: 2 | Bonds: 5 (800 Y) | Donations: 320 Y
+    Replies: 2 | Boosts: 800 Y | Tips: 320 Y
 
 [2] Charlie (c9d0e1f2...) — 20 min ago
     Interesting paper on sybil resistance: https://...
-    Replies: 7 | Bonds: 12 (3,400 Y) | Donations: 1,050 Y
+    Replies: 7 | Boosts: 3,400 Y | Tips: 1,050 Y
 ```
 
-### Bonding
+### Promotion
 
 ```bash
-# Check the current bond price for a post
-$ dsn bond price abcd1234efgh5678
-Post: abcd1234efgh5678
-Current bond price: 15 Y
-Total bonded: 800 Y
-Bond count: 5
-
-# Place a bond on a post
-$ dsn bond place --post abcd1234efgh5678 --amount 100
+# Boost a post (burns Y to amplify — no price, no position, no return)
+$ dsn promote boost --post abcd1234efgh5678 --amount 100
 Enter passphrase: ********
-Bond placed.
+Boost placed.
   Post: abcd1234efgh5678
-  Amount: 100 Y
-  Your Y after bond: 1,150 Y
+  Burned: 100 Y
+  Your Y after boost: 1,150 Y
 
-# View bonds on a post
-$ dsn bond view abcd1234efgh5678
+# View promotion totals for a post
+$ dsn promote view abcd1234efgh5678
 Post: abcd1234efgh5678
-Total bonded: 900 Y
-Bonders: 6
+Total promoted: 900 Y
+Promoters: 6
   a1b2c3d4... (Alice) — 100 Y
   e5f6a7b8... (Bob)   — 200 Y
   c9d0e1f2... (Charlie) — 350 Y
   [3 more]
 
-# View your active bond positions
-$ dsn bond mine
-Your bond positions:
-  abcd1234efgh5678 — 100 Y (placed epoch 43)
-  5678dcba4321...   — 50 Y  (placed epoch 41)
-Total bonded: 150 Y
+# View your promotion history
+$ dsn promote mine
+Your promotions:
+  abcd1234efgh5678 — 100 Y (burned epoch 43)
+  5678dcba4321...   — 50 Y  (burned epoch 41)
+Total promoted: 150 Y
 ```
 
 ### Token Operations
@@ -991,12 +1058,13 @@ $ dsn y balance
 Y Balance: 1,250.000000
 Nonce: 14
 
-# Donate Y to a post's creator
-$ dsn y donate --post abcd1234efgh5678 --amount 25000000
+# Tip a post's creator (the post rides along as the on-chain memo)
+$ dsn y tip --post abcd1234efgh5678 --to e5f6a7b8... --amount 25000000
 Enter passphrase: ********
-Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
+Tip sent: 25.000000 Y to e5f6a7b8... (Bob) for post abcd1234efgh5678
+  (24.750000 Y to creator, 0.250000 Y burned)
 
-# Tip a user
+# Plain tip to a user (no post reference)
 $ dsn y tip --to e5f6a7b8... --amount 25000000
 Enter passphrase: ********
 Tip sent: 25.000000 Y to e5f6a7b8... (Bob)
@@ -1004,18 +1072,26 @@ Tip sent: 25.000000 Y to e5f6a7b8... (Bob)
 # View Y transaction history
 $ dsn y history --limit 5
 TYPE      AMOUNT       TO/POST                  EPOCH
-donate    25.000000    abcd1234efgh5678         43
-tip       25.000000    e5f6a7b8... (Bob)        43
-bond      100.000000   abcd1234efgh5678         43
-emission  87.500000    (auto)                   42
+tip       25.000000    abcd1234efgh5678         43
+promote   100.000000   abcd1234efgh5678         43
+rebate    87.500000    (auto)                   42
+referral  10.000000    from f3a4b5c6... (Dave)  42
 tip       10.000000    c9d0e1f2... (Charlie)    41
 
-# View emission info
-$ dsn y emission
+# View rebate info
+$ dsn y rebate
 Current epoch: 43
-Epoch emission rate: 1,000 Y
-Your share (last epoch): 87.500000 Y
-Distribution: automatic per epoch
+Epoch rebate drop: 30,000 Y
+Your eligible fees burned this epoch: 100.000000 Y
+Projected rebate this epoch: 112.400000 Y
+Rebate received (last epoch): 87.500000 Y
+
+# View referral earnings from your invitees
+$ dsn y earnings
+Referral earnings (10% of direct invitees' fees, doc 10 §3.3):
+  f3a4b5c6... (Dave)  — 10.000000 Y (term ends epoch 246)
+  b7c8d9e0... (Erin)  — 2.500000 Y  (term ends epoch 251)
+Total: 12.500000 Y
 ```
 
 ### Name Registration
@@ -1024,20 +1100,33 @@ Distribution: automatic per epoch
 # Check cost to register a name
 $ dsn name cost alice
 Name: alice
-Cost: 500 Y (short name premium)
+Registration: 100 Y (includes first year)
+Renewal: 100 Y/year
+Status: available
 
-# Register a name (burns Y)
+# Register a name (burns Y, includes the first year)
 $ dsn name register alice
 Enter passphrase: ********
 Name registered.
   Name: alice
-  Burned: 500 Y
-  Your Y after: 750 Y
+  Burned: 100 Y
+  Paid through: epoch 95
+  Your Y after: 1,150 Y
+
+# Renew a name for another year
+$ dsn name renew alice
+Enter passphrase: ********
+Name renewed.
+  Name: alice
+  Burned: 100 Y
+  Paid through: epoch 147 (grace period: 4 epochs)
 
 # Look up a name
 $ dsn name lookup alice
 Name: alice
 Owner: a1b2c3d4e5f6a7b8...
+Paid through: epoch 147 (grace period: 4 epochs)
+Status: active
 ```
 
 ### Invitations
@@ -1062,6 +1151,12 @@ You (a1b2c3d4...) — invited by d7e8f9a0... (epoch 12)
 ### Moderation
 
 ```bash
+# Lock the moderation bond (required for flag/review eligibility, doc 06)
+$ dsn mod bond --amount 10000000
+Enter passphrase: ********
+Moderation bond locked: 10.000000 Y
+You are now eligible to flag and review (subject to account age).
+
 # Flag a post
 $ dsn mod flag --post abcd1234efgh5678 --reason spam
 Enter passphrase: ********
@@ -1073,9 +1168,9 @@ Flag submitted.
 $ dsn mod flags abcd1234efgh5678
 Post: abcd1234efgh5678
 Flags: 3
-  [spam]   by a1b2c3d4... — epoch 43
-  [spam]   by e5f6a7b8... — epoch 43
-  [abuse]  by c9d0e1f2... — epoch 44
+  [spam]        by a1b2c3d4... — epoch 43
+  [spam]        by e5f6a7b8... — epoch 43
+  [harassment]  by c9d0e1f2... — epoch 44
 
 Counter-flags: 1
   by g1h2i3j4... — epoch 44
@@ -1249,7 +1344,7 @@ async fn main() {
 | `rand` | latest | Spot-check probability, nonce generation |
 | `dsn-core` | workspace | Core types, crypto primitives |
 | `dsn-data` | workspace | Storage trait abstractions |
-| `dsn-chain` | workspace | On-chain data reading (bonds, donations, names) |
+| `dsn-chain` | workspace | On-chain data reading (tips, promotions, names, identity, services) |
 | `dsn-token-y` | workspace | Y balance validation, transfer verification |
 | `dsn-invitation` | workspace | Invitation chain operations |
 | `dsn-moderation` | workspace | Content flagging operations |

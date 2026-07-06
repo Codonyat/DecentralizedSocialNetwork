@@ -6,6 +6,8 @@ Content moderation separates **existence** from **visibility**. Data stored on A
 
 The protocol is fully transparent: all flags are public GraphEntries on Autonomi, all scoring is deterministic, and any observer can audit the moderation history of any post or user.
 
+One caveat must be stated honestly: for illegal content (e.g., CSAM), "existence is uncensorable" is **not** an adequate answer. Permanent storage of such material is real legal exposure for storage node operators, indexers, and the project. The flagging machinery in this document governs *visibility only*; handling at the storage layer -- chunk-level blocklist standards and hash-list integration that storage nodes can adopt -- is required and is tracked as an open protocol issue (doc 09 §2.5).
+
 ## Module Structure
 
 ```
@@ -15,7 +17,7 @@ crates/moderation/src/
 ├── counter_flag.rs     # Counter-flag (contest) creation and validation
 ├── aggregation.rs      # Flag score aggregation and uniform scoring
 ├── policy.rs           # ModerationPolicy trait + built-in policies
-├── reputation.rs       # Flagger reputation tracking (accuracy-based)
+├── reputation.rs       # Flagger and reviewer reputation tracking (accuracy-based)
 ├── review.rs           # Broader community review triggered by counter-flags
 └── error.rs            # Moderation error types
 ```
@@ -24,9 +26,9 @@ crates/moderation/src/
 
 1. **No censorship at the data layer** -- Autonomi stores everything permanently. Flags are metadata *about* content, not deletion requests.
 2. **Indexer sovereignty** -- Each indexer chooses its own `ModerationPolicy`. Users who disagree switch indexers.
-3. **Eligibility-gated flagging** -- Only users who are invited, have sufficient account age, and have donated enough can flag, preventing flag spam from bots.
+3. **Eligibility-gated flagging** -- Only users who are invited, have sufficient account age, and hold an active moderation bond can flag. The bond makes every flagging identity carry an objective, per-identity capital cost (doc 09 §2.5).
 4. **Uniform influence** -- Each eligible flagger/reviewer contributes weight 1.0, preventing any single account from dominating moderation outcomes.
-5. **Accountability** -- Flags are signed and permanent. Flaggers who abuse the system lose credibility (low accuracy causes their flags to be ignored by indexers).
+5. **Accountability** -- Flags and review votes are signed and permanent. Flaggers and reviewers who abuse the system lose credibility (low accuracy causes their flags or review votes to be ignored by indexers).
 6. **Contestability** -- Flagged content authors can counter-flag, triggering broader community review.
 
 ## Eligibility Criteria
@@ -35,7 +37,9 @@ A user is **eligible** to flag or review if all of the following are true:
 
 1. **Invited**: The user has an on-chain invitation record (exists in the web-of-trust graph).
 2. **Account age**: The user's account is at least `MIN_ACCOUNT_AGE_EPOCHS` epochs old.
-3. **Donation count**: The user has made at least `MIN_DONATION_COUNT` donations.
+3. **Moderation bond**: The user has an active moderation bond: `MODERATION_BOND_Y` (10 Y) locked in the on-chain service registry's moderator role (doc 11). The bond is refundable after `MODERATION_BOND_COOLDOWN_EPOCHS` epochs once the user exits moderation.
+
+The bond replaces the earlier donation-count criterion, which was judged purchasable -- dust donations bought moderation votes, and any donation-derived criterion inherited wash-traffic corruption (doc 09 §2.5). A locked bond is an objective, on-chain fact with a real per-identity capital cost.
 
 Each eligible user receives a uniform weight of **1.0** for flagging and reviewing.
 
@@ -49,11 +53,13 @@ pub fn is_eligible(
 }
 ```
 
-Indexers are responsible for computing the set of eligible accounts based on on-chain data (invitation records, account creation epochs, donation counts).
+Indexers are responsible for computing the set of eligible accounts based on on-chain data (invitation records, account creation epochs, active moderation bonds).
 
 ## Type Definitions
 
 ### Flag Reason (`flag.rs`)
+
+Note that misinformation is deliberately not a protocol-level reason: truth-by-majority-vote is not resolvable at the protocol layer and was the primary brigading target in any polarized topic (doc 09 §2.5); indexers that want such categories define policy-specific vocabularies via `Other` plus their published policy metadata.
 
 ```rust
 /// Reason categories for flagging content.
@@ -67,8 +73,7 @@ pub enum FlagReason {
     Harassment = 1,
     /// Content depicting or promoting violence.
     Violence = 2,
-    /// Content that is verifiably false and likely to cause harm.
-    Misinformation = 3,
+    // 3 reserved (Misinformation removed from the protocol vocabulary, doc 09 §2.5)
     /// Content illegal in most jurisdictions (e.g., CSAM).
     IllegalContent = 4,
     /// Not safe for work (nudity, explicit material). Not inherently rule-breaking;
@@ -249,21 +254,29 @@ pub struct PostModerationScore {
     /// The post being scored.
     pub post_address: ContentAddress,
 
-    /// Weighted flag score: count of eligible flaggers (each weight 1.0).
+    /// Weighted flag score: count of eligible flaggers whose flags are
+    /// ACTIVE, i.e. not nullified by a resolved overturn (each weight 1.0).
     pub weighted_flag_score: f64,
 
-    /// Weighted counter-flag score: count of eligible overturn voters (each weight 1.0).
+    /// Informational: count of eligible overturn voters (each weight 1.0).
+    /// A review-outcome input, not a score component -- overturn votes decide
+    /// review resolution, which nullifies flags; they are never subtracted.
     pub weighted_overturn_score: f64,
 
-    /// Weighted uphold score: count of eligible uphold voters (each weight 1.0).
+    /// Informational: count of eligible uphold voters (each weight 1.0).
+    /// A review-outcome input, not a score component -- uphold votes resolve
+    /// the review but never add to the score.
     pub weighted_uphold_score: f64,
 
-    /// Net moderation score: flag_score + uphold_score - overturn_score.
-    /// Positive = content is flagged. Negative or zero = content is clean.
+    /// Net moderation score: the weighted score of active (non-nullified)
+    /// flags. Positive = content is flagged. Zero = content is clean.
     pub net_score: f64,
 
-    /// Number of unique flaggers.
+    /// Number of unique flaggers (including those whose flags were nullified).
     pub flag_count: u32,
+
+    /// Number of flags nullified by a resolved overturn.
+    pub nullified_flag_count: u32,
 
     /// Number of active counter-flags.
     pub counter_flag_count: u32,
@@ -287,7 +300,7 @@ pub struct PostModerationScore {
 ### Step 1: User Submits a Flag
 
 1. Alice sees a post she considers spam.
-2. Alice's client verifies she is eligible (invited, sufficient account age, sufficient donations).
+2. Alice's client verifies she is eligible (invited, sufficient account age, active moderation bond).
 3. Alice's client constructs a `ContentFlag` with reason `Spam`.
 4. Alice derives a flag-specific key: `derive_child(root_sk, b"flag" || post_address)`.
 5. Alice's client serializes the flag, signs it, and writes a GraphEntry to Autonomi:
@@ -325,8 +338,8 @@ pub struct PostModerationScore {
 
 ### Step 4: Broader Community Review
 
-1. Indexers detect the counter-flag and mark the post as "under review."
-2. Eligible community members (invited + account age >= N epochs + donation count >= M) can cast `ReviewVote` entries.
+1. Indexers detect the counter-flag and mark the post as "under review" (`review_active`); the existing flags remain counted while the review runs.
+2. Eligible community members (invited + account age >= `MIN_ACCOUNT_AGE_EPOCHS` + active moderation bond) can cast `ReviewVote` entries.
 3. The review window lasts `REVIEW_PERIOD_EPOCHS` epochs.
 4. Each eligible reviewer contributes weight 1.0.
 5. Each reviewer may only vote once per review (enforced by derived key uniqueness).
@@ -335,32 +348,58 @@ pub struct PostModerationScore {
 
 1. After the review period, indexers tally `weighted_uphold_score` vs `weighted_overturn_score`.
 2. If `weighted_overturn_score > weighted_uphold_score`:
-   - The flag is **overturned**. The post is restored to visibility.
+   - The flag is **overturned**. The flags covered by the review are **nullified** -- excluded from the flag score entirely -- and the post is restored to visibility.
    - The original flagger's accuracy is penalized (see Reputation below).
 3. If `weighted_uphold_score >= weighted_overturn_score`:
-   - The flag is **upheld**. The post remains hidden.
+   - The flag is **upheld**. The flags remain active and the post remains hidden. Uphold votes do not add to the score; they only resolve the review.
    - The contester receives no penalty (contesting is free except for the effort).
+4. In either case, if the review resolved with a margin >= 2:1, reviewers on the losing side have their accuracy decremented (see Reviewer Accountability below); narrower verdicts affect nobody's accuracy.
 
 ## Flag Aggregation and Scoring (`aggregation.rs`)
 
 ### Core Scoring Formula
 
 ```rust
-/// Aggregate all flags, counter-flags, and review votes for a post.
+/// Aggregate all flags, counter-flags, review votes, and resolved review
+/// outcomes for a post.
+///
+/// Scoring model (doc 09 §2.5): the net score is the weighted score of
+/// ACTIVE flags only. A review that resolves as `FlagOverturned` NULLIFIES
+/// the flags it covered -- they are excluded from the score entirely, not
+/// merely outvoted. While a review is active the flags remain counted and
+/// the post is marked `review_active`. Uphold votes never add to the score;
+/// they only resolve the review.
 pub fn aggregate_moderation_score(
     flags: &[ContentFlag],
     counter_flags: &[CounterFlag],
     review_votes: &[ReviewVote],
+    resolved_reviews: &[ReviewState],        // Resolved reviews for this post
     eligible_accounts: &HashSet<PublicKey>,  // Eligible accounts computed by indexer
     current_epoch: u64,
 ) -> PostModerationScore {
     let mut weighted_flag_score = 0.0_f64;
     let mut weighted_overturn_score = 0.0_f64;
     let mut weighted_uphold_score = 0.0_f64;
+    let mut nullified_flag_count = 0_u32;
     let mut reason_scores: HashMap<FlagReason, f64> = HashMap::new();
     let mut unique_flaggers: HashSet<PublicKey> = HashSet::new();
 
-    // 1. Score all flags (each eligible flagger contributes weight 1.0)
+    // 1. Determine the nullification cutoff: each review that resolved as
+    //    FlagOverturned nullifies the flags it covered -- every flag on this
+    //    post submitted before that review resolved.
+    let mut nullify_before_epoch: Option<u64> = None;
+    for review in resolved_reviews {
+        if let ReviewState::Resolved {
+            outcome: ResolvedOutcome::FlagOverturned { .. },
+            resolved_at_epoch,
+        } = review {
+            nullify_before_epoch = Some(
+                nullify_before_epoch.map_or(*resolved_at_epoch, |e| e.max(*resolved_at_epoch)),
+            );
+        }
+    }
+
+    // 2. Score ACTIVE flags (each eligible flagger contributes weight 1.0)
     for flag in flags {
         if !eligible_accounts.contains(&flag.flagger) {
             continue; // Not eligible, ignore flag
@@ -371,19 +410,28 @@ pub fn aggregate_moderation_score(
             continue;
         }
 
+        // Nullified by a resolved overturn: excluded from the score entirely
+        if let Some(cutoff) = nullify_before_epoch {
+            if flag.flagged_at_epoch < cutoff {
+                nullified_flag_count += 1;
+                continue;
+            }
+        }
+
         let weight = 1.0;
         weighted_flag_score += weight;
 
         *reason_scores.entry(flag.reason).or_insert(0.0) += weight;
     }
 
-    // 2. Determine if a review is active
+    // 3. Determine if a review is active (flags stay counted meanwhile)
     let review_active = !counter_flags.is_empty()
         && counter_flags.iter().any(|cf| {
             current_epoch < cf.countered_at_epoch + REVIEW_PERIOD_EPOCHS
         });
 
-    // 3. Score review votes (only if a review was triggered)
+    // 4. Tally review votes (informational; they decide review resolution,
+    //    they are NOT score components)
     let mut unique_reviewers: HashSet<PublicKey> = HashSet::new();
     for vote in review_votes {
         if !eligible_accounts.contains(&vote.reviewer) {
@@ -401,8 +449,8 @@ pub fn aggregate_moderation_score(
         }
     }
 
-    // 4. Compute net score
-    let net_score = weighted_flag_score + weighted_uphold_score - weighted_overturn_score;
+    // 5. Compute net score: active (non-nullified) flags only
+    let net_score = weighted_flag_score;
 
     PostModerationScore {
         post_address: flags.first()
@@ -413,6 +461,7 @@ pub fn aggregate_moderation_score(
         weighted_uphold_score,
         net_score,
         flag_count: unique_flaggers.len() as u32,
+        nullified_flag_count,
         counter_flag_count: counter_flags.len() as u32,
         review_vote_count: unique_reviewers.len() as u32,
         review_active,
@@ -424,13 +473,13 @@ pub fn aggregate_moderation_score(
 
 ### Score Examples
 
-| Scenario | Eligible Flaggers | Flag Score | Outcome (default policy, threshold=10.0) |
+| Scenario | Eligible Flaggers | Net Score | Outcome (default policy, threshold=10.0) |
 |---|---|---|---|
 | 1 eligible user flags | 1 | 1.0 | Visible (below threshold) |
 | 10 eligible users flag | 10 | 10.0 | Hidden |
 | 3 eligible users flag | 3 | 3.0 | Visible (below threshold) |
-| 12 flag, review: 8 overturn vs 3 uphold | flag=12.0, overturn=8.0, uphold=3.0 | net = 12.0 + 3.0 - 8.0 = 7.0 | Visible (overturned below threshold) |
-| 15 flag, review: 2 overturn vs 5 uphold | flag=15.0, overturn=2.0, uphold=5.0 | net = 15.0 + 5.0 - 2.0 = 18.0 | Hidden (upheld) |
+| 12 flag, review resolves 8 overturn vs 3 uphold | 12, all nullified by the overturn | net = 0.0 | Visible (overturn nullifies the flags) |
+| 15 flag, review resolves 2 overturn vs 5 uphold | 15, all remain active | net = 15.0 | Hidden (upheld; uphold votes add nothing) |
 
 ## Moderation Policy Abstraction (`policy.rs`)
 
@@ -613,9 +662,11 @@ pub struct IndexerModerationMetadata {
 }
 ```
 
-## Flagger Reputation Tracking (`reputation.rs`)
+## Flagger and Reviewer Reputation Tracking (`reputation.rs`)
 
 ### Flagger Record
+
+Accuracy is computed **only from flags that went through a resolved community review**. Uncontested flags carry no accuracy signal either way. (An earlier revision counted uncontested flags as upheld; that let flaggers farm accuracy by targeting users unlikely to counter-flag -- newcomers, casual users -- and was removed per doc 09 §2.5.)
 
 ```rust
 /// Tracks a flagger's moderation history.
@@ -624,20 +675,21 @@ pub struct IndexerModerationMetadata {
 pub struct FlaggerRecord {
     pub flagger: PublicKey,
 
-    /// Total flags submitted by this user.
+    /// Total flags submitted by this user (contested or not).
     pub total_flags: u64,
 
-    /// Flags that were upheld (or never contested).
-    pub upheld_flags: u64,
+    /// Flags that were upheld by a resolved community review.
+    pub resolved_upheld: u64,
 
-    /// Flags that were overturned by community review.
-    pub overturned_flags: u64,
+    /// Flags that were overturned by a resolved community review.
+    pub resolved_overturned: u64,
 
     /// Flags currently under review.
     pub pending_review_flags: u64,
 
-    /// Computed accuracy rate: upheld / (upheld + overturned).
-    /// Flags that were never contested count as upheld.
+    /// Computed accuracy rate: resolved_upheld / (resolved_upheld + resolved_overturned).
+    /// Only resolved reviews move this number; uncontested flags carry
+    /// NO accuracy signal either way (doc 09 §2.5).
     pub accuracy_rate: f64,
 }
 ```
@@ -651,30 +703,33 @@ pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
 
 /// Determine if a flagger should be trusted based on their track record.
 pub fn is_flagger_trusted(record: &FlaggerRecord) -> bool {
-    // New flaggers (< 3 flags) are trusted by default
-    if record.total_flags < 3 {
+    // Flaggers with < 3 resolved reviews are trusted by default
+    // (uncontested flags carry no accuracy signal, doc 09 §2.5)
+    if record.resolved_upheld + record.resolved_overturned < 3 {
         return true;
     }
     record.accuracy_rate >= MIN_FLAGGER_ACCURACY
 }
 
-/// Update a flagger's record after a review concludes.
+/// Update a flagger's record after a review RESOLVES.
+/// This is the only path that moves accuracy: flags that are never
+/// contested leave the record untouched.
 pub fn update_flagger_record(
     record: &mut FlaggerRecord,
     outcome: ReviewOutcome,
 ) {
     match outcome {
         ReviewOutcome::Upheld => {
-            record.upheld_flags += 1;
+            record.resolved_upheld += 1;
         }
         ReviewOutcome::Overturned => {
-            record.overturned_flags += 1;
+            record.resolved_overturned += 1;
         }
     }
 
-    let total_resolved = record.upheld_flags + record.overturned_flags;
+    let total_resolved = record.resolved_upheld + record.resolved_overturned;
     if total_resolved > 0 {
-        record.accuracy_rate = record.upheld_flags as f64 / total_resolved as f64;
+        record.accuracy_rate = record.resolved_upheld as f64 / total_resolved as f64;
     }
 }
 
@@ -688,6 +743,86 @@ pub enum ReviewOutcome {
 ```
 
 Bad flaggers (those with low accuracy) have their flags ignored by indexers -- no economic penalty, just credibility loss. Once a flagger's accuracy drops below `MIN_FLAGGER_ACCURACY`, their flags are effectively invisible to the moderation system.
+
+### Reviewer Accountability
+
+Reviewers face consequences symmetrical to flaggers. After a review resolves with a **decisive margin** (winning side >= 2:1 over the losing side), every reviewer on the losing side has their accuracy decremented. Reviews that resolve with a narrow margin (< 2:1) affect nobody's accuracy -- close calls are not evidence of bad faith. Once a reviewer's accuracy drops below `MIN_REVIEWER_ACCURACY`, indexers ignore their future review votes, exactly as they ignore low-accuracy flaggers' flags.
+
+```rust
+/// Reviewer accuracy below which future review votes are ignored by indexers.
+pub const MIN_REVIEWER_ACCURACY: f64 = 0.5;
+
+/// Winning-side : losing-side margin at or above which a resolved review
+/// moves reviewer accuracy. Narrower verdicts affect nobody.
+pub const REVIEWER_ACCURACY_MARGIN: f64 = 2.0;
+
+/// Tracks a reviewer's moderation history.
+/// Indexers maintain this locally; the underlying data (review votes) is all on Autonomi.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewerRecord {
+    pub reviewer: PublicKey,
+
+    /// Total review votes cast by this user.
+    pub total_votes: u64,
+
+    /// Votes on the winning side of a decisively resolved review (margin >= 2:1).
+    pub decisive_majority_votes: u64,
+
+    /// Votes on the losing side of a decisively resolved review (margin >= 2:1).
+    pub decisive_minority_votes: u64,
+
+    /// Computed accuracy rate:
+    /// decisive_majority / (decisive_majority + decisive_minority).
+    /// Narrow-margin reviews (< 2:1) carry no accuracy signal either way.
+    pub accuracy_rate: f64,
+}
+
+/// Determine if a reviewer's votes should be counted.
+pub fn is_reviewer_trusted(record: &ReviewerRecord) -> bool {
+    // Reviewers with < 3 decisively resolved reviews are trusted by default
+    if record.decisive_majority_votes + record.decisive_minority_votes < 3 {
+        return true;
+    }
+    record.accuracy_rate >= MIN_REVIEWER_ACCURACY
+}
+
+/// Update reviewer records after a review resolves.
+/// Only decisive resolutions (margin >= 2:1) move anyone's accuracy.
+pub fn update_reviewer_records(
+    records: &mut HashMap<PublicKey, ReviewerRecord>,
+    votes_uphold: &[PublicKey],
+    votes_overturn: &[PublicKey],
+) {
+    let (winners, losers) = if votes_uphold.len() >= votes_overturn.len() {
+        (votes_uphold, votes_overturn)
+    } else {
+        (votes_overturn, votes_uphold)
+    };
+
+    // Narrow margin: no accuracy signal for anyone
+    if (winners.len() as f64) < REVIEWER_ACCURACY_MARGIN * (losers.len() as f64) {
+        return;
+    }
+
+    for pk in winners {
+        let record = records.entry(pk.clone()).or_insert_with(|| ReviewerRecord::new(pk.clone()));
+        record.decisive_majority_votes += 1;
+        recompute_reviewer_accuracy(record);
+    }
+    for pk in losers {
+        let record = records.entry(pk.clone()).or_insert_with(|| ReviewerRecord::new(pk.clone()));
+        record.decisive_minority_votes += 1;
+        recompute_reviewer_accuracy(record);
+    }
+}
+
+fn recompute_reviewer_accuracy(record: &mut ReviewerRecord) {
+    let decisive = record.decisive_majority_votes + record.decisive_minority_votes;
+    if decisive > 0 {
+        record.accuracy_rate = record.decisive_majority_votes as f64 / decisive as f64;
+    }
+}
+```
 
 ## Broader Community Review (`review.rs`)
 
@@ -838,8 +973,12 @@ pub fn derive_review_vote_key(
 /// Minimum account age (in epochs) required to flag or review.
 pub const MIN_ACCOUNT_AGE_EPOCHS: u64 = 2;
 
-/// Minimum number of donations required to flag or review.
-pub const MIN_DONATION_COUNT: u64 = 5;
+/// Moderation bond required to flag or review: Y locked in the on-chain
+/// service registry's moderator role (doc 11).
+pub const MODERATION_BOND_Y: u64 = 10_000_000; // 10 Y (6 decimals, doc 03)
+
+/// Epochs after exiting moderation before the bond is refundable.
+pub const MODERATION_BOND_COOLDOWN_EPOCHS: u64 = 4;
 
 /// Number of epochs a review remains open for voting.
 pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
@@ -849,6 +988,13 @@ pub const MIN_REVIEW_VOTES: u32 = 5;
 
 /// Flagger accuracy below which future flags are ignored.
 pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
+
+/// Reviewer accuracy below which future review votes are ignored.
+pub const MIN_REVIEWER_ACCURACY: f64 = 0.5;
+
+/// Winning-side : losing-side margin at or above which a resolved review
+/// moves reviewer accuracy.
+pub const REVIEWER_ACCURACY_MARGIN: f64 = 2.0;
 
 /// Maximum length of flag explanation text (characters).
 pub const MAX_EXPLANATION_CHARS: usize = 512;
@@ -872,7 +1018,7 @@ pub fn validate_flag(
     // 2. Flagger must be eligible
     if !eligible_accounts.contains(&flag.flagger) {
         return Err(ModerationError::NotEligible {
-            reason: "flagger is not eligible (must be invited, have sufficient account age, and sufficient donations)".to_string(),
+            reason: "flagger is not eligible (must be invited, have sufficient account age, and an active moderation bond)".to_string(),
         });
     }
 
@@ -976,7 +1122,7 @@ pub enum ModerationError {
 
 ### Flag Spam from Bots
 
-Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and have zero donations. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and make `MIN_DONATION_COUNT` donations before it can flag -- a meaningful cost that deters automated spam.
+Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and hold no moderation bond. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and lock `MODERATION_BOND_Y` (10 Y) in the service registry's moderator role before it can flag. The bond is a **per-identity capital cost**: a botnet must lock real Y for every flagging identity it operates, so scaling flag spam scales locked capital linearly, and the `MODERATION_BOND_COOLDOWN_EPOCHS` cooldown prevents rapidly recycling one bond across throwaway identities.
 
 ### Coordinated Flag Brigading
 
@@ -985,8 +1131,9 @@ A group conspires to flag legitimate content:
 - The author counter-flags, triggering review.
 - Independent reviewers (not part of the brigade) vote to overturn.
 - Every brigade member who flagged loses accuracy, and once accuracy drops below `MIN_FLAGGER_ACCURACY`, their future flags are ignored entirely.
+- Brigading the review itself now costs the brigade its reviewing power too: if the review resolves decisively (margin >= 2:1) against them, every brigade reviewer on the losing side loses accuracy, and below `MIN_REVIEWER_ACCURACY` their future review votes are ignored by indexers.
 - All flags are public and auditable, so brigading patterns are visible.
-- The eligibility threshold (invitations + account age + donations) makes it expensive to create many sockpuppet accounts for brigading.
+- The eligibility threshold (invitations + account age + moderation bonds) makes it expensive to create many sockpuppet accounts for brigading -- each one must lock its own bond.
 
 ### Retaliatory Flagging
 
@@ -1024,6 +1171,6 @@ A malicious indexer sets a hide threshold of 0 (hiding everything):
 ### `dsn-indexer`
 
 - The indexer calls `aggregate_moderation_score()` during its crawl cycle.
-- The indexer computes the set of eligible accounts from on-chain data (invitation records, account creation epochs, donation counts) and passes it to the aggregation functions.
+- The indexer computes the set of eligible accounts from on-chain data (invitation records, account creation epochs, and active moderation bonds in the service registry's moderator role, doc 11) and passes it to the aggregation functions.
 - Applies its configured `ModerationPolicy` to decide visibility.
-- Maintains `FlaggerRecord` locally for reputation tracking.
+- Maintains `FlaggerRecord` and `ReviewerRecord` locally for reputation tracking.

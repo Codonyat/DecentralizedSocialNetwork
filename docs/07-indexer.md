@@ -4,16 +4,16 @@
 
 Autonomi is a content-addressed storage network with no built-in query capabilities. Clients cannot ask Autonomi "give me Alice's feed" or "search for posts about Rust." The indexer bridges this gap: it listens to blockchain events, crawls Autonomi for content, builds queryable indices locally, and exposes a REST API for clients.
 
-Because ALL source content lives on Autonomi (immutable Chunks, signed Scratchpads, GraphEntries) and all economic activity (bonds, donations, transfers, emissions) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: clients can spot-check any result the indexer returns by fetching the underlying Autonomi data or querying the blockchain themselves.
+Because ALL source content lives on Autonomi (immutable Chunks, signed Scratchpads, GraphEntries) and all economic activity (tips, promotions, transfers, rebates, referrals) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: clients can spot-check any result the indexer returns by fetching the underlying Autonomi data or querying the blockchain themselves.
 
-Multiple competing indexers can run simultaneously. No single indexer can censor content without clients noticing — they simply switch to a different indexer or verify against Autonomi directly.
+Multiple competing indexers can run simultaneously. No single indexer can censor content without clients noticing — they simply switch to a different indexer or verify against Autonomi directly. Registered indexers additionally stake Y in the on-chain `ServiceRegistry` and sign every API response, which upgrades "verifiable" to "enforceable": provable lies are slashable (doc 11; see the Service Registry Duties section below).
 
 ## Module Structure
 
 ```
 crates/indexer/src/
 ├── lib.rs              # Re-exports, IndexerService construction
-├── config.rs           # Configuration: crawl frequency, chain settings, moderation policy, storage paths
+├── config.rs           # Configuration: crawl frequency, chain settings, moderation policy, service registration, storage paths
 ├── chain_listener.rs   # Listens to blockchain events, populates local index
 ├── crawler.rs          # Crawl loop: discover users, fetch content, follow links
 ├── store.rs            # Local index storage (SQLite-backed)
@@ -24,18 +24,18 @@ crates/indexer/src/
 │   ├── profiles.rs     # GET /profiles/:user_pk — profile + stats
 │   ├── posts.rs        # GET /posts/:address — single post + thread
 │   ├── search.rs       # GET /search?q=... — full-text search
-│   ├── engagement.rs   # GET /engagement/:post_address — bonds, donations
+│   ├── engagement.rs   # GET /engagement/:post_address — promotions, tips
 │   ├── moderation.rs   # GET /moderation/:post_address — flag status, verdicts
 │   ├── names.rs        # GET /names/:name — name resolution
 │   ├── spotcheck.rs    # GET /spotcheck/:post_address — raw Autonomi data for verification
 │   └── health.rs       # GET /health — indexer status, crawl stats
-├── feed_builder.rs     # Feed ranking: chronological, donated, bonded
+├── feed_builder.rs     # Feed ranking: chronological, tipped, promoted
 └── error.rs            # Indexer error types
 ```
 
 ## Chain Listener (`chain_listener.rs`)
 
-The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (bonds, donations, emissions, transfers, invitations, name registrations).
+The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (tips, promotions, rebates, referrals, transfers, invitations, name registrations/renewals/expiries, key rotations, service registrations).
 
 ### Event Types
 
@@ -43,12 +43,22 @@ The listener processes the following on-chain events:
 
 | Event | Description | Index Action |
 |---|---|---|
-| **Bond** | User bonds Y tokens to a post | `upsert_bond` |
-| **Donation** | User donates Y tokens to an author via a post | `upsert_donation` |
-| **Emission** | New Y tokens emitted to an address | Update user's `y_balance` |
+| **Promotion** | Promoter burns Y to amplify a post (pay-to-amplify, no return path) | `upsert_promotion` |
+| **Tip** | Sender tips Y to a creator (transfer + 1% burn) with a 32-byte post-ref memo | `upsert_tip` — the memo attributes the tip to a post |
+| **RebateDistributed** | Epoch rebate drop paid to an account pro-rata to protocol fees burned (doc 10 §3.2.1) | Update account's `y_balance` |
 | **Transfer** | Y tokens transferred between users | Update sender/receiver `y_balance` |
 | **Invitation** | New user invited to the network | `ensure_user_known`, record invitation link |
-| **NameRegistration** | User registers or updates a name | `upsert_name` |
+| **NameRegistration** | User registers a name (includes `paid_through_epoch`) | `upsert_name` |
+| **NameRenewed** | Name renewed for another term | Update `names` table (extend `paid_through_epoch`) |
+| **NameExpired** | Name lapsed past its grace period | Update `names` table; expired names resolve to nothing |
+| **ReferralPaid** | Inviter received their referral cut of an invitee's fee | Update inviter's referral-earnings stat |
+| **KeyRotated** | Identity re-pointed from `old_key` to `new_key` via the IdentityRegistry | Remap identity → current key across the index |
+| **ServiceRegistered** | A service (indexer, gateway) staked into the `ServiceRegistry` | Maintain the indexer directory |
+| **ServiceSlashed** | A service's stake was slashed on a verified fraud proof | Maintain the indexer directory (mark slashed) |
+
+There is no `Emission` event: emission-to-creators no longer exists. The
+scheduled drops arrive as `RebateDistributed` (usage rebates) events instead
+(doc 10 §3.2).
 
 ### Reorg Handling
 
@@ -106,14 +116,14 @@ async fn process_chain_event(
     event: &ChainEvent,
 ) -> Result<(), IndexerError> {
     match event {
-        ChainEvent::Bond { user, post_address, amount, block_number } => {
-            index.upsert_bond(user, post_address, *amount, *block_number).await?;
+        ChainEvent::Promotion { promoter, post_hash, amount, block_number } => {
+            index.upsert_promotion(promoter, post_hash, *amount, *block_number).await?;
         }
-        ChainEvent::Donation { donor, post_address, author, amount, block_number } => {
-            index.upsert_donation(donor, post_address, author, *amount, *block_number).await?;
+        ChainEvent::Tip { sender, post_ref, creator, amount, burn, block_number } => {
+            index.upsert_tip(sender, post_ref, creator, *amount, *block_number).await?;
         }
-        ChainEvent::Emission { recipient, amount, .. } => {
-            index.add_y_balance(recipient, *amount).await?;
+        ChainEvent::RebateDistributed { epoch: _, account, amount, .. } => {
+            index.add_y_balance(account, *amount).await?;
         }
         ChainEvent::Transfer { from, to, amount, .. } => {
             index.transfer_y_balance(from, to, *amount).await?;
@@ -122,17 +132,45 @@ async fn process_chain_event(
             index.ensure_user_known(invitee).await?;
             index.record_invitation(inviter, invitee).await?;
         }
-        ChainEvent::NameRegistration { user, name, .. } => {
-            index.upsert_name(user, name).await?;
+        ChainEvent::NameRegistration { user, name, paid_through_epoch, .. } => {
+            index.upsert_name(user, name, *paid_through_epoch).await?;
+        }
+        ChainEvent::NameRenewed { name, paid_through_epoch, .. } => {
+            index.renew_name(name, *paid_through_epoch).await?;
+        }
+        ChainEvent::NameExpired { name, .. } => {
+            index.expire_name(name).await?;
+        }
+        ChainEvent::ReferralPaid { inviter, invitee: _, amount, .. } => {
+            index.add_referral_earnings(inviter, *amount).await?;
+        }
+        ChainEvent::KeyRotated { identity, old_key, new_key, .. } => {
+            index.remap_identity_key(identity, old_key, new_key).await?;
+        }
+        ChainEvent::ServiceRegistered { service_key, stake, uri, .. } => {
+            index.upsert_service(service_key, *stake, uri).await?;
+        }
+        ChainEvent::ServiceSlashed { service_key, .. } => {
+            index.mark_service_slashed(service_key).await?;
         }
     }
     Ok(())
 }
 ```
 
+### Key Rotations
+
+A `KeyRotated` event re-points an identity to a new key (doc 01, doc 09
+§2.6). The listener remaps identity → current key across the entire index,
+and the crawler must from then on fetch mutable data (profile, FeedIndex,
+FollowList Scratchpads) at addresses derived from the **current** key. Old
+content is not orphaned: content signatures remain valid against the key that
+was current at write time, so previously indexed posts stay verifiable
+without re-signing.
+
 ## Crawler Design (`crawler.rs`)
 
-The crawler fetches content from Autonomi — profiles, posts, follow lists, and reply graphs. It does NOT handle any economic data (bonds, donations, balances, emissions); that is the chain listener's responsibility.
+The crawler fetches content from Autonomi — profiles, posts, follow lists, and reply graphs. It does NOT handle any economic data (tips, promotions, balances, rebates); that is the chain listener's responsibility.
 
 ### Discovery Strategy
 
@@ -249,7 +287,7 @@ Users are crawled in priority order:
 |---|---|---|
 | **1 (highest)** | Never crawled | New user, need initial data |
 | **2** | Known Scratchpad writes since last crawl | Active user, likely has new content |
-| **3** | High bond/donation volume | Heavily engaged user, feeds depend on their content |
+| **3** | High tip/promotion volume | Heavily engaged user, feeds depend on their content |
 | **4** | High follower count | Popular user, many feeds reference their posts |
 | **5 (lowest)** | Idle, low engagement | Inactive user, unlikely to have new data |
 
@@ -277,14 +315,17 @@ pub struct IndexedUser {
     pub follower_count: u64,
     pub following_count: u64,
     pub post_count: u64,
-    /// Trust distance from seed users in the invitation graph.
+    /// Informational invitation-tree depth (doc 05). Edge-layer display and
+    /// heuristics only — never consulted by any monetary rule.
     pub trust_distance: u32,
     /// Token state (from on-chain events).
     pub y_balance: u64,
     pub y_nonce: u64,
-    /// Aggregate donation stats (from on-chain events).
-    pub total_donations_received: u64,
-    pub total_donations_given: u64,
+    /// Aggregate tip stats (from on-chain events).
+    pub total_tips_received: u64,
+    pub total_tips_given: u64,
+    /// Referral annuity earnings from direct invitees (from ReferralPaid events).
+    pub referral_earnings: u64,
     /// Invitation chain.
     pub invited_by: Option<PublicKey>,
     pub invitation_depth: u32,
@@ -317,12 +358,12 @@ pub struct IndexedPost {
     pub sequence: u64,
     /// Timestamp (informational).
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Bond metrics (from on-chain events).
-    pub total_bonded: u64,
-    pub bond_count: u64,
-    /// Donation metrics (from on-chain events).
-    pub total_donated: u64,
-    pub unique_donors: u32,
+    /// Promotion metrics (from on-chain events).
+    pub total_promoted: u64,
+    pub promotion_count: u64,
+    /// Tip metrics (from on-chain events, attributed via the post_ref memo).
+    pub total_tipped: u64,
+    pub unique_tippers: u32,
     /// Moderation state.
     pub flag_count: u32,
     pub moderation_verdict: Option<ModerationVerdict>,
@@ -331,18 +372,18 @@ pub struct IndexedPost {
 /// Engagement detail for a post.
 pub struct IndexedEngagement {
     pub post_address: ContentAddress,
-    pub bonds: Vec<IndexedBond>,
-    pub donations: Vec<IndexedDonation>,
+    pub promotions: Vec<IndexedPromotion>,
+    pub tips: Vec<IndexedTip>,
 }
 
-pub struct IndexedBond {
-    pub bonder: PublicKey,
+pub struct IndexedPromotion {
+    pub promoter: PublicKey,
     pub amount: u64,
     pub block_number: u64,
 }
 
-pub struct IndexedDonation {
-    pub donor: PublicKey,
+pub struct IndexedTip {
+    pub sender: PublicKey,
     pub amount: u64,
     pub block_number: u64,
 }
@@ -378,9 +419,10 @@ pub enum ModerationVerdict {
 | `users` | `public_key` | User profiles, stats, token balances |
 | `posts` | `address` | Post content, engagement counts |
 | `follows` | `(follower, followee)` | Follow relationships |
-| `bonds` | `(bonder, post_address, block_number)` | Bond records (from chain) |
-| `donations` | `(donor, post_address, block_number)` | Donation records (from chain) |
-| `names` | `name` | Name-to-public-key resolution (from chain) |
+| `promotions` | `(promoter, post_address, block_number)` | Promotion records (from chain) |
+| `tips` | `(sender, post_address, block_number)` | Tip records (from chain, attributed via post_ref memo) |
+| `names` | `name` | Name-to-identity resolution with `paid_through_epoch` (from chain); expired names resolve to nothing |
+| `services` | `service_key` | Indexer directory: stake, endpoint URI, status (from chain) |
 | `reply_links` | `(parent_address, child_address)` | Thread structure |
 | `invitations` | `(inviter, invitee)` | Invitation graph |
 | `flags` | `(flagger, post_address)` | Content flags |
@@ -405,12 +447,20 @@ pub trait IndexStore: Send + Sync {
                                         verdict: ModerationVerdict) -> Result<(), IndexerError>;
 
     // --- Write operations (used by chain listener) ---
-    async fn upsert_bond(&self, user: &PublicKey, post: &ContentAddress,
-                         amount: u64, block_number: u64) -> Result<(), IndexerError>;
-    async fn upsert_donation(&self, donor: &PublicKey, post: &ContentAddress,
-                             author: &PublicKey, amount: u64, block_number: u64) -> Result<(), IndexerError>;
-    async fn upsert_name(&self, user: &PublicKey, name: &str) -> Result<(), IndexerError>;
+    async fn upsert_promotion(&self, promoter: &PublicKey, post: &ContentAddress,
+                              amount: u64, block_number: u64) -> Result<(), IndexerError>;
+    async fn upsert_tip(&self, sender: &PublicKey, post_ref: &ContentAddress,
+                        creator: &PublicKey, amount: u64, block_number: u64) -> Result<(), IndexerError>;
+    async fn upsert_name(&self, user: &PublicKey, name: &str,
+                         paid_through_epoch: u64) -> Result<(), IndexerError>;
+    async fn renew_name(&self, name: &str, paid_through_epoch: u64) -> Result<(), IndexerError>;
+    async fn expire_name(&self, name: &str) -> Result<(), IndexerError>;
     async fn record_invitation(&self, inviter: &PublicKey, invitee: &PublicKey) -> Result<(), IndexerError>;
+    async fn add_referral_earnings(&self, inviter: &PublicKey, amount: u64) -> Result<(), IndexerError>;
+    async fn remap_identity_key(&self, identity: &IdentityId, old_key: &PublicKey,
+                                new_key: &PublicKey) -> Result<(), IndexerError>;
+    async fn upsert_service(&self, service_key: &PublicKey, stake: u64, uri: &str) -> Result<(), IndexerError>;
+    async fn mark_service_slashed(&self, service_key: &PublicKey) -> Result<(), IndexerError>;
     async fn add_y_balance(&self, user: &PublicKey, amount: u64) -> Result<(), IndexerError>;
     async fn transfer_y_balance(&self, from: &PublicKey, to: &PublicKey, amount: u64) -> Result<(), IndexerError>;
     async fn rollback_to_block(&self, block_number: u64) -> Result<(), IndexerError>;
@@ -428,8 +478,8 @@ pub trait IndexStore: Send + Sync {
     async fn search_posts(&self, query: &str, cursor: Option<u64>,
                           limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
     async fn get_engagement(&self, post: &ContentAddress) -> Result<IndexedEngagement, IndexerError>;
-    async fn get_bonds_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedBond>, IndexerError>;
-    async fn get_donations_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedDonation>, IndexerError>;
+    async fn get_promotions_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedPromotion>, IndexerError>;
+    async fn get_tips_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedTip>, IndexerError>;
     async fn get_moderation_status(&self, post: &ContentAddress) -> Result<ModerationVerdict, IndexerError>;
     async fn get_flagged_posts(&self, min_flags: u32, cursor: Option<u64>,
                                 limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
@@ -444,8 +494,8 @@ pub trait IndexStore: Send + Sync {
 pub struct CrawlStats {
     pub total_users: u64,
     pub total_posts: u64,
-    pub total_bonds: u64,
-    pub total_donations: u64,
+    pub total_promotions: u64,
+    pub total_tips: u64,
     pub last_crawl_completed: Option<chrono::DateTime<chrono::Utc>>,
     pub last_crawl_duration_ms: u64,
     pub last_indexed_block: u64,
@@ -463,18 +513,23 @@ Clients choose a ranking strategy when requesting feeds. The indexer supports mu
 pub enum FeedRanking {
     /// Reverse chronological. No algorithmic sorting.
     Chronological,
-    /// Weighted by donation volume and donor diversity.
-    Donated,
-    /// Weighted by bond volume (staked visibility).
-    Bonded,
-    /// Combined: donations + bonds + recency, with configurable weights.
+    /// Weighted by tip volume and tipper diversity.
+    Tipped,
+    /// Weighted by promotion volume (paid amplification).
+    Promoted,
+    /// Combined: tips + promotions + recency, with configurable weights.
     Blended {
         recency_weight: f64,
-        donation_weight: f64,
-        bond_weight: f64,
+        tip_weight: f64,
+        promotion_weight: f64,
     },
 }
 ```
+
+Ranking remains an **edge-layer choice** (doc 09 §3): nothing here is
+consensus, and different indexers may offer different strategies. Promotion is
+a paid-amplification signal — an ad, not a quality judgment — which clients
+and indexers may weight or ignore as they see fit.
 
 ### Home Feed Construction
 
@@ -511,22 +566,22 @@ pub fn blended_score(
     let age_hours = (now - post.created_at).num_hours().max(0) as f64;
     let recency = (-age_hours / 24.0).exp();
 
-    // Donation signal: log-scaled total donated, weighted by donor diversity
-    let donation = (1.0 + post.total_donated as f64).ln()
-        * (1.0 + post.unique_donors as f64).ln();
+    // Tip signal: log-scaled total tipped, weighted by tipper diversity
+    let tip = (1.0 + post.total_tipped as f64).ln()
+        * (1.0 + post.unique_tippers as f64).ln();
 
-    // Bond signal: log-scaled total bonded
-    let bond = (1.0 + post.total_bonded as f64).ln();
+    // Promotion signal: log-scaled total promoted
+    let promotion = (1.0 + post.total_promoted as f64).ln();
 
     recency * weights.recency_weight
-        + donation * weights.donation_weight
-        + bond * weights.bond_weight
+        + tip * weights.tip_weight
+        + promotion * weights.promotion_weight
 }
 ```
 
 ## REST API Endpoints (`api/`)
 
-All endpoints return JSON. Pagination uses cursor-based pagination with `?cursor=<sequence>&limit=<n>`.
+All endpoints return JSON. Pagination uses cursor-based pagination with `?cursor=<sequence>&limit=<n>`. All responses carry an `X-DSN-Claim` signature header (or a `claim` envelope field) — the service-key signature over the canonical claim commitment described in the Service Registry Duties section (doc 11 §3.2).
 
 ### Feeds
 
@@ -569,8 +624,9 @@ Response:
     "post_count": 128,
     "y_balance": 5000,
     "trust_distance": 2,
-    "total_donations_received": 12000,
-    "total_donations_given": 3500,
+    "total_tips_received": 12000,
+    "total_tips_given": 3500,
+    "referral_earnings": 800,
     "invited_by": "hex or null"
 }
 ```
@@ -651,20 +707,20 @@ GET /api/v1/engagement/:post_address
 Response:
 {
     "post_address": "hex...",
-    "total_bonded": 1500,
-    "bond_count": 3,
-    "bonds": [
+    "total_promoted": 1500,
+    "promotion_count": 3,
+    "promotions": [
         {
-            "bonder": "pk_hex",
+            "promoter": "pk_hex",
             "amount": 500,
             "block_number": 12345
         }
     ],
-    "total_donated": 2000,
-    "unique_donors": 8,
-    "donations": [
+    "total_tipped": 2000,
+    "unique_tippers": 8,
+    "tips": [
         {
-            "donor": "pk_hex",
+            "sender": "pk_hex",
             "amount": 250,
             "block_number": 12340
         }
@@ -682,18 +738,23 @@ Response:
     "name": "alice",
     "public_key": "hex...",
     "display_name": "Alice",
-    "registered_block": 10500
+    "registered_block": 10500,
+    "paid_through_epoch": 95,
+    "expired": false
 }
 ```
 
-### Bonds and Donations per User/Post
+Names that have lapsed past their grace period resolve to nothing (the
+endpoint returns 404 once a `NameExpired` event is indexed).
+
+### Promotions and Tips per User/Post
 
 ```
-GET /api/v1/users/:pk/bonds?cursor=0&limit=20
+GET /api/v1/users/:pk/promotions?cursor=0&limit=20
 
 Response:
 {
-    "bonds": [
+    "promotions": [
         {
             "post_address": "hex...",
             "amount": 500,
@@ -706,14 +767,14 @@ Response:
 ```
 
 ```
-GET /api/v1/users/:pk/donations?cursor=0&limit=20
+GET /api/v1/users/:pk/tips?cursor=0&limit=20
 
 Response:
 {
-    "donations": [
+    "tips": [
         {
             "post_address": "hex...",
-            "author": "pk_hex",
+            "creator": "pk_hex",
             "amount": 250,
             "block_number": 12340
         }
@@ -724,26 +785,29 @@ Response:
 ```
 
 ```
-GET /api/v1/posts/:addr/bonds?cursor=0&limit=20
+GET /api/v1/posts/:addr/promotions?cursor=0&limit=20
 
 Response:
 {
-    "bonds": [IndexedBond],
+    "promotions": [IndexedPromotion],
     "next_cursor": 20,
     "has_more": false
 }
 ```
 
 ```
-GET /api/v1/posts/:addr/donations?cursor=0&limit=20
+GET /api/v1/posts/:addr/tips?cursor=0&limit=20
 
 Response:
 {
-    "donations": [IndexedDonation],
+    "tips": [IndexedTip],
     "next_cursor": 20,
     "has_more": false
 }
 ```
+
+Tips are attributed to posts via the 32-byte `post_ref` memo carried
+on-chain by every tip (doc 11 §1.2).
 
 ### Moderation Status
 
@@ -790,19 +854,21 @@ GET /api/v1/spotcheck/engagement/:post_address
 
 Response:
 {
-    "indexed_bond_count": 3,
-    "indexed_donation_count": 8,
+    "indexed_promotion_count": 3,
+    "indexed_tip_count": 8,
     "chain_proof": {
-        "bonds_on_chain": 3,
-        "donations_on_chain": 8,
-        "bonds_match": true,
-        "donations_match": true
+        "promotions_on_chain": 3,
+        "tips_on_chain": 8,
+        "promotions_match": true,
+        "tips_match": true
     },
     "match": true
 }
 ```
 
 The spot-check API lets any client verify that the indexer is not fabricating or omitting data. For content, the indexer provides the raw Autonomi data. For engagement metrics, the indexer's counts can be verified against on-chain events.
+
+Because every response — including spot-check responses — is wrapped in a signed claim envelope (see Service Registry Duties), a spot-check failure is no longer just a reason to switch indexers: the signed claim can be escalated to an on-chain fraud proof against the indexer's stake (doc 11 §3.4).
 
 ### Health
 
@@ -816,8 +882,8 @@ Response:
     "crawl_stats": {
         "total_users": 1250,
         "total_posts": 48000,
-        "total_bonds": 5200,
-        "total_donations": 31000,
+        "total_promotions": 5200,
+        "total_tips": 31000,
         "last_crawl_completed": "2026-03-03T12:00:00Z",
         "last_crawl_duration_ms": 45000,
         "last_indexed_block": 128500
@@ -843,15 +909,15 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         // Posts & Threads
         .route("/api/v1/posts/:address", get(posts::get_post))
         .route("/api/v1/posts/:address/thread", get(posts::get_thread))
-        .route("/api/v1/posts/:address/bonds", get(engagement::get_post_bonds))
-        .route("/api/v1/posts/:address/donations", get(engagement::get_post_donations))
+        .route("/api/v1/posts/:address/promotions", get(engagement::get_post_promotions))
+        .route("/api/v1/posts/:address/tips", get(engagement::get_post_tips))
         // Search
         .route("/api/v1/search", get(search::search_posts))
         // Names
         .route("/api/v1/names/:name", get(names::resolve_name))
-        // Users — bonds & donations
-        .route("/api/v1/users/:pk/bonds", get(engagement::get_user_bonds))
-        .route("/api/v1/users/:pk/donations", get(engagement::get_user_donations))
+        // Users — promotions & tips
+        .route("/api/v1/users/:pk/promotions", get(engagement::get_user_promotions))
+        .route("/api/v1/users/:pk/tips", get(engagement::get_user_tips))
         // Engagement
         .route("/api/v1/engagement/:address", get(engagement::get_engagement))
         // Moderation
@@ -875,6 +941,55 @@ pub struct AppState {
 }
 ```
 
+## Service Registry Duties (doc 11)
+
+An indexer that wants to be more than anonymous gossip registers in the
+on-chain `ServiceRegistry` with a **stake** and a **service key** (doc 11
+§3.1). Registration is what turns doc 07's trust model from "verifiable if
+someone bothers" into "enforceable because anyone might."
+
+### Signed responses
+
+EVERY API response is signed by the service key over a canonical claim
+commitment (doc 11 §3.2):
+
+```
+claim = (request_hash, merkle_root(items), chain_height, epoch, expiry)
+```
+
+The signature travels as the `X-DSN-Claim` header (or a `claim` envelope
+field in the JSON body). Responses without a valid claim signature are
+treated by clients as anonymous gossip; the registry listing obliges signing.
+
+### Slashable faults
+
+Slashable faults are the closed list of doc 11 §3.3 — only
+cryptographically decidable lies:
+
+- **F1 Forged content** — serving an item whose alleged author signature is invalid.
+- **F2 Equivocation** — two correctly signed, contradictory claims for the same request.
+- **F3 Provable omission** — attesting completeness for a user/feed-version while omitting an entry provable from the user's signed FeedIndex. Completeness attestations are opt-in per response, but refusing to attest is a visible disclosure.
+- **F4 False chain facts** — asserting a name/balance/stake fact the contract can check against its own state.
+
+Omission without attestation, staleness, and ranking bias remain
+market-disciplined, not slashable.
+
+### Liveness challenges and rewards
+
+Registered indexers answer per-epoch liveness challenges (sampled from chain
+randomness) to earn their share of the service pool (doc 10 §3.2.2).
+Unanswered challenges do not slash — they zero that epoch's reward. Provable
+lies slash: **50% of stake burned, 50% to the prover as bounty** (doc 11
+§3.4).
+
+### Operational requirements
+
+The service key is a distinct keypair from any user identity, loaded from
+`service_key_path`. The operator escrows `stake_amount` at registration, and
+`sign_responses` must be `true` for a registered indexer — an unsigned
+response from a registered indexer is indistinguishable from a withheld one
+and forfeits the trust upgrade the stake paid for.
+
 ## Configuration (`config.rs`)
 
 ```rust
@@ -894,6 +1009,16 @@ pub struct IndexerConfig {
 
     /// Moderation policy.
     pub moderation: ModerationPolicyConfig,
+
+    /// Path to the service keypair used to sign API responses (doc 11 §3.2).
+    pub service_key_path: String,      // default: "./service_key.enc"
+
+    /// Y stake escrowed in the ServiceRegistry at registration (doc 11 §3.1).
+    pub stake_amount: u64,             // must be >= MIN_STAKE
+
+    /// Sign every API response with the service key.
+    /// Must be true for registered indexers.
+    pub sign_responses: bool,          // default: true
 
     /// Local storage path for SQLite index.
     pub db_path: String,               // default: "./indexer.db"
@@ -983,6 +1108,9 @@ impl IndexerConfig {
 bind_address = "0.0.0.0"
 bind_port = 3000
 db_path = "./indexer.db"
+service_key_path = "./service_key.enc"
+stake_amount = 10000000000        # 10,000 Y (>= MIN_STAKE)
+sign_responses = true             # must be true for registered indexers
 
 [chain]
 rpc_url = "https://rpc.example.com"
@@ -1018,6 +1146,8 @@ Each indexer operator chooses their own moderation policy. This is a feature, no
 - **Unmoderated indexers** may disable moderation entirely (set thresholds to `u32::MAX`)
 
 Clients choose which indexer to use based on the moderation policy they prefer. The `/health` endpoint exposes the policy name so clients can make informed choices.
+
+Flag/review eligibility is computed from on-chain data per doc 06: an invitation record, sufficient account age, and a locked moderation bond. No donation- or tip-derived criterion exists.
 
 ## Error Types (`error.rs`)
 
@@ -1159,8 +1289,9 @@ The indexer is an **untrusted convenience layer**. Its trust model is:
 | Property | Guarantee |
 |---|---|
 | **Data integrity** | Every indexed content item traces back to a signed Autonomi object. Every indexed economic event traces back to an on-chain transaction. Clients can verify any item via the spot-check API, by reading Autonomi directly, or by querying the blockchain. |
-| **Completeness** | NOT guaranteed. An indexer may omit posts (censorship). Clients detect this by querying multiple indexers or checking a user's FeedIndex Scratchpad directly. |
+| **Completeness** | NOT guaranteed in general. An indexer may omit posts (censorship); clients detect this by querying multiple indexers or checking a user's FeedIndex Scratchpad directly. BUT post-level omission becomes provable — and slashable — when the indexer serves completeness attestations (doc 11 §3.3 F3). |
+| **Truthfulness** | Registered indexers sign every response over a canonical claim commitment; provable fabrication, equivocation, attested omission, or false chain facts are slashable (doc 11). |
 | **Ranking fairness** | NOT guaranteed. An indexer may bias feed rankings. Clients can request `Chronological` ranking as a neutral baseline. |
 | **Moderation accuracy** | Subjective by design. Each indexer applies its own moderation policy. Clients choose the indexer whose policy they agree with. |
-| **Economic accuracy** | On-chain events are the source of truth for bonds, donations, emissions, and transfers. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
+| **Economic accuracy** | On-chain events are the source of truth for tips, promotions, rebates, referrals, and transfers. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
 | **Availability** | NOT guaranteed by any single indexer. Multiple competing indexers provide redundancy. The source data on Autonomi and the blockchain is always available independently. |

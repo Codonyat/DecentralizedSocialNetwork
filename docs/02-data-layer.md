@@ -7,7 +7,7 @@ Abstracts off-chain content storage behind traits, enabling:
 2. Real IPFS/Autonomi backend for testnet/mainnet
 3. Clean separation of protocol logic from storage mechanics
 
-On-chain operations (tokens, bonds, donations, names, invitations, epochs) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
+On-chain operations (tokens, tips, promotions, names, invitations, epochs, identity, services) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
 
 ## Module Structure
 
@@ -179,12 +179,14 @@ The `ChainClient` trait is defined in the `dsn-chain` crate and provides access 
 `ChainClient` covers the following operations:
 
 - **Y token**: balance queries, transfers between accounts
-- **Bonds**: placing bonds on posts, querying bond state and bonding curves
-- **Donations**: executing donations from donor to creator (with burn), querying donation history
-- **Names**: registering human-readable names, resolving name to public key
-- **Invitations**: creating invitations, querying trust distance in the invitation tree
-- **Epochs**: querying current epoch info, emission schedule
-- **Events**: listening for on-chain events (new bonds, donations, epoch transitions)
+- **Promotions**: promotion burns on posts, querying promotion totals
+- **Tips**: executing tips (transfer + burn, with post-ref memo), querying tip history
+- **Names**: registering and renewing human-readable names, resolving name to identity, expiry recycling
+- **Invitations**: creating invitations, querying the invitation registry
+- **Epochs**: querying current epoch info, rebate drop schedule (rebates are auto-distributed)
+- **Identity**: key rotation records, recovery configuration
+- **Services**: service registry stakes and endpoints (doc 11)
+- **Events**: listening for on-chain events (new tips, promotions, rebate distributions, epoch transitions)
 
 See the `dsn-chain` crate documentation for the full trait definition and implementation details.
 
@@ -253,11 +255,13 @@ pub struct AutonomiBacked {
 | Reply link | Off-chain (Graph) | reply-specific key | Immutable edge parent→child |
 | Content flag | Off-chain (Graph) | flag-specific key | Immutable moderation flag |
 | Y Balance | On-chain | smart contract | ERC-20 token |
-| Bonds | On-chain | smart contract | Per-post bonding curve |
-| Donations | On-chain | smart contract | Donor→creator, with burn |
-| Names | On-chain | smart contract | Name→public key mapping |
-| Invitations | On-chain | smart contract | Invitation tree |
-| Epochs/Emission | On-chain | smart contract | Auto-distributed |
+| Promotions | On-chain | smart contract | Per-post promotion burn totals |
+| Tips | On-chain | smart contract | Sender→creator transfer + 1% burn, post-ref memo |
+| Names | On-chain | smart contract | Name→identity mapping, renewal/expiry |
+| Invitations | On-chain | smart contract | Invitation registry |
+| Epochs/Rebates | On-chain | smart contract | Drop auto-distributed pro-rata to fees burned |
+| Identity rotation/recovery | On-chain | smart contract | Stable identity ids (doc 01) |
+| Service stakes | On-chain | smart contract | Indexer staking/slashing (doc 11) |
 
 ## Error Types (`error.rs`)
 

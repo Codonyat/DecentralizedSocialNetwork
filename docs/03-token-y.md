@@ -2,195 +2,263 @@
 
 ## Purpose
 
-Token Y is the native utility token with a fixed 21M supply, enforced on-chain via smart contracts. This crate contains **pure computation** -- no I/O, no storage, no async. Smart contracts enforce all rules; this crate provides the math and validation logic that both clients and contracts rely on.
+Token Y is the native token with a fixed 21M supply, enforced on-chain via the
+contract suite (doc 11 §1.1). This crate contains **pure computation** — no
+I/O, no storage, no async. Smart contracts enforce all rules; this crate
+provides the math and validation logic that clients, indexers, and contracts
+all rely on.
+
+The economic design follows the **monetary constitution** (doc 10 §2): every
+rule in this document is objective, deterministic, and immutable at genesis.
+Nothing in the money layer measures a subjective quantity (doc 09 §3).
+There is no bonding, no donation-weighted emission, and no social metric
+anywhere in this crate — see doc 09 §2.1–2.3 for why those were removed.
 
 ## Module Structure
 
 ```
 crates/token-y/src/
   lib.rs
-  emission.rs         # Halving math, emission_for_epoch()
-  donation.rs         # Donation burn math, creator share, trust-distance weighting
-  bonding.rs          # Bonding curve pricing, burn computation
-  distribution.rs     # Per-epoch emission shares (donations -> emission allocation)
-  name_registry.rs    # Name pricing, validation
+  supply.rs           # Total supply, allocation buckets, rebate drop schedule
+  tips.rs             # Tip split math (transfer + flat burn)
+  fees.rs             # Protocol fee sinks: invitation, promotion; referral split
+  name_registry.rs    # Name pricing, renewal, expiry, validation
+  rebate.rs           # Usage rebate pool: per-epoch pro-rata distribution
+  referral.rs         # Referral annuity math (10% of direct invitees' fees)
   error.rs
 ```
 
 All modules are **pure functions** over their inputs. No I/O, no storage, no async.
 
-## A. Emission (`emission.rs`)
+## A. Supply & Allocation (`supply.rs`)
 
 ### Fixed Parameters
 
 ```rust
-pub const TOTAL_SUPPLY: u64 = 21_000_000_000_000;  // 21M with 6 decimals
-pub const INITIAL_EMISSION: u64 = 10_000_000_000;   // 10,000 Y/epoch
-pub const HALVING_INTERVAL: u64 = 52;
-pub const MAX_HALVINGS: u64 = 20;
+pub const TOTAL_SUPPLY: u64 = 21_000_000_000_000; // 21M with 6 decimals
+
+/// Allocation buckets (doc 10 §3.2). Ratios are constitutional; they are
+/// minted once at genesis into their respective contracts/escrows.
+pub const USAGE_REBATE_POOL: u64   = 6_300_000_000_000; // 30% — RebatePool contract
+pub const SERVICE_POOL: u64        = 2_100_000_000_000; // 10% — timelocked reserve (doc 10 §5.5)
+pub const TREASURY: u64            = 4_200_000_000_000; // 20% — 5y linear, unspent burns at y8
+pub const TEAM: u64                = 3_150_000_000_000; // 15% — 1y cliff, 4y vest
+pub const LIQUIDITY_SALE: u64      = 3_150_000_000_000; // 15% — DEX liquidity + public sale
+pub const GENESIS_COMMUNITY: u64   = 2_100_000_000_000; // 10% — retroactive drops, sunset y3
 ```
 
-### Emission Table (first 5 halvings)
+There is no mint function outside these buckets. Once the rebate and service
+pools are exhausted, distribution is over; from then on supply only shrinks
+(burns).
+
+### Rebate Drop Schedule
+
+Epochs are block-based, targeting ~1 week (doc 00). The usage rebate pool
+pays a scheduled per-epoch drop with 2-year halvings:
+
+```rust
+pub const INITIAL_REBATE_DROP: u64 = 30_000_000_000; // 30,000 Y/epoch
+pub const REBATE_HALVING_INTERVAL: u64 = 104;        // epochs (~2 years)
+pub const MAX_REBATE_HALVINGS: u64 = 20;
+
+/// Y dropped by the rebate pool in a given epoch.
+pub fn rebate_drop_for_epoch(epoch: u64) -> u64 {
+    let halvings = epoch / REBATE_HALVING_INTERVAL;
+    if halvings >= MAX_REBATE_HALVINGS { return 0; }
+    INITIAL_REBATE_DROP >> halvings
+}
+
+/// Total dropped before a given epoch (for pool accounting).
+pub fn total_dropped_before_epoch(epoch: u64) -> u64;
+```
 
 | Epoch Range | Y per Epoch | Cumulative Y |
 |---|---|---|
-| 0-51 | 10,000 | 520,000 |
-| 52-103 | 5,000 | 780,000 |
-| 104-155 | 2,500 | 910,000 |
-| 156-207 | 1,250 | 975,000 |
-| 208-259 | 625 | 1,007,500 |
+| 0–103 | 30,000 | 3,120,000 |
+| 104–207 | 15,000 | 4,680,000 |
+| 208–311 | 7,500 | 5,460,000 |
+| 312–415 | 3,750 | 5,850,000 |
+| 416–519 | 1,875 | 6,045,000 |
 
-### Key Functions
+Geometric-series dust remaining in the pool after `MAX_REBATE_HALVINGS` is
+burned in the final epoch (deterministic close-out).
 
-```rust
-/// Compute Y emission for a specific epoch.
-/// Epochs are block-based; the smart contract determines boundaries.
-pub fn emission_for_epoch(epoch: u64) -> u64 {
-    let halvings = epoch / HALVING_INTERVAL;
-    if halvings >= MAX_HALVINGS { return 0; }
-    INITIAL_EMISSION >> halvings
-}
+## B. Tips (`tips.rs`)
 
-/// Compute total Y emitted before a given epoch (sum of all prior epochs).
-pub fn total_emitted_before_epoch(epoch: u64) -> u64;
-```
-
-Emission is distributed to creators proportional to weighted donations received during each epoch. A per-creator cap per epoch prevents any single creator from capturing all emission. Donor diversity weighting ensures that more unique donors at greater trust distances produce more weight.
-
-## B. Donations (`donation.rs`)
-
-A "like" is a micro-Y donation to a creator. Each donation is a pure loss for the donor, making it a strong quality signal.
+A tip is the atomic social-economic act: a transfer of **existing** Y from
+fan to creator with a small flat burn. Nothing is minted against tips
+(doc 10 §1.1), so wash-tipping is strictly lossy and pointless.
 
 ### Mechanics
 
-- A fraction of each donation is burned (removed from circulation permanently).
-- The remainder goes to the creator.
-- Donations are weighted by trust distance between donor and recipient for emission calculations (farther = more weight, preventing self-donation via sock puppets).
+- `TIP_BURN_RATE_BPS` of each tip is burned; the remainder goes to the creator.
+- Each tip carries a 32-byte memo — the content address of the post it
+  rewards — so indexers can attribute tips to content (doc 11 §1.2).
+- Privacy: clients SHOULD send tips from one-time derived sender keys
+  (doc 09 §2.7) so the public ledger records flows without a linkable donor
+  identity by default.
+- Tip burns are **not** rebate-eligible (§E): rebating them would subsidize
+  fake tip volume and corrupt the tip signal indexers use for ranking.
 
 ### Constants and Functions
 
 ```rust
-pub const DONATION_BURN_RATE_BPS: u64 = 500; // 5%
+pub const TIP_BURN_RATE_BPS: u64 = 100; // 1%
 
-pub fn compute_donation_split(amount: u64) -> DonationSplit {
-    let burn = amount * DONATION_BURN_RATE_BPS / 10_000;
+pub fn compute_tip_split(amount: u64) -> TipSplit {
+    let burn = amount * TIP_BURN_RATE_BPS / 10_000;
     let creator_share = amount - burn;
-    DonationSplit { burn, creator_share }
+    TipSplit { burn, creator_share }
 }
 
-pub struct DonationSplit {
+pub struct TipSplit {
     pub burn: u64,
     pub creator_share: u64,
 }
-
-/// Weight a donation for emission calculation based on trust distance.
-/// Greater distance = more weight (harder to fake).
-/// Graph distance 0 (self) = 0 weight.
-/// Graph distance 1 (direct invitee/inviter) = 0.5 weight.
-/// Graph distance 2+ = 1.0 weight (uncapped).
-pub fn donation_weight(graph_distance: u32) -> f64;
 ```
 
-All functions are pure -- they take inputs and return outputs with no side effects.
+## C. Protocol Fees & Referral Split (`fees.rs`, `referral.rs`)
 
-## C. Bonding (`bonding.rs`)
-
-Users bond Y on posts they believe will attract future bonders.
-
-### Mechanics
-
-- The poster is the mandatory first bonder (skin in the game, spam deterrent).
-- A percentage of every bond is burned (negative-sum).
-- Bonding curve: later bonders pay more; early bonders profit from distributions of new bonds.
-- Bonding is non-redeemable against the contract. Bonders do not "sell back." Instead, a portion of each new bond is distributed to previous bonders proportional to their position. The burned percentage is gone forever.
-
-### Types and Functions
+All protocol fees (invitations, promotions, name registration/renewal) route
+through one deterministic split: if the payer has an inviter within the
+referral term, 10% of the fee goes to that inviter and 90% burns; otherwise
+100% burns.
 
 ```rust
-pub const BOND_BURN_RATE_BPS: u64 = 1_000; // 10%
+pub const REFERRAL_SHARE_BPS: u64 = 1_000; // 10% of fees to the direct inviter
+pub const REFERRAL_TERM_EPOCHS: u64 = 208; // ~4 years from the invitee's invitation
 
-pub struct BondingCurveState {
-    pub total_bonded: u64,
-    pub bond_count: u64,
-    pub bonders: Vec<(PublicKey, u64)>, // (bonder, amount)
-}
-
-/// Compute the price of the next bond given the current curve state.
-/// Linear curve: price = base_price + slope * total_bonded
-pub fn bond_price(state: &BondingCurveState, base_price: u64, slope: u64) -> u64;
-
-/// Compute how a new bond is distributed.
-pub fn compute_bond_distribution(
-    bond_amount: u64,
-    state: &BondingCurveState,
-) -> BondDistribution;
-
-pub struct BondDistribution {
+pub struct FeeSplit {
+    pub referral_share: u64, // 0 if no eligible inviter
     pub burned: u64,
-    pub to_previous_bonders: Vec<(PublicKey, u64)>, // proportional to existing bonds
 }
+
+/// Split a protocol fee between the payer's inviter (if within term) and burn.
+pub fn compute_fee_split(
+    fee: u64,
+    invited_at_epoch: Option<u64>,
+    current_epoch: u64,
+) -> FeeSplit;
 ```
 
-All bonding functions are pure computation over the curve state.
+Properties (doc 10 §3.3): objective, oracle-free, depth-1 only (no
+compounding tree income), and unfakeable at a profit — routing your own fees
+through a Sybil invitee returns 10% of money that was 100% yours.
 
-## D. Distribution (`distribution.rs`)
-
-Per-epoch emission shares are computed from donations.
-
-### Mechanics
-
-- Each creator's share = `weighted_donations_received / total_weighted_donations` applied to the epoch's emission.
-- Weight for each donation = `donation_amount * donation_weight(graph_distance)`.
-- Per-creator cap: no single creator receives more than `per_creator_cap_bps` of total emission in a single epoch.
-
-### Key Function
+### Fee Sinks
 
 ```rust
-/// Compute how the epoch's emission is distributed across creators.
-/// Pure function: takes the epoch number and a list of donations, returns
-/// a map of creator public key to Y amount earned.
-pub fn compute_epoch_emission_shares(
-    epoch: u64,
-    donations: &[(PublicKey, PublicKey, u64, u32)], // (donor, creator, amount, graph_distance)
-    per_creator_cap_bps: u64,
-) -> HashMap<PublicKey, u64>;
+/// Flat cost to issue an invitation (doc 05).
+pub const INVITATION_COST_Y: u64 = 100_000_000; // 100 Y
+
+/// Promotion: pay-to-amplify. The full amount is a fee (routed through
+/// compute_fee_split, i.e. ≥90% burned). No return path — an advertising
+/// cost, not an investment (replaces bonding, doc 09 §2.3).
+pub fn validate_promotion(amount: u64, min_promotion: u64) -> Result<(), TokenYError>;
 ```
 
-No I/O -- the caller supplies all donation data and receives the result.
+Posting, following, replying, and reading carry **no protocol fee** — costs
+sit on amplification and scarce namespace, never on existence (doc 10 §1.2).
 
-## E. Name Registry (`name_registry.rs`)
+## D. Name Registry (`name_registry.rs`)
 
-Users burn Y to claim a username on-chain. Names are permanent and resolve to a public key.
+Users pay Y (via the fee split) to claim a unique name, and an annual renewal
+to keep it. Names that lapse past a grace period expire and become
+registrable again (doc 09 §2.8: fixes squatting, lost keys, and gives the
+sink an ongoing life).
 
 ### Pricing Tiers
 
-| Name Length | Cost (Y) |
-|---|---|
-| 1 char | 1,000,000 |
-| 2 chars | 100,000 |
-| 3 chars | 10,000 |
-| 4 chars | 1,000 |
-| 5+ chars | 100 |
+Registration includes the first year. Renewal costs the same tier price per
+year.
+
+| Name Length | Registration (Y) | Renewal (Y/year) |
+|---|---|---|
+| 1 char | 1,000,000 | 1,000,000 |
+| 2 chars | 100,000 | 100,000 |
+| 3 chars | 10,000 | 10,000 |
+| 4 chars | 1,000 | 1,000 |
+| 5+ chars | 100 | 100 |
+
+```rust
+pub const NAME_TERM_EPOCHS: u64 = 52;       // one year of exclusivity per payment
+pub const NAME_GRACE_PERIOD_EPOCHS: u64 = 4; // renewal window after expiry
+
+/// Return the Y cost to register or renew a name for one term.
+pub fn name_cost(name: &str) -> u64;
+
+/// A name lapses when current_epoch > paid_through + grace period.
+pub fn is_name_expired(paid_through_epoch: u64, current_epoch: u64) -> bool {
+    current_epoch > paid_through_epoch + NAME_GRACE_PERIOD_EPOCHS
+}
+```
 
 ### Validation Rules
 
 - Lowercase alphanumeric characters and hyphens only.
-- Length: 1-32 characters.
-- No leading or trailing hyphens.
-- No consecutive hyphens.
-- Unicode normalization (NFKC) is applied before validation.
-
-### Functions
+- Length: 1–32 characters.
+- No leading or trailing hyphens; no consecutive hyphens.
+- Unicode normalization (NFKC) applied before validation.
 
 ```rust
-/// Return the Y cost to register a name, based on its normalized length.
-pub fn name_cost(name: &str) -> u64;
-
 /// Validate and normalize a name. Returns the NFKC-normalized name on success.
 pub fn validate_name(name: &str) -> Result<String, NameError>;
 ```
 
-Both functions are pure -- no storage lookups. The smart contract checks name availability on-chain.
+The smart contract checks availability (including expiry of previous
+registrations) on-chain. Names resolve to an **identity** (doc 01), not a raw
+key, so key rotation does not orphan names.
+
+## E. Usage Rebate Distribution (`rebate.rs`)
+
+Each epoch's drop (§A) is distributed **pro-rata to protocol fees burned that
+epoch** by each account (doc 10 §3.2.1). This is the "smart distribution to
+early adopters": while `drop > total fees`, real usage is rebated at >100% —
+the early network is effectively free — decaying smoothly to full price as
+adoption grows. Its fully-adversarial equilibrium is a continuous token sale
+at market price (see doc 10 §3.2.1 for the analysis), and Sybil-splitting
+across accounts changes a pro-rata share by exactly zero.
+
+### Eligible Fees (constitutional exclusion list, doc 10 §3.2.1)
+
+| Fee | Rebate-eligible? | Rationale |
+|---|---|---|
+| Name registration | yes | pure burn |
+| Name renewal (first year of a given name) | yes | pure burn |
+| Name renewal (subsequent years) | **no** | gives squat-harvesting a carrying cost |
+| Invitation | yes | pure burn |
+| Promotion | yes | pure burn |
+| Tip burns | **no** | protects tip-signal integrity |
+| Any resource-consuming fee (e.g. future storage rent) | **no** | rebating would manufacture spam load |
+
+### Key Function
+
+```rust
+/// Compute the epoch's rebate distribution.
+/// Pure function: takes the eligible fees burned per account this epoch,
+/// returns each account's share of the epoch drop.
+pub fn compute_epoch_rebates(
+    epoch: u64,
+    eligible_fees_burned: &[(PublicKey, u64)],
+) -> HashMap<PublicKey, u64>;
+```
+
+No caps, no weights, no identity logic — pro-rata over burned amounts is the
+entire mechanism, and that simplicity is what makes it Sybil-immune.
+
+## F. Referral Annuity Accounting (`referral.rs`)
+
+```rust
+/// Whether an invitee's fees still pay their inviter.
+pub fn referral_active(invited_at_epoch: u64, current_epoch: u64) -> bool {
+    current_epoch < invited_at_epoch + REFERRAL_TERM_EPOCHS
+}
+
+/// The inviter's cut of a fee (0 if term elapsed or genesis account).
+pub fn referral_cut(fee: u64) -> u64 {
+    fee * REFERRAL_SHARE_BPS / 10_000
+}
+```
 
 ## Error Types (`error.rs`)
 
@@ -200,11 +268,11 @@ pub enum TokenYError {
     #[error("insufficient balance: have {have}, need {need}")]
     InsufficientBalance { have: u64, need: u64 },
 
-    #[error("invalid bond amount")]
-    InvalidBondAmount,
+    #[error("invalid tip amount")]
+    InvalidTipAmount,
 
-    #[error("invalid donation amount")]
-    InvalidDonationAmount,
+    #[error("promotion below minimum: {amount} < {min}")]
+    PromotionBelowMinimum { amount: u64, min: u64 },
 
     #[error("post not found")]
     PostNotFound,
@@ -212,11 +280,14 @@ pub enum TokenYError {
     #[error("name already taken: {name}")]
     NameTaken { name: String },
 
+    #[error("name expired; must re-register: {name}")]
+    NameExpired { name: String },
+
     #[error("invalid name: {reason}")]
     InvalidName { reason: String },
 
-    #[error("emission cap exceeded")]
-    EmissionCapExceeded,
+    #[error("rebate pool exhausted")]
+    RebatePoolExhausted,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,3 +311,23 @@ pub enum NameError {
     ConsecutiveHyphens,
 }
 ```
+
+## Anti-Gaming Analysis
+
+Every distribution channel passes the doc 10 §3.1 test (*"the fully-gamed
+equilibrium must still be an acceptable outcome"*):
+
+- **Wash tips**: burn 1% to move your own money, mint nothing. Strictly lossy.
+  Self-tipping to climb an indexer's tip-ranked feed is paid promotion at
+  full price — an ad buy, not an exploit.
+- **Rebate harvesting**: profitable only while `drop > total fees`; the
+  equilibrium is buying tokens from the protocol at market price. Sybil
+  accounts are irrelevant to a pro-rata share.
+- **Referral self-dealing**: paying your own fees through a Sybil invitee
+  returns 10% of your own money. Strictly lossy.
+- **Name squatting**: recurring renewal cost per name per year, and renewals
+  after year one are rebate-ineligible, so a large squat portfolio bleeds Y
+  forever.
+- **What no longer exists**: bonding curves (pyramid, doc 09 §2.3) and
+  donation-weighted emission (mining equilibrium at `D ≈ 20E`, doc 09 §2.1).
+  Nothing in this crate mints against a social metric.
