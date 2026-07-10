@@ -17,7 +17,7 @@ crates/cli/src/
 │   ├── social.rs       # Follow, unfollow, feed view
 │   ├── token_y.rs      # Donate, tip, view balance, emission info
 │   ├── bond.rs         # Place bonds, view bonds, check prices
-│   ├── name.rs         # Register names, lookup, cost check
+│   ├── name.rs         # Claim/assess handles, rent status, pay rent, force-buy, lookup(+history)
 │   ├── invitation.rs   # Invite users, view invitation chain
 │   └── moderation.rs   # Flag content, counter-flag, view flags
 ├── config.rs           # Configuration loading (file + env + flags)
@@ -73,12 +73,17 @@ pub enum Command {
     TokenY(TokenYCommand),
     /// Bonding on posts
     Bond(BondCommand),
-    /// Name registration
+    /// Handle management (Harberger-rented @handles)
     Name(NameCommand),
     /// Invitation management
     Invite(InviteCommand),
     /// Content moderation
     Mod(ModCommand),
+    /// View a creator's supporters (donor recognition; indexer convenience, NOT protocol)
+    Supporters {
+        /// Public key of the creator (short hex or full hex)
+        creator: String,
+    },
 }
 ```
 
@@ -156,6 +161,11 @@ pub enum PostAction {
     Create {
         /// Post content (max 4000 chars)
         content: String,
+        /// Mention a user by @handle (repeatable). Resolved to the user's
+        /// public key at write time and stored in `Post.mentions` — mentions
+        /// hold public keys, never handles, so they survive handle changes.
+        #[arg(long)]
+        mention: Vec<String>,
     },
     /// Reply to an existing post
     Reply {
@@ -164,6 +174,9 @@ pub enum PostAction {
         to: String,
         /// Reply content
         content: String,
+        /// Mention a user by @handle (repeatable); resolved to a public key at write time.
+        #[arg(long)]
+        mention: Vec<String>,
     },
     /// View a single post by content address
     View {
@@ -287,20 +300,55 @@ pub enum BondAction {
 ```rust
 #[derive(Subcommand)]
 pub enum NameAction {
-    /// Burn Y to claim a name
-    Register {
-        /// The name to register
-        name: String,
+    /// Claim an unowned @handle. Sets the self-assessed value V (Harberger)
+    /// and pays the first epoch's rent into the Reward Pool at claim time.
+    Claim {
+        /// The @handle to claim (given without the leading @)
+        handle: String,
+        /// Self-assessed value V in Y (atomic units). Mandatory and must be
+        /// >= the tier floor for short handles (len 1-6). Omit for the flat
+        /// tier (len >= 7), where V is meaningless: flat 1 Y/epoch rent, no
+        /// force-buy.
+        #[arg(long)]
+        value: Option<u64>,
     },
-    /// Resolve a name to a public key
+    /// Change the self-assessed value V of a handle you own. Increases take
+    /// effect immediately; decreases take effect only after the lookback
+    /// window (26 epochs).
+    Assess {
+        /// The @handle to reassess
+        handle: String,
+        /// New self-assessed value V in Y (atomic units)
+        #[arg(long)]
+        value: u64,
+    },
+    /// Pay rent on a handle you own, extending its paid-through epoch.
+    /// Rent flows to the Reward Pool.
+    PayRent {
+        /// The @handle to pay rent on
+        handle: String,
+        /// Number of epochs of rent to prepay
+        #[arg(long, default_value = "1")]
+        epochs: u32,
+    },
+    /// Show rent status for a handle: per-epoch rent, paid-through epoch,
+    /// and grace/lapse state.
+    RentStatus {
+        /// The @handle to check
+        handle: String,
+    },
+    /// Force-buy a short (Harberger-tier) handle at its deterministic price
+    /// = max(V, floor). Escrows the bid for the notice window and pays a
+    /// non-refundable 1% fee to the Reward Pool. Not available for flat-tier
+    /// handles (len >= 7 are a safe harbor).
+    ForceBuy {
+        /// The @handle to force-buy
+        handle: String,
+    },
+    /// Resolve a handle to its owner, with live rent status and ownership history.
     Lookup {
-        /// The name to look up
-        name: String,
-    },
-    /// Check pricing for a name
-    Cost {
-        /// The name to check pricing for
-        name: String,
+        /// The @handle to look up
+        handle: String,
     },
 }
 ```
@@ -358,6 +406,22 @@ pub enum FlagReason {
     Impersonation,
 }
 ```
+
+### Donor Recognition Display (client convention, NOT protocol)
+
+Donor recognition is a **presentation-layer convenience** computed by the client and
+indexer from public chain data. It is verifiable but carries **no economic-accuracy
+guarantee** — the protocol still treats a donation as a pure financial loss with no
+on-chain privilege. The CLI surfaces three conventions:
+
+- **Thread-level prominence.** A donor's replies rank higher *within the donated
+  thread only*, proportional to the amount donated (a "superchat"). This never
+  buys global reach — confining the boost to the thread prevents pay-for-reach
+  corruption of the wider feed.
+- **Supporter badges.** A user's lifetime Y donated to a creator, shown as a badge
+  on that creator's threads. Derived from public donations, so anyone can recompute it.
+- **Creator leaderboards.** `dsn supporters <creator>` renders the creator's ranked
+  supporter list from the indexer's `GET /api/v1/creators/:pk/supporters` endpoint.
 
 ## Key Storage Design (`keystore.rs`)
 
@@ -518,7 +582,8 @@ impl IndexerClient {
         user: &PublicKey,
     ) -> Result<YBalanceSummary, IndexerError>;
 
-    /// Fetch epoch info (current epoch, emission schedule).
+    /// Fetch epoch info via `GET /api/v1/epoch`: current epoch, scheduled
+    /// emission, Reward Pool drip (2% of balance), and Reward Pool balance.
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
     // --- Bond queries ---
@@ -541,19 +606,21 @@ impl IndexerClient {
         user: &PublicKey,
     ) -> Result<Vec<BondPosition>, IndexerError>;
 
-    // --- Name queries ---
+    // --- Handle queries ---
 
-    /// Resolve a name to a public key.
+    /// Resolve an @handle to its current owner's public key.
     pub async fn name_lookup(
         &self,
-        name: &str,
+        handle: &str,
     ) -> Result<Option<PublicKey>, IndexerError>;
 
-    /// Fetch the cost to register a name.
-    pub async fn name_cost(
+    /// Fetch the full Harberger status of an @handle: owner, self-assessed
+    /// value, tier, per-epoch rent, rent status, any pending force-buy, and
+    /// ownership history.
+    pub async fn name_status(
         &self,
-        name: &str,
-    ) -> Result<NameCost, IndexerError>;
+        handle: &str,
+    ) -> Result<NameStatus, IndexerError>;
 
     // --- Donation queries ---
 
@@ -562,6 +629,13 @@ impl IndexerClient {
         &self,
         post: &ContentAddress,
     ) -> Result<DonationInfo, IndexerError>;
+
+    /// Fetch a creator's supporter leaderboard (donor recognition; derived
+    /// from public chain data, NOT under the economic-accuracy guarantee).
+    pub async fn creator_supporters(
+        &self,
+        creator: &PublicKey,
+    ) -> Result<CreatorSupporters, IndexerError>;
 
     // --- Moderation queries ---
 
@@ -593,6 +667,8 @@ pub struct FeedItem {
     pub bond_count: u64,
     pub total_bonded: u64,
     pub donation_total: u64,
+    /// Donor-recognition badge for the author (client convention, NOT protocol).
+    pub author_badge: Option<SupporterBadge>,
 }
 
 /// Detailed post view.
@@ -605,12 +681,86 @@ pub struct PostDetail {
     pub total_bonded: u64,
     pub donation_total: u64,
     pub flags: Vec<FlagInfo>,
+    /// Donor-recognition badge for the author (client convention, NOT protocol).
+    pub author_badge: Option<SupporterBadge>,
+    /// Thread-scoped donor prominence (atomic Y donated to this thread's root
+    /// author); used only to rank this reply within its thread, never globally.
+    pub thread_prominence: Option<u64>,
 }
 
 /// Thread view: root post plus nested replies.
 pub struct ThreadView {
     pub root: PostDetail,
-    pub replies: Vec<ThreadView>,  // Recursive nesting
+    /// Nested replies, ordered by thread-scoped donor prominence then recency.
+    pub replies: Vec<ThreadView>,
+    /// True if this node was surfaced by thread-level donor prominence
+    /// (superchat-style boost, confined to this thread only).
+    pub donor_boosted: bool,
+}
+
+/// Donor-recognition badge, computed from public chain data. Verifiable but
+/// NOT part of the protocol's economic-accuracy guarantee.
+pub struct SupporterBadge {
+    /// Lifetime Y donated to the creator in context (atomic units, JSON string).
+    pub lifetime_donated: u64,
+    /// Rank on the creator's supporter leaderboard, if ranked.
+    pub rank: Option<u32>,
+}
+
+/// A creator's supporter leaderboard.
+pub struct CreatorSupporters {
+    pub creator: PublicKey,
+    pub supporters: Vec<SupporterEntry>,
+}
+
+pub struct SupporterEntry {
+    pub supporter: PublicKey,
+    pub profile: Option<UserProfile>,
+    pub lifetime_donated: u64,  // atomic Y
+    pub rank: u32,
+}
+
+/// Full Harberger status of an @handle (returned by `name_status`).
+pub struct NameStatus {
+    pub handle: String,
+    /// None if the handle is unowned or has lapsed.
+    pub owner: Option<PublicKey>,
+    /// Self-assessed value V in atomic Y; 0 for the flat tier.
+    pub assessed_value: u64,
+    pub tier: HandleTier,
+    /// Rent per epoch in atomic Y (0.1% of max(V, floor) for Harberger; flat 1 Y).
+    pub rent_per_epoch: u64,
+    pub rent_status: RentState,
+    /// Present while a force-buy is in its notice window.
+    pub force_buy_pending: Option<ForceBuyState>,
+    pub ownership_history: Vec<OwnershipRecord>,
+    /// True if ownership changed within the lookback window (26 epochs).
+    pub recently_changed_owner: bool,
+}
+
+pub enum HandleTier {
+    /// len 1-6: rent = 0.1% of max(V, floor), force-buyable.
+    Harberger,
+    /// len >= 7: flat 1 Y/epoch, no force-buy (safe harbor).
+    Flat,
+}
+
+pub enum RentState {
+    Paid { through_epoch: u64 },
+    Grace { epochs_left: u32 },
+    Lapsed,
+}
+
+pub struct ForceBuyState {
+    pub bidder: PublicKey,
+    pub bid: u64,             // escrowed, atomic Y
+    pub deadline_epoch: u64,
+}
+
+pub struct OwnershipRecord {
+    pub owner: PublicKey,
+    pub claimed_at_epoch: u64,
+    pub released_at_epoch: Option<u64>,
 }
 ```
 
@@ -905,6 +1055,16 @@ Enter passphrase: ********
 Post published.
 Content address: abcd1234efgh5678...
 
+# Create a post mentioning users by @handle (repeatable).
+# The client resolves each handle to a public key at write time and stores the
+# keys in Post.mentions — mentions travel as public keys, so they keep pointing
+# at the same account even if a handle is later reassigned.
+$ dsn post create "Welcome @alice and @bob!" --mention alice --mention bob
+Enter passphrase: ********
+Post published.
+Content address: abcd1234efgh5678...
+Mentions resolved: @alice -> a1b2c3d4..., @bob -> e5f6a7b8...
+
 # View a post
 $ dsn post view abcd1234efgh5678
 Post by Alice (a1b2c3d4...)
@@ -995,6 +1155,7 @@ Nonce: 14
 $ dsn y donate --post abcd1234efgh5678 --amount 25000000
 Enter passphrase: ********
 Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
+  (5% fee to Reward Pool; the remainder weights the creator's next-epoch emission share)
 
 # Tip a user
 $ dsn y tip --to e5f6a7b8... --amount 25000000
@@ -1010,34 +1171,120 @@ bond      100.000000   abcd1234efgh5678         43
 emission  87.500000    (auto)                   42
 tip       10.000000    c9d0e1f2... (Charlie)    41
 
-# View emission info
+# View emission info (reads GET /api/v1/epoch via IndexerClient::epoch_info)
 $ dsn y emission
 Current epoch: 43
-Epoch emission rate: 1,000 Y
+Scheduled emission: 1,400,000,000 Y      (epochs 0-49, before the first halving)
+Reward Pool drip (2%): 250,000 Y         (pool balance: 12,500,000 Y)
+Total epoch emission: 1,400,250,000 Y    (scheduled + drip)
 Your share (last epoch): 87.500000 Y
-Distribution: automatic per epoch
+Distribution: automatic per epoch, directed by donation weighting
 ```
 
-### Name Registration
+### Handles (Harberger @handles)
+
+Amounts are entered in atomic units (6 decimals) and echoed in human-readable Y.
+Short handles (len 1-6) are Harberger-taxed; long handles (len >= 7) rent flat.
 
 ```bash
-# Check cost to register a name
-$ dsn name cost alice
-Name: alice
-Cost: 500 Y (short name premium)
-
-# Register a name (burns Y)
-$ dsn name register alice
+# Claim a short @handle (Harberger tier). Set the self-assessed value V and pay
+# the first epoch's rent to the Reward Pool. V itself is NOT spent — it is the
+# price at which you agree to be force-bought.
+$ dsn name claim alice --value 10000000000
 Enter passphrase: ********
-Name registered.
-  Name: alice
-  Burned: 500 Y
-  Your Y after: 750 Y
+Handle claimed: @alice
+  Tier: Harberger (len 5, assessment floor 10,000 Y)
+  Self-assessed value (V): 10,000.000000 Y
+  First-epoch rent paid: 10.000000 Y   (0.1% of max(V, floor)) -> Reward Pool
+  Rent paid through: epoch 43
+  Your Y after: 1,240.000000 Y
 
-# Look up a name
-$ dsn name lookup alice
-Name: alice
-Owner: a1b2c3d4e5f6a7b8...
+# Raise the assessed value (increases take effect immediately).
+$ dsn name assess alice --value 50000000000
+Enter passphrase: ********
+Assessment updated: @alice
+  Self-assessed value (V): 50,000.000000 Y
+  New rent: 50.000000 Y/epoch   (0.1% of 50,000 Y)
+  Note: a decrease would take effect only after the 26-epoch lookback window.
+
+# Check rent status.
+$ dsn name rent-status alice
+Handle: @alice
+  Owner: a1b2c3d4e5f6a7b8... (you)
+  Tier: Harberger (len 5)
+  Self-assessed value (V): 50,000.000000 Y
+  Rent: 50.000000 Y/epoch
+  Rent paid through: epoch 43   (current epoch: 43)
+  Status: Paid
+
+# Prepay several epochs of rent.
+$ dsn name pay-rent alice --epochs 3
+Enter passphrase: ********
+Rent paid: @alice
+  3 epochs x 50.000000 Y = 150.000000 Y -> Reward Pool
+  Rent paid through: epoch 46
+  Your Y after: 1,090.000000 Y
+
+# Force-buy someone else's short handle at its deterministic price = max(V, floor).
+# The bid is escrowed for the 1-epoch notice window; the 1% fee is non-refundable.
+$ dsn name force-buy chris
+Enter passphrase: ********
+Force-buy initiated on @chris
+  Deterministic price (bid): 20,000.000000 Y   (max(V = 20,000, floor = 10,000))
+  Escrowed until epoch 47 (1-epoch notice window): 20,000.000000 Y
+  Non-refundable fee (1%): 200.000000 Y -> Reward Pool
+  Total charged now: 20,200.000000 Y
+  The owner may cancel by raising V to >= 22,000.000000 Y (110% of the bid).
+  If uncontested, @chris transfers to you at epoch 47.
+
+# (run by the current owner, @chris, to defend the handle)
+# Cancel a force-buy by raising V to >= 110% of the bid and paying the
+# retroactive rent on the increase over the 26-epoch lookback window.
+$ dsn name assess chris --value 22000000000
+Enter passphrase: ********
+Assessment updated: @chris
+  Self-assessed value (V): 22,000.000000 Y   (>= 110% of the 20,000 Y bid)
+  Force-buy cancelled; the challenger's 20,000 Y bid is refunded (the 1% fee is not).
+  New rent: 22.000000 Y/epoch
+  Retroactive rent on the +2,000 Y increase over 26 epochs: 52.000000 Y -> Reward Pool
+
+# If the owner does NOT cancel, the transfer executes at the deadline with a
+# waterfall over the escrowed 20,000 Y bid (it can never exceed the bid or underflow).
+# Example with 40 Y of rent arrears owed by the previous owner:
+#   1. arrears -> Reward Pool:                   40.000000 Y
+#   2. owner_share = min(V, bid - arrears):  19,960.000000 Y -> previous owner
+#   3. remainder -> Reward Pool:                  0.000000 Y
+# Under-assessing does not help a squatter: the owner payout is capped at
+# min(V, ...), and any excess up to the floor-based bid goes to the Reward Pool.
+
+# Look up a handle: owner, live rent status, and ownership history.
+$ dsn name lookup nadia
+Handle: @nadia
+  ! Owner changed 2 epochs ago (within the 26-epoch lookback) — verify identity before trusting.
+  Owner: 4d5e6f70a1b2c3d4...   (this account formerly went by @nad)
+  Tier: Harberger (len 5) | V: 15,000.000000 Y | Rent: 15.000000 Y/epoch
+  Status: Paid through epoch 48
+  Ownership history:
+    4d5e6f70... epoch 46 -> present   (acquired via force-buy)
+    8899aabb... epoch 22 -> 46
+```
+
+Flat tier (len >= 7) — no assessed value, flat rent, and a permanent safe harbor:
+
+```bash
+# Claim a long @handle: omit --value; rent is a flat 1 Y/epoch for every length >= 7.
+$ dsn name claim decentralist
+Enter passphrase: ********
+Handle claimed: @decentralist
+  Tier: Flat (len 12)
+  Rent: 1.000000 Y/epoch   (identical for every handle of length >= 7)
+  First-epoch rent paid: 1.000000 Y -> Reward Pool
+  Rent paid through: epoch 43
+  Note: no self-assessed value and no force-buy — long handles cannot be taken.
+
+# Force-buy is rejected for flat-tier handles.
+$ dsn name force-buy decentralist
+Error: force-buy not available for @decentralist (flat tier, len 12 — safe harbor)
 ```
 
 ### Invitations
@@ -1079,6 +1326,22 @@ Flags: 3
 
 Counter-flags: 1
   by g1h2i3j4... — epoch 44
+```
+
+### Supporters (Donor Recognition)
+
+```bash
+# View a creator's supporter leaderboard (derived from public donations;
+# a client/indexer convenience, NOT a protocol privilege).
+$ dsn supporters e5f6a7b8...
+Supporters of Bob (e5f6a7b8...):
+  RANK  SUPPORTER              LIFETIME DONATED
+  1     a1b2c3d4... (Alice)    1,250.000000 Y
+  2     c9d0e1f2... (Charlie)    640.000000 Y
+  3     f3a4b5c6... (Dave)       180.000000 Y
+  [12 more]
+Note: badges and thread prominence are computed off-chain and verifiable, but
+carry no economic-accuracy guarantee — a donation buys no on-chain privilege.
 ```
 
 ## Error Handling Strategy
@@ -1216,10 +1479,15 @@ async fn main() {
 
 1. User runs `dsn post create "Hello world"`
 2. CLI loads config, unlocks keyfile (passphrase prompt)
-3. `commands/post.rs` constructs a `Post`, signs it with the secret key
-4. CLI writes the post Chunk via `dsn-data::ChunkStore::put()`
-5. CLI updates the user's FeedIndex Scratchpad via `dsn-data::ScratchpadStore::update()`
-6. CLI prints the content address to stdout
+3. For each `--mention @handle`, the CLI resolves the handle to its current
+   public key via `IndexerClient::name_lookup` (spot-checked) and collects the
+   keys into `Post.mentions`. Mentions store public keys, never handles, so they
+   keep pointing at the same account after a handle change; handles re-resolve to
+   display text only at render time.
+4. `commands/post.rs` constructs a `Post`, signs it with the secret key
+5. CLI writes the post Chunk via `dsn-data::ChunkStore::put()`
+6. CLI updates the user's FeedIndex Scratchpad via `dsn-data::ScratchpadStore::update()`
+7. CLI prints the content address to stdout
 
 ### Read Path (e.g., viewing feed)
 

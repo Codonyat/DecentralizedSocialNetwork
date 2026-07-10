@@ -180,10 +180,11 @@ The `ChainClient` trait is defined in the `dsn-chain` crate and provides access 
 
 - **Y token**: balance queries, transfers between accounts
 - **Bonds**: placing bonds on posts, querying bond state and bonding curves
-- **Donations**: executing donations from donor to creator (with burn), querying donation history
-- **Names**: registering human-readable names, resolving name to public key
-- **Invitations**: creating invitations, querying trust distance in the invitation tree
+- **Donations**: executing donations from donor to creator (with a protocol fee routed to the Reward Pool), querying donation history
+- **Names**: claiming/assessing/renting handles (Harberger), resolving handle to public key
+- **Invitations**: creating invitations, querying tree position (depth, ancestry) in the invitation tree
 - **Epochs**: querying current epoch info, emission schedule
+- **Reward Pool**: querying pool balance and per-epoch drip amount
 - **Events**: listening for on-chain events (new bonds, donations, epoch transitions)
 
 See the `dsn-chain` crate documentation for the full trait definition and implementation details.
@@ -254,8 +255,8 @@ pub struct AutonomiBacked {
 | Content flag | Off-chain (Graph) | flag-specific key | Immutable moderation flag |
 | Y Balance | On-chain | smart contract | ERC-20 token |
 | Bonds | On-chain | smart contract | Per-post bonding curve |
-| Donations | On-chain | smart contract | Donor→creator, with burn |
-| Names | On-chain | smart contract | Name→public key mapping |
+| Donations | On-chain | smart contract | Donor→creator, fee to Reward Pool |
+| Names | On-chain | smart contract | Handle→public key mapping (Harberger) |
 | Invitations | On-chain | smart contract | Invitation tree |
 | Epochs/Emission | On-chain | smart contract | Auto-distributed |
 

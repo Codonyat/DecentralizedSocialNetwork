@@ -26,7 +26,9 @@ crates/indexer/src/
 │   ├── search.rs       # GET /search?q=... — full-text search
 │   ├── engagement.rs   # GET /engagement/:post_address — bonds, donations
 │   ├── moderation.rs   # GET /moderation/:post_address — flag status, verdicts
-│   ├── names.rs        # GET /names/:name — name resolution
+│   ├── names.rs        # GET /names/:handle — handle resolution + lifecycle state
+│   ├── epoch.rs        # GET /epoch — scheduled emission, Reward Pool balance, drip
+│   ├── creators.rs     # GET /creators/:pk/supporters — donor recognition (not protocol)
 │   ├── spotcheck.rs    # GET /spotcheck/:post_address — raw Autonomi data for verification
 │   └── health.rs       # GET /health — indexer status, crawl stats
 ├── feed_builder.rs     # Feed ranking: chronological, donated, bonded
@@ -35,7 +37,7 @@ crates/indexer/src/
 
 ## Chain Listener (`chain_listener.rs`)
 
-The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (bonds, donations, emissions, transfers, invitations, name registrations).
+The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (bonds, donations, emissions, transfers, invitations, handle lifecycle events, and Reward Pool state).
 
 ### Event Types
 
@@ -43,12 +45,18 @@ The listener processes the following on-chain events:
 
 | Event | Description | Index Action |
 |---|---|---|
-| **Bond** | User bonds Y tokens to a post | `upsert_bond` |
-| **Donation** | User donates Y tokens to an author via a post | `upsert_donation` |
-| **Emission** | New Y tokens emitted to an address | Update user's `y_balance` |
+| **Bond** | User bonds Y tokens to a post; the fee portion (10%; the entire first bond) routes to the Reward Pool | `upsert_bond`, `add_pool_inflow` |
+| **Donation** | User donates Y tokens to an author via a post; the 5% fee routes to the Reward Pool | `upsert_donation`, `add_pool_inflow` |
+| **EmissionDistributed** | Scheduled emission plus Reward Pool drip distributed to a creator | Update recipient's `y_balance` |
 | **Transfer** | Y tokens transferred between users | Update sender/receiver `y_balance` |
-| **Invitation** | New user invited to the network | `ensure_user_known`, record invitation link |
-| **NameRegistration** | User registers or updates a name | `upsert_name` |
+| **Invitation** | New user invited to the network; the invite fee routes to the Reward Pool | `ensure_user_known`, `record_invitation`, `add_pool_inflow` |
+| **EpochAdvanced** | Epoch boundary crossed | `update_epoch_state` (scheduled emission, drip, pool balance) |
+| **NameClaimed** | User claims an unowned @handle (sets assessed value, pays first-epoch rent) | `upsert_name` |
+| **AssessmentChanged** | Owner changes a handle's assessed value (decreases take effect after the lookback window) | `update_name_assessment` |
+| **NameRentPaid** | Handle rent paid through an epoch (→ Reward Pool) | `record_rent_payment` |
+| **ForceBuyInitiated** | A Harberger-tier handle receives a force-buy bid | `mark_force_buy` |
+| **NameTransferred** | Handle ownership changes (force-buy completes or manual transfer) | `transfer_name` (appends to `name_history`) |
+| **NameLapsed** | Handle rent unpaid past grace; handle returns to unowned | `lapse_name` |
 
 ### Reorg Handling
 
@@ -106,24 +114,50 @@ async fn process_chain_event(
     event: &ChainEvent,
 ) -> Result<(), IndexerError> {
     match event {
-        ChainEvent::Bond { user, post_address, amount, block_number } => {
+        // --- Economic events (fee portions feed the Reward Pool) ---
+        ChainEvent::Bond { user, post_address, amount, fee_to_pool, block_number } => {
             index.upsert_bond(user, post_address, *amount, *block_number).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
-        ChainEvent::Donation { donor, post_address, author, amount, block_number } => {
+        ChainEvent::Donation { donor, post_address, author, amount, fee_to_pool, block_number } => {
             index.upsert_donation(donor, post_address, author, *amount, *block_number).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
-        ChainEvent::Emission { recipient, amount, .. } => {
+        ChainEvent::EmissionDistributed { recipient, amount, .. } => {
+            // Per-epoch total = scheduled emission + Reward Pool drip; both land here.
             index.add_y_balance(recipient, *amount).await?;
         }
         ChainEvent::Transfer { from, to, amount, .. } => {
             index.transfer_y_balance(from, to, *amount).await?;
         }
-        ChainEvent::Invitation { inviter, invitee, .. } => {
+        ChainEvent::Invitation { inviter, invitee, fee_to_pool, .. } => {
             index.ensure_user_known(invitee).await?;
             index.record_invitation(inviter, invitee).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
-        ChainEvent::NameRegistration { user, name, .. } => {
-            index.upsert_name(user, name).await?;
+        ChainEvent::EpochAdvanced { epoch, scheduled_emission, pool_drip, pool_balance } => {
+            index.update_epoch_state(*epoch, *scheduled_emission, *pool_drip, *pool_balance).await?;
+        }
+
+        // --- Handle lifecycle events (six events; see 01/03 for the on-chain model) ---
+        ChainEvent::NameClaimed { owner, handle, assessed_value, claimed_at_epoch, .. } => {
+            index.upsert_name(owner, handle, *assessed_value, *claimed_at_epoch).await?;
+        }
+        ChainEvent::AssessmentChanged { handle, new_value, effective_epoch, .. } => {
+            index.update_name_assessment(handle, *new_value, *effective_epoch).await?;
+        }
+        ChainEvent::NameRentPaid { handle, paid_through_epoch, .. } => {
+            index.record_rent_payment(handle, *paid_through_epoch).await?;
+        }
+        ChainEvent::ForceBuyInitiated { handle, bidder, bid, deadline_epoch, .. } => {
+            index.mark_force_buy(handle, bidder, *bid, *deadline_epoch).await?;
+        }
+        ChainEvent::NameTransferred { handle, from, to, at_epoch, .. } => {
+            // Appends the prior owner's span to name_history, then sets the new owner.
+            index.transfer_name(handle, from, to, *at_epoch).await?;
+        }
+        ChainEvent::NameLapsed { handle, at_epoch, .. } => {
+            index.lapse_name(handle, *at_epoch).await?;
         }
     }
     Ok(())
@@ -264,11 +298,19 @@ The indexer builds a local relational index from two sources: Autonomi's flat ke
 ```rust
 /// A fully indexed user record.
 pub struct IndexedUser {
-    /// Primary identity.
+    /// Primary identity. PublicKey is the ONLY canonical identity; the handle is
+    /// a mutable label resolved at render time (see 01 Identity Principle).
     pub public_key: PublicKey,
-    /// Registered name (from on-chain NameRegistration events).
-    pub registered_name: Option<String>,
-    /// Latest profile data.
+    /// On-chain @handle, if one is currently claimed (from handle lifecycle events).
+    pub handle: Option<String>,
+    /// Assessed value backing the handle, in atomic Y. `None` (stored as 0) in the
+    /// flat tier, where the value is meaningless.
+    pub handle_assessed_value: Option<u64>,
+    /// Pricing tier the handle falls under, derived from its length.
+    pub handle_tier: Option<HandleTier>,
+    /// Current rent standing of the handle. Ownership history lives in `name_history`.
+    pub handle_rent_status: Option<HandleRentStatus>,
+    /// Latest profile data (`display_name` is cosmetic and off-chain).
     pub display_name: String,
     pub bio: String,
     pub avatar: Option<ContentAddress>,
@@ -310,6 +352,11 @@ pub struct IndexedPost {
     pub author: PublicKey,
     /// Post content.
     pub content: String,
+    /// Public keys mentioned in the post. Mirrors `Post.mentions` from 01:
+    /// clients resolve @handles to PublicKeys at write time and embed the keys,
+    /// so mentions survive handle changes; the indexer renders them back to
+    /// current handles at read time.
+    pub mentions: Vec<PublicKey>,
     /// Threading.
     pub reply_to: Option<ContentAddress>,
     pub reply_count: u64,
@@ -369,6 +416,26 @@ pub enum ModerationVerdict {
     /// Flags exceed threshold, content hidden by this indexer.
     Hidden { flag_count: u32 },
 }
+
+/// Handle pricing tier, derived from handle length (see 03 §E Name Registry).
+#[derive(Clone, Serialize, Deserialize)]
+pub enum HandleTier {
+    /// Length 1–6: Harberger tax on the assessed value; force-buyable.
+    Harberger,
+    /// Length ≥ 7: flat 1 Y/epoch for all lengths; no force-buy (safe harbor).
+    Flat,
+}
+
+/// Rent standing for a claimed handle, derived from on-chain rent events.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum HandleRentStatus {
+    /// Rent paid through the current epoch.
+    Paid,
+    /// Rent unpaid but still within the grace window.
+    Grace { epochs_left: u32 },
+    /// Grace expired; the handle has returned to unowned.
+    Lapsed,
+}
 ```
 
 ### SQLite Tables (Logical)
@@ -380,10 +447,13 @@ pub enum ModerationVerdict {
 | `follows` | `(follower, followee)` | Follow relationships |
 | `bonds` | `(bonder, post_address, block_number)` | Bond records (from chain) |
 | `donations` | `(donor, post_address, block_number)` | Donation records (from chain) |
-| `names` | `name` | Name-to-public-key resolution (from chain) |
+| `names` | `handle` | Current handle ownership: owner, assessed value, tier, rent status, last-paid epoch, force-buy state (from chain) |
+| `name_history` | `(handle, claimed_at_epoch)` | Past ownership spans of a handle ("formerly @x") |
+| `supporters` | `(creator, supporter)` | Per-creator lifetime donation totals — donor recognition (derived from `donations`) |
 | `reply_links` | `(parent_address, child_address)` | Thread structure |
 | `invitations` | `(inviter, invitee)` | Invitation graph |
 | `flags` | `(flagger, post_address)` | Content flags |
+| `reward_pool` | singleton | Reward Pool balance, current epoch, last scheduled emission, last drip |
 | `chain_state` | singleton | Last indexed block number, block hashes for reorg detection |
 | `crawl_state` | `public_key` | Per-user crawl metadata |
 | `posts_fts` | (virtual) | Full-text search index on `posts.content` |
@@ -409,10 +479,25 @@ pub trait IndexStore: Send + Sync {
                          amount: u64, block_number: u64) -> Result<(), IndexerError>;
     async fn upsert_donation(&self, donor: &PublicKey, post: &ContentAddress,
                              author: &PublicKey, amount: u64, block_number: u64) -> Result<(), IndexerError>;
-    async fn upsert_name(&self, user: &PublicKey, name: &str) -> Result<(), IndexerError>;
+    // Handle lifecycle (six on-chain events). All atomic Y amounts are u64.
+    async fn upsert_name(&self, owner: &PublicKey, handle: &str,
+                         assessed_value: u64, claimed_at_epoch: u64) -> Result<(), IndexerError>;
+    async fn update_name_assessment(&self, handle: &str, new_value: u64,
+                                    effective_epoch: u64) -> Result<(), IndexerError>;
+    async fn record_rent_payment(&self, handle: &str, paid_through_epoch: u64) -> Result<(), IndexerError>;
+    async fn mark_force_buy(&self, handle: &str, bidder: &PublicKey, bid: u64,
+                            deadline_epoch: u64) -> Result<(), IndexerError>;
+    async fn transfer_name(&self, handle: &str, from: &PublicKey, to: &PublicKey,
+                           at_epoch: u64) -> Result<(), IndexerError>;
+    async fn lapse_name(&self, handle: &str, at_epoch: u64) -> Result<(), IndexerError>;
     async fn record_invitation(&self, inviter: &PublicKey, invitee: &PublicKey) -> Result<(), IndexerError>;
     async fn add_y_balance(&self, user: &PublicKey, amount: u64) -> Result<(), IndexerError>;
     async fn transfer_y_balance(&self, from: &PublicKey, to: &PublicKey, amount: u64) -> Result<(), IndexerError>;
+    /// Add a protocol fee (bond/donation/invite/rent/force-buy) to the Reward Pool total.
+    async fn add_pool_inflow(&self, fee: u64) -> Result<(), IndexerError>;
+    /// Snapshot the authoritative epoch state on each EpochAdvanced event.
+    async fn update_epoch_state(&self, epoch: u64, scheduled_emission: u64,
+                                pool_drip: u64, pool_balance: u64) -> Result<(), IndexerError>;
     async fn rollback_to_block(&self, block_number: u64) -> Result<(), IndexerError>;
     async fn last_indexed_block(&self) -> Result<Option<u64>, IndexerError>;
     async fn update_last_indexed_block(&self, block_number: u64) -> Result<(), IndexerError>;
@@ -433,7 +518,19 @@ pub trait IndexStore: Send + Sync {
     async fn get_moderation_status(&self, post: &ContentAddress) -> Result<ModerationVerdict, IndexerError>;
     async fn get_flagged_posts(&self, min_flags: u32, cursor: Option<u64>,
                                 limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
-    async fn resolve_name(&self, name: &str) -> Result<Option<PublicKey>, IndexerError>;
+    /// Resolve a handle to its current owner plus lifecycle state and ownership history.
+    async fn resolve_name(&self, handle: &str) -> Result<Option<ResolvedHandle>, IndexerError>;
+    /// Ownership history for a handle (most recent first), backing "formerly @x" hints.
+    async fn name_history(&self, handle: &str) -> Result<Vec<HandleOwnership>, IndexerError>;
+    /// Donor recognition (NOT protocol): supporters of a creator, ranked by lifetime donated.
+    async fn get_creator_supporters(&self, creator: &PublicKey, cursor: Option<u64>,
+                                    limit: u32) -> Result<Vec<Supporter>, IndexerError>;
+    /// Top-N supporters of a creator (the leaderboard view).
+    async fn get_supporter_leaderboard(&self, creator: &PublicKey,
+                                       limit: u32) -> Result<Vec<Supporter>, IndexerError>;
+    /// Current epoch, scheduled emission, Reward Pool drip, and pool balance
+    /// (read path for CLI `epoch_info` and `GET /api/v1/epoch`).
+    async fn get_epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
     // --- Crawl coordination ---
     async fn users_by_staleness(&self) -> Result<Vec<PublicKey>, IndexerError>;
@@ -449,6 +546,48 @@ pub struct CrawlStats {
     pub last_crawl_completed: Option<chrono::DateTime<chrono::Utc>>,
     pub last_crawl_duration_ms: u64,
     pub last_indexed_block: u64,
+}
+
+/// Handle resolution result: current owner plus full lifecycle state.
+pub struct ResolvedHandle {
+    pub handle: String,
+    pub owner: PublicKey,
+    pub assessed_value: u64,          // atomic Y; 0 in the flat tier
+    pub tier: HandleTier,
+    pub rent_status: HandleRentStatus,
+    pub rent_per_epoch: u64,          // atomic Y; rate × max(V, floor) or the flat 1 Y
+    pub force_buy: Option<ForceBuyState>,
+    pub history: Vec<HandleOwnership>,
+    /// True if ownership changed within the last few epochs (impersonation warning).
+    pub recently_changed_owner: bool,
+}
+
+pub struct ForceBuyState {
+    pub bidder: PublicKey,
+    pub bid: u64,                     // atomic Y, escrowed for the notice window
+    pub deadline_epoch: u64,
+}
+
+/// One ownership span of a handle. `released_at_epoch` is `None` for the current owner.
+pub struct HandleOwnership {
+    pub public_key: PublicKey,
+    pub claimed_at_epoch: u64,
+    pub released_at_epoch: Option<u64>,
+}
+
+/// A supporter's cumulative donations to one creator (donor recognition, derived).
+pub struct Supporter {
+    pub public_key: PublicKey,
+    pub lifetime_donated: u64,        // atomic Y, summed across all donations to the creator
+    pub donation_count: u64,
+}
+
+/// Current epoch / emission / Reward Pool snapshot. Backs `GET /api/v1/epoch`.
+pub struct EpochInfo {
+    pub epoch: u64,
+    pub scheduled_emission: u64,      // atomic Y minted this epoch by the schedule
+    pub pool_drip: u64,               // atomic Y added to creator emission from the pool
+    pub pool_balance: u64,            // atomic Y currently held by the Reward Pool
 }
 ```
 
@@ -524,9 +663,69 @@ pub fn blended_score(
 }
 ```
 
+Note: this global ranking formula is intentionally **unchanged** by donor recognition. Donation-based prominence applies only *within a single thread* (see Donor Recognition below); it never feeds into `blended_score` or any home-feed / timeline / search ranking. A donation buys a donor higher placement in the replies to the post they supported — nowhere else.
+
+## Donor Recognition (client/indexer convention — NOT protocol)
+
+Donor recognition is a **presentation layer** built entirely from public chain data. It is emphatically **not** part of the protocol and confers **no** on-chain rights: the protocol keeps a donation a pure financial loss (the donor pays the 5% fee to the Reward Pool and directs emission to the recipient — nothing flows back). These features are conventions an indexer or client *may* implement; a different indexer may ignore them, and because every number is recomputable from on-chain donations, any client can verify or reproduce them independently.
+
+### Thread-scoped superchat prominence
+
+Within the replies to a given post, an indexer may rank a donor's replies higher **in that thread only**, proportional to how much that donor has donated to the thread's author. This is the "superchat" pattern: paying to stand out where you already gave support.
+
+The prominence is deliberately **thread-local and never global**. It must not raise a donor's reach in home feeds, timelines, or search. The reason is anti-corruption: if Y could buy general reach, the network would degrade into pay-for-distribution and the ranking signals (bonds, donations, recency) would stop reflecting genuine engagement. Confining bought prominence to the one thread the donation supported keeps the incentive honest — it rewards supporting a creator's conversation without letting money purchase audience elsewhere.
+
+```rust
+/// Thread-local prominence weight for a donor's replies under `thread_author`'s post.
+/// Purely presentational: derived from public donation totals, applied ONLY when
+/// ordering replies within this thread, never to global feed ranking.
+pub fn thread_donor_prominence(
+    donor_lifetime_to_author: u64, // atomic Y this donor has donated to thread_author
+) -> f64 {
+    (1.0 + donor_lifetime_to_author as f64).ln()
+}
+```
+
+### Supporter badges
+
+An indexer may attach a **verifiable badge** to a donor, summarizing their lifetime donations to a creator (e.g. bronze / silver / gold tiers by cumulative atomic Y). Badges are computed from the public `donations` table — no privileged state — so they carry the same verifiability guarantee as any other indexed economic figure: a client can recompute the lifetime total from on-chain donations and confirm the badge.
+
+### Per-creator leaderboards
+
+An indexer may publish a **per-creator supporter leaderboard** ranking a creator's supporters by lifetime donated. Like badges, this is derived and reproducible from chain data; it is subjective only in the cosmetic sense (tier cutoffs, display), not in the underlying totals.
+
+```
+GET /api/v1/creators/:pk/supporters?cursor=0&limit=20
+
+Response:
+{
+    "creator": "pk_hex",
+    "supporters": [
+        {
+            "public_key": "pk_hex",
+            "lifetime_donated": "25000000000",
+            "donation_count": 34,
+            "badge": "gold"
+        },
+        {
+            "public_key": "pk_hex",
+            "lifetime_donated": "4200000000",
+            "donation_count": 9,
+            "badge": "silver"
+        }
+    ],
+    "next_cursor": 20,
+    "has_more": true
+}
+```
+
+Donor annotations (badge, thread prominence rank) also appear inline on donation entries in thread and engagement responses, so clients can render "superchat" styling without a second request. These annotations are advisory client hints, not economic facts, and are clearly separable from the verifiable donation amounts they accompany.
+
 ## REST API Endpoints (`api/`)
 
 All endpoints return JSON. Pagination uses cursor-based pagination with `?cursor=<sequence>&limit=<n>`.
+
+**API convention — atomic Y amounts are JSON strings.** Every token amount (balances, donation/bond totals, assessed values, rent, emission, pool balances) is a **base-10 string of atomic Y** (6 decimals, so `"1000000"` = 1 Y). At the 140B-Y hard cap the supply is `140_000_000_000_000_000` atomic, which exceeds JSON's safe integer range (2^53 ≈ 9.0×10^15); serializing these as numbers would silently lose precision in JavaScript clients. Counts, block numbers, epochs, and other small integers remain JSON numbers. All sample responses below follow this convention.
 
 ### Feeds
 
@@ -560,17 +759,20 @@ GET /api/v1/profiles/:user_pk
 Response:
 {
     "public_key": "hex...",
-    "registered_name": "alice" | null,
+    "handle": "alice" | null,
+    "handle_assessed_value": "15000000000" | null,
+    "handle_tier": "harberger" | "flat" | null,
+    "handle_rent_status": "Paid" | null,
     "display_name": "Alice",
     "bio": "...",
     "avatar": "content_address_hex or null",
     "follower_count": 42,
     "following_count": 15,
     "post_count": 128,
-    "y_balance": 5000,
+    "y_balance": "50000000000",
     "trust_distance": 2,
-    "total_donations_received": 12000,
-    "total_donations_given": 3500,
+    "total_donations_received": "12000000000",
+    "total_donations_given": "3500000000",
     "invited_by": "hex or null"
 }
 ```
@@ -605,7 +807,7 @@ GET /api/v1/posts/:content_address
 Response:
 {
     "post": IndexedPost,
-    "author_profile": { "display_name": "...", "registered_name": "alice" | null }
+    "author_profile": { "display_name": "...", "handle": "alice" | null }
 }
 ```
 
@@ -651,40 +853,80 @@ GET /api/v1/engagement/:post_address
 Response:
 {
     "post_address": "hex...",
-    "total_bonded": 1500,
+    "total_bonded": "1500000000",
     "bond_count": 3,
     "bonds": [
         {
             "bonder": "pk_hex",
-            "amount": 500,
+            "amount": "500000000",
             "block_number": 12345
         }
     ],
-    "total_donated": 2000,
+    "total_donated": "2000000000",
     "unique_donors": 8,
     "donations": [
         {
             "donor": "pk_hex",
-            "amount": 250,
-            "block_number": 12340
+            "amount": "250000000",
+            "block_number": 12340,
+            "donor_badge": "gold"
         }
     ]
 }
 ```
 
+The `donor_badge` field is an advisory donor-recognition hint (see Donor Recognition); it is not an economic fact and is derived from public donation totals. The verifiable amounts (`amount`, `total_donated`) are the economic data.
+
 ### Names
 
+Resolves an @handle to its current owner plus full Harberger lifecycle state.
+
 ```
-GET /api/v1/names/:name
+GET /api/v1/names/:handle
 
 Response:
 {
-    "name": "alice",
+    "handle": "alice",
     "public_key": "hex...",
-    "display_name": "Alice",
-    "registered_block": 10500
+    "assessed_value": "15000000000",
+    "tier": "harberger",
+    "rent_status": "Paid",
+    "rent_per_epoch": "15000000",
+    "force_buy_pending": null,
+    "ownership_history": [
+        {
+            "public_key": "hex...",
+            "claimed_at_epoch": 12,
+            "released_at_epoch": 34
+        },
+        {
+            "public_key": "hex...",
+            "claimed_at_epoch": 34,
+            "released_at_epoch": null
+        }
+    ],
+    "recently_changed_owner": false
 }
 ```
+
+`tier` is `"harberger"` (length 1–6) or `"flat"` (length ≥ 7). `rent_status` is `"Paid"`, `{ "Grace": { "epochs_left": 2 } }`, or `"Lapsed"`. `force_buy_pending`, when a bid is outstanding, is `{ "bidder": "hex...", "bid": "20000000000", "deadline_epoch": 39 }` (Harberger tier only; the flat tier is a safe harbor with no force-buy). `recently_changed_owner` warns clients that the handle recently changed hands — useful for impersonation checks, since the current owner may differ from the one a reader remembers.
+
+### Epoch and Reward Pool
+
+```
+GET /api/v1/epoch
+
+Response:
+{
+    "epoch": 37,
+    "scheduled_emission": "1400000000000000",
+    "pool_drip": "170000000000",
+    "total_emission": "1400170000000000",
+    "pool_balance": "8500000000000"
+}
+```
+
+Reports the current epoch's economics: `scheduled_emission` is the schedule's mint for this epoch (1.4B Y = `"1400000000000000"` atomic while epoch < 50, halving every 50 epochs), `pool_drip` is 2% of the Reward Pool balance added to creator emission, `total_emission` is their sum, and `pool_balance` is the pool's current holdings. This is the read path behind the CLI `epoch_info` command.
 
 ### Bonds and Donations per User/Post
 
@@ -696,7 +938,7 @@ Response:
     "bonds": [
         {
             "post_address": "hex...",
-            "amount": 500,
+            "amount": "500000000",
             "block_number": 12345
         }
     ],
@@ -714,7 +956,7 @@ Response:
         {
             "post_address": "hex...",
             "author": "pk_hex",
-            "amount": 250,
+            "amount": "250000000",
             "block_number": 12340
         }
     ],
@@ -847,8 +1089,12 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         .route("/api/v1/posts/:address/donations", get(engagement::get_post_donations))
         // Search
         .route("/api/v1/search", get(search::search_posts))
-        // Names
-        .route("/api/v1/names/:name", get(names::resolve_name))
+        // Names (handle resolution + Harberger lifecycle state)
+        .route("/api/v1/names/:handle", get(names::resolve_name))
+        // Epoch & Reward Pool
+        .route("/api/v1/epoch", get(epoch::get_epoch))
+        // Donor recognition (client convention, not protocol)
+        .route("/api/v1/creators/:pk/supporters", get(creators::get_supporters))
         // Users — bonds & donations
         .route("/api/v1/users/:pk/bonds", get(engagement::get_user_bonds))
         .route("/api/v1/users/:pk/donations", get(engagement::get_user_donations))
@@ -1162,5 +1408,6 @@ The indexer is an **untrusted convenience layer**. Its trust model is:
 | **Completeness** | NOT guaranteed. An indexer may omit posts (censorship). Clients detect this by querying multiple indexers or checking a user's FeedIndex Scratchpad directly. |
 | **Ranking fairness** | NOT guaranteed. An indexer may bias feed rankings. Clients can request `Chronological` ranking as a neutral baseline. |
 | **Moderation accuracy** | Subjective by design. Each indexer applies its own moderation policy. Clients choose the indexer whose policy they agree with. |
-| **Economic accuracy** | On-chain events are the source of truth for bonds, donations, emissions, and transfers. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
+| **Donor recognition** | Derived and subjective, like moderation — NOT part of the economic-accuracy guarantee. Badges, thread-scoped superchat prominence, and per-creator leaderboards are presentation conventions, not protocol, and confer no on-chain rights. The underlying donation totals they summarize are verifiable against the chain, but their display (tier cutoffs, prominence weighting, thread-local ordering) is the indexer's choice; a different indexer may show them differently or not at all. |
+| **Economic accuracy** | On-chain events are the source of truth for bonds, donations, emissions, transfers, handle rent, and Reward Pool flows. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
 | **Availability** | NOT guaranteed by any single indexer. Multiple competing indexers provide redundancy. The source data on Autonomi and the blockchain is always available independently. |

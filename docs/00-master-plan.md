@@ -9,6 +9,8 @@ The system is split into two layers:
 
 Smart contracts enforce economic rules atomically. Off-chain content storage provides cheap, permanent, content-addressed data. The indexer bridges both layers into a queryable REST API.
 
+**Identity**: PublicKey is the sole canonical identity; on-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, never a structural reference.
+
 ## Project Structure
 
 ```
@@ -27,7 +29,7 @@ DecentralizedSocialNetwork/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction
 │   ├── chain/                    # Blockchain abstraction layer
-│   ├── token-y/                  # Token Y: emission, bonding, donations, names (pure math)
+│   ├── token-y/                  # Token Y: emission, bonding, donations, handle rent (pure math)
 │   ├── invitation/               # On-chain invitation tree + trust distance
 │   ├── moderation/               # Content flagging + filtering
 │   ├── indexer/                  # Chain listener + content crawler + REST API
@@ -75,7 +77,7 @@ DecentralizedSocialNetwork/
 | `dsn-core` | (none) | Shared types, crypto primitives |
 | `dsn-data` | core | Off-chain content storage traits + in-memory mock |
 | `dsn-chain` | core | On-chain blockchain abstraction traits + in-memory mock |
-| `dsn-token-y` | core | Pure computation: emission, bonding curves, donation math, name pricing |
+| `dsn-token-y` | core | Pure computation: emission, bonding curves, donation math, handle rent math |
 | `dsn-invitation` | core, chain | On-chain invitation tree, trust distance, donation weighting |
 | `dsn-moderation` | core, data | Content flags, counter-flags, review, policies |
 | `dsn-indexer` | core, data, chain, token-y, invitation, moderation | Chain listener, content crawler, REST API, feed ranking |
@@ -123,7 +125,7 @@ The `dsn-chain` crate defines the `ChainClient` trait abstracting all blockchain
 - Y balance queries and transfers
 - Bond placement and queries
 - Donation execution and queries
-- Name registration and resolution
+- Handle claim / assessment / rent / force-buy and resolution
 - Invitation creation and trust distance queries
 - Epoch info queries (emission is auto-distributed)
 - Chain event listening (for indexer)
@@ -136,7 +138,7 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 |---|---|---|
 | Y token balances | On-chain | Atomic enforcement, no double-spend |
 | Bonds | On-chain | Bonding curve state needs atomic updates |
-| Donations | On-chain | Burn enforcement, emission accounting |
+| Donations | On-chain | Fee routing to Reward Pool, emission accounting |
 | Name registry | On-chain | Global uniqueness guarantee |
 | Invitation tree | On-chain | Sybil resistance, trust distance |
 | Epoch/emission | On-chain | Deterministic, auto-distributed |
@@ -150,22 +152,13 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 
 The following smart contracts enforce on-chain rules. They are not part of this Rust workspace — they are implemented in a separate repo (Solidity/Vyper/etc.) and deployed to the target blockchain.
 
-1. **YToken** — ERC-20 + burn + mint (emission only)
+1. **YToken** — ERC-20 + mint (scheduled emission, hard 140B cap); tokens are never destroyed
 2. **BondingContract** — bond(), bonding curve state per post hash
-3. **DonationContract** — donate(), burn fraction, forward to creator
+3. **DonationContract** — donate(), fee to Reward Pool, forward to creator
 4. **EmissionContract** — epoch tracking, auto-distribution to creators
-5. **NameRegistry** — register(), resolve(), tiered pricing
+5. **NameRegistry** — Harberger registry: claim()/assess()/pay_rent()/force_buy()/resolve()
 6. **InvitationTree** — invite(), trust distance, genesis seeding
-
-## Cross-Cutting: What Replaces R?
-
-| Old (R was used for) | New Replacement |
-|---|---|
-| Curation weight (DiversityScore) | Bonding (Y at risk) + donations (Y burned) |
-| Y emission share | Donations received (weighted by donor trust distance) |
-| Invitation capacity | Y burn cost per invitation |
-| Moderation flag/review weight | Uniform weighting with eligibility thresholds |
-| Spam prevention (R=0 = powerless) | Mandatory first bond (posting costs Y), donations cost Y, invitations cost Y |
+7. **RewardPool** — receives all protocol fees, drips 2%/epoch into creator emission
 
 ## Cross-Cutting: Epoch Model
 

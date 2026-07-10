@@ -35,7 +35,7 @@ A user is **eligible** to flag or review if all of the following are true:
 
 1. **Invited**: The user has an on-chain invitation record (exists in the web-of-trust graph).
 2. **Account age**: The user's account is at least `MIN_ACCOUNT_AGE_EPOCHS` epochs old.
-3. **Donation count**: The user has made at least `MIN_DONATION_COUNT` donations.
+3. **Donation count**: The user has made at least `MIN_DONATION_COUNT` donations of at least `MIN_ELIGIBLE_DONATION` (1 Y, tunable) each, to recipients with pairwise weight ≥ 0.5 (outside the flagger's own subtree — see 05-invitation.md).
 
 Each eligible user receives a uniform weight of **1.0** for flagging and reviewing.
 
@@ -841,6 +841,10 @@ pub const MIN_ACCOUNT_AGE_EPOCHS: u64 = 2;
 /// Minimum number of donations required to flag or review.
 pub const MIN_DONATION_COUNT: u64 = 5;
 
+/// Minimum size of each qualifying donation (in atomic Y) counted toward
+/// MIN_DONATION_COUNT; tunable.
+pub const MIN_ELIGIBLE_DONATION: u64 = 1_000_000; // 1 Y (6 decimals)
+
 /// Number of epochs a review remains open for voting.
 pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
 
@@ -976,7 +980,7 @@ pub enum ModerationError {
 
 ### Flag Spam from Bots
 
-Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and have zero donations. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and make `MIN_DONATION_COUNT` donations before it can flag -- a meaningful cost that deters automated spam.
+Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and have zero donations. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and make `MIN_DONATION_COUNT` donations of at least `MIN_ELIGIBLE_DONATION` each to recipients with pairwise weight ≥ 0.5 outside its own subtree before it can flag -- dust donations and donations to self-created sockpuppets don't count, so the size and targeting requirement is a meaningful cost that deters automated spam.
 
 ### Coordinated Flag Brigading
 
