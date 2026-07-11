@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Content moderation separates **existence** from **visibility**. Data stored on Autonomi is permanent and uncensorable (existence). Indexers decide what to serve, and users choose which indexer to trust (visibility). This crate provides the flagging, counter-flagging, aggregation, and policy machinery that indexers use to make visibility decisions.
+Content moderation separates **existence** from **visibility**. Existence is guaranteed by portable signed objects replicated across independently chosen indexers, the author's own local copies, and trustless third-party mirrors — anyone may re-publish, and anchors keep prior timestamps provable forever (existence). Indexers decide what to serve, and users choose which indexer to trust (visibility). This crate provides the flagging, counter-flagging, aggregation, and policy machinery that indexers use to make visibility decisions.
 
-The protocol is fully transparent: all flags are public GraphEntries on Autonomi, all scoring is deterministic, and any observer can audit the moderation history of any post or user.
+The protocol is fully transparent: all flags are public signed objects served by indexers, all scoring is deterministic, and any observer can audit the moderation history of any post or user.
 
 ## Module Structure
 
@@ -22,12 +22,14 @@ crates/moderation/src/
 
 ## Design Principles
 
-1. **No censorship at the data layer** -- Autonomi stores everything permanently. Flags are metadata *about* content, not deletion requests.
+1. **No censorship at the data layer** -- indexers serve signed objects and clients keep local copies, so suppressing a user requires suppressing every indexer AND their permissionless ability to republish; anchors keep prior timestamps provable forever. Flags are metadata *about* content, not deletion requests.
 2. **Indexer sovereignty** -- Each indexer chooses its own `ModerationPolicy`. Users who disagree switch indexers.
 3. **Eligibility-gated flagging** -- Only users who are invited, have sufficient account age, and have donated enough can flag, preventing flag spam from bots.
 4. **Uniform influence** -- Each eligible flagger/reviewer contributes weight 1.0, preventing any single account from dominating moderation outcomes.
 5. **Accountability** -- Flags are signed and permanent. Flaggers who abuse the system lose credibility (low accuracy causes their flags to be ignored by indexers).
 6. **Contestability** -- Flagged content authors can counter-flag, triggering broader community review.
+
+**Ingest blocklists (host policy, not protocol censorship).** Indexers, media hosts, and any out-of-protocol mirrors MAY apply hash blocklists (for example, published CSAM hash lists) at ingest, declining to store or serve matching bytes. This is edge policy at each host's discretion, not a protocol-level deletion: the object may still exist on other hosts, and a host applying a different blocklist can still serve it. The protocol neither mandates nor forbids such lists.
 
 ## Eligibility Criteria
 
@@ -57,7 +59,7 @@ Indexers are responsible for computing the set of eligible accounts based on on-
 
 ```rust
 /// Reason categories for flagging content.
-/// Encoded as a u8 and hashed into the GraphEntry's descendant metadata.
+/// Encoded as a u8 within the flag object.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 #[repr(u8)]
 pub enum FlagReason {
@@ -67,8 +69,11 @@ pub enum FlagReason {
     Harassment = 1,
     /// Content depicting or promoting violence.
     Violence = 2,
-    /// Content that is verifiably false and likely to cause harm.
-    Misinformation = 3,
+    /// Reserved. Formerly a "false/harmful" category; removed because
+    /// truth-by-plebiscite invites brigading — indexer vocabularies handle truth
+    /// disputes, not the protocol. Discriminant 3 stays reserved so the other
+    /// values remain stable.
+    Reserved3 = 3,
     /// Content illegal in most jurisdictions (e.g., CSAM).
     IllegalContent = 4,
     /// Not safe for work (nudity, explicit material). Not inherently rule-breaking;
@@ -83,13 +88,12 @@ pub enum FlagReason {
 
 ```rust
 /// A content flag submitted by a user.
-/// Stored as a GraphEntry on Autonomi (immutable once written).
+/// A signed, content-addressed object published to indexers (immutable once published).
 ///
-/// GraphEntry mapping:
-///   owner:       flag_derived_key (derived from flagger's root key + flag purpose + post address)
-///   parents:     [flagger_pk]
-///   content:     flagged_post_address (32 bytes)
-///   descendants: [(post_author_pk, flag_metadata_hash)]
+/// Object mapping:
+///   object_id:   flag_object_id (see Object-ID Derivation for Flags)
+///   author:      flagger identity key (signs the object)
+///   references:  flagged post address, post author, reason, cycle
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ContentFlag {
     /// Public key of the user who submitted the flag.
@@ -104,8 +108,13 @@ pub struct ContentFlag {
     /// Reason for the flag.
     pub reason: FlagReason,
 
+    /// Reason-class cycle this flag belongs to: the number of prior OVERTURN
+    /// resolutions for (post_address, reason) at flag time. Aggregation counts
+    /// only current-cycle flags, so an overturn zeroes the prior cycle's flags.
+    pub cycle: u32,
+
     /// Optional free-text explanation (max 512 chars).
-    /// Stored as a Chunk; this field holds the ContentAddress of that Chunk.
+    /// Stored as a separate content object; this field holds its ContentAddress.
     pub explanation: Option<ContentAddress>,
 
     /// Epoch in which the flag was submitted.
@@ -114,17 +123,17 @@ pub struct ContentFlag {
     /// Monotonic flag sequence per flagger (prevents replay).
     pub sequence: u64,
 
-    /// BLS signature over all fields above.
+    /// ed25519 signature over all fields above.
     pub signature: Signature,
 }
 ```
 
 ### Flag Metadata Hash
 
-The `flag_metadata_hash` stored in the GraphEntry descendant tuple is computed as:
+The `flag_metadata_hash` included in the flag object's metadata is computed as:
 
 ```rust
-/// Compute the 32-byte metadata hash stored in the GraphEntry descendant.
+/// Compute the 32-byte metadata hash included in the flag object.
 pub fn flag_metadata_hash(flag: &ContentFlag) -> [u8; 32] {
     let bytes = bincode::serialize(&(
         flag.reason as u8,
@@ -139,13 +148,12 @@ pub fn flag_metadata_hash(flag: &ContentFlag) -> [u8; 32] {
 
 ```rust
 /// A counter-flag (contest) submitted by the author of flagged content.
-/// Stored as a GraphEntry on Autonomi.
+/// A signed, content-addressed object published to indexers.
 ///
-/// GraphEntry mapping:
-///   owner:       counter_flag_derived_key
-///   parents:     [contester_pk]
-///   content:     original_flag_address (32-byte hash identifying the flag GraphEntry)
-///   descendants: [(original_flagger_pk, contest_metadata_hash)]
+/// Object mapping:
+///   object_id:   counter_flag_object_id (see Object-ID Derivation for Flags)
+///   author:      contester identity key (signs the object)
+///   references:  original flag object, original flagger, post address
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CounterFlag {
     /// The user contesting the flag (must be the flagged post's author).
@@ -164,7 +172,7 @@ pub struct CounterFlag {
     /// Reason for contesting.
     pub contest_reason: ContestReason,
 
-    /// Optional evidence (ContentAddress of a Chunk with supporting material).
+    /// Optional evidence (ContentAddress of a content object with supporting material).
     pub evidence: Option<ContentAddress>,
 
     /// Epoch in which the counter-flag was submitted.
@@ -173,7 +181,7 @@ pub struct CounterFlag {
     /// Monotonic counter-flag sequence per contester.
     pub sequence: u64,
 
-    /// BLS signature over all fields above.
+    /// ed25519 signature over all fields above.
     pub signature: Signature,
 }
 
@@ -198,13 +206,12 @@ pub enum ContestReason {
 
 ```rust
 /// A community review vote cast during a broader review triggered by a counter-flag.
-/// Stored as a GraphEntry on Autonomi.
+/// A signed, content-addressed object published to indexers.
 ///
-/// GraphEntry mapping:
-///   owner:       review_derived_key
-///   parents:     [reviewer_pk]
-///   content:     counter_flag_address (32 bytes)
-///   descendants: [(post_author_pk, vote_metadata_hash)]
+/// Object mapping:
+///   object_id:   review_vote_object_id (see Object-ID Derivation for Flags)
+///   author:      reviewer identity key (signs the object)
+///   references:  counter-flag object, post address
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ReviewVote {
     /// The community member casting the review vote.
@@ -225,7 +232,7 @@ pub struct ReviewVote {
     /// Monotonic review sequence per reviewer.
     pub sequence: u64,
 
-    /// BLS signature.
+    /// ed25519 signature.
     pub signature: Signature,
 }
 
@@ -289,21 +296,22 @@ pub struct PostModerationScore {
 1. Alice sees a post she considers spam.
 2. Alice's client verifies she is eligible (invited, sufficient account age, sufficient donations).
 3. Alice's client constructs a `ContentFlag` with reason `Spam`.
-4. Alice derives a flag-specific key: `derive_child(root_sk, b"flag" || post_address)`.
-5. Alice's client serializes the flag, signs it, and writes a GraphEntry to Autonomi:
+4. Alice's client computes the flag's object id: `flag_object_id = hash(alice_pk || "flag" || post_address || reason || cycle)` (see Object-ID Derivation for Flags).
+5. Alice's client serializes the flag, signs it with her identity key, and publishes it to K chosen indexers (keeping a local copy):
    ```
-   GraphEntry {
-       owner: flag_derived_pk,
-       parents: [alice_pk],
-       content: post_content_address,
-       descendants: [(post_author_pk, flag_metadata_hash)],
+   Signed flag object {
+       object_id:   flag_object_id,
+       author:      alice_pk,
+       post:        post_content_address,
+       post_author: post_author_pk,
+       reason, cycle,
    }
    ```
-6. The flag is now permanently recorded on Autonomi.
+6. The flag is now served by those indexers and synced to their peers.
 
 ### Step 2: Indexers Aggregate Flags
 
-1. Indexers crawl GraphEntries, discovering new flags.
+1. Indexers ingest published objects and sync from peers, discovering new flags.
 2. For each flagged post, the indexer computes `PostModerationScore` (see Aggregation below).
 3. The indexer applies its `ModerationPolicy` to decide visibility.
 4. If `net_score >= policy.hide_threshold`, the indexer hides the post from its feeds.
@@ -312,13 +320,13 @@ pub struct PostModerationScore {
 
 1. Bob, the post author, sees his post was hidden.
 2. Bob's client constructs a `CounterFlag` referencing the original flag.
-3. Bob derives a counter-flag-specific key and writes a GraphEntry:
+3. Bob's client computes `counter_flag_object_id`, signs the counter-flag with his identity key, and publishes it to K indexers (keeping a local copy):
    ```
-   GraphEntry {
-       owner: counter_flag_derived_pk,
-       parents: [bob_pk],
-       content: original_flag_ref,
-       descendants: [(alice_pk, contest_metadata_hash)],
+   Signed counter-flag object {
+       object_id: counter_flag_object_id,
+       author:    bob_pk,
+       flag:      original_flag_ref,
+       flagger:   alice_pk,
    }
    ```
 4. The counter-flag triggers a broader community review.
@@ -347,10 +355,18 @@ pub struct PostModerationScore {
 
 ```rust
 /// Aggregate all flags, counter-flags, and review votes for a post.
+///
+/// Overturn nullification: a resolved review that OVERTURNS a (post, reason-class)
+/// advances that reason-class's cycle by one. Aggregation counts only flags whose
+/// `cycle` matches the reason-class's current cycle, so overturning a reason zeroes
+/// every flag filed under it — those flags are excluded from the net entirely, not
+/// merely outweighed. New flags filed after the overturn carry the new cycle and
+/// start fresh. Upheld reviews do NOT advance the cycle (upheld flags keep counting).
 pub fn aggregate_moderation_score(
     flags: &[ContentFlag],
     counter_flags: &[CounterFlag],
     review_votes: &[ReviewVote],
+    resolved_reviews: &[(FlagReason, u32, ResolvedOutcome)], // (reason-class, cycle, outcome)
     eligible_accounts: &HashSet<PublicKey>,  // Eligible accounts computed by indexer
     current_epoch: u64,
 ) -> PostModerationScore {
@@ -360,10 +376,26 @@ pub fn aggregate_moderation_score(
     let mut reason_scores: HashMap<FlagReason, f64> = HashMap::new();
     let mut unique_flaggers: HashSet<PublicKey> = HashSet::new();
 
-    // 1. Score all flags (each eligible flagger contributes weight 1.0)
+    // 0. Current cycle per reason-class = number of OVERTURN resolutions for it.
+    //    Upheld resolutions do not advance the cycle.
+    let mut current_cycle: HashMap<FlagReason, u32> = HashMap::new();
+    for (reason, _cycle, outcome) in resolved_reviews {
+        if matches!(outcome, ResolvedOutcome::FlagOverturned { .. }) {
+            *current_cycle.entry(*reason).or_insert(0) += 1;
+        }
+    }
+
+    // 1. Score all flags (each eligible flagger contributes weight 1.0), but only
+    //    flags at their reason-class's CURRENT cycle count. Old-cycle flags (a
+    //    reason-class that was overturned) are auto-excluded -> that class is zeroed.
     for flag in flags {
         if !eligible_accounts.contains(&flag.flagger) {
             continue; // Not eligible, ignore flag
+        }
+
+        let cur = current_cycle.get(&flag.reason).copied().unwrap_or(0);
+        if flag.cycle != cur {
+            continue; // Stale cycle: this reason-class was overturned, flag zeroed
         }
 
         // Each flagger counted only once per post
@@ -383,7 +415,9 @@ pub fn aggregate_moderation_score(
             current_epoch < cf.countered_at_epoch + REVIEW_PERIOD_EPOCHS
         });
 
-    // 3. Score review votes (only if a review was triggered)
+    // 3. Score live review votes (an in-progress review). A review that has already
+    //    resolved is folded into `resolved_reviews` above; an overturn there zeroes
+    //    its reason-class in step 1 rather than being netted here.
     let mut unique_reviewers: HashSet<PublicKey> = HashSet::new();
     for vote in review_votes {
         if !eligible_accounts.contains(&vote.reviewer) {
@@ -401,7 +435,8 @@ pub fn aggregate_moderation_score(
         }
     }
 
-    // 4. Compute net score
+    // 4. Compute net score. Overturned reason-classes contribute nothing because
+    //    their flags were excluded in step 1.
     let net_score = weighted_flag_score + weighted_uphold_score - weighted_overturn_score;
 
     PostModerationScore {
@@ -429,8 +464,10 @@ pub fn aggregate_moderation_score(
 | 1 eligible user flags | 1 | 1.0 | Visible (below threshold) |
 | 10 eligible users flag | 10 | 10.0 | Hidden |
 | 3 eligible users flag | 3 | 3.0 | Visible (below threshold) |
-| 12 flag, review: 8 overturn vs 3 uphold | flag=12.0, overturn=8.0, uphold=3.0 | net = 12.0 + 3.0 - 8.0 = 7.0 | Visible (overturned below threshold) |
-| 15 flag, review: 2 overturn vs 5 uphold | flag=15.0, overturn=2.0, uphold=5.0 | net = 15.0 + 5.0 - 2.0 = 18.0 | Hidden (upheld) |
+| 12 flags (Spam, cycle 0), review resolves **Overturned** (8 vs 3) | 12 | reason-class zeroed (cycle→1) → 0.0 | Visible (overturn nullifies the whole reason-class, not merely outweighs it) |
+| 15 flags (Spam, cycle 0), review resolves **Upheld** (5 vs 2) | 15 | 15.0 (cycle unchanged) | Hidden (upheld) |
+
+The overturn row shows the fix: an overturned reason-class advances its cycle, so its flags are permanently excluded from the net (not merely subtracted). A genuinely new problem filed after the overturn carries the new cycle (1) and is counted afresh; a late-arriving old-cycle flag is auto-excluded. The last (`resolved_reviews`) row is what feeds `aggregate_moderation_score`; live, unresolved reviews still tally `uphold − overturn` into the net.
 
 ## Moderation Policy Abstraction (`policy.rs`)
 
@@ -619,7 +656,8 @@ pub struct IndexerModerationMetadata {
 
 ```rust
 /// Tracks a flagger's moderation history.
-/// Indexers maintain this locally; the underlying data (flags, reviews) is all on Autonomi.
+/// Indexers maintain this locally; the underlying data (flags, reviews) is all
+/// public signed objects served by indexers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FlaggerRecord {
     pub flagger: PublicKey,
@@ -627,7 +665,8 @@ pub struct FlaggerRecord {
     /// Total flags submitted by this user.
     pub total_flags: u64,
 
-    /// Flags that were upheld (or never contested).
+    /// Flags upheld by a resolved community review. Uncontested flags are never
+    /// counted here — they do not affect accuracy at all.
     pub upheld_flags: u64,
 
     /// Flags that were overturned by community review.
@@ -636,8 +675,9 @@ pub struct FlaggerRecord {
     /// Flags currently under review.
     pub pending_review_flags: u64,
 
-    /// Computed accuracy rate: upheld / (upheld + overturned).
-    /// Flags that were never contested count as upheld.
+    /// Computed accuracy rate: upheld / (upheld + overturned) over RESOLVED reviews
+    /// only. Uncontested flags never enter this ratio, which prevents a predator
+    /// from farming a high accuracy score by mass-flagging content no one contests.
     pub accuracy_rate: f64,
 }
 ```
@@ -687,7 +727,7 @@ pub enum ReviewOutcome {
 }
 ```
 
-Bad flaggers (those with low accuracy) have their flags ignored by indexers -- no economic penalty, just credibility loss. Once a flagger's accuracy drops below `MIN_FLAGGER_ACCURACY`, their flags are effectively invisible to the moderation system.
+Bad flaggers (those with low accuracy) have their flags ignored by indexers -- no economic penalty, just credibility loss. Once a flagger's accuracy drops below `MIN_FLAGGER_ACCURACY`, their flags are effectively invisible to the moderation system. Only RESOLVED reviews move the ratio: an uncontested flag never counts as upheld, so a predator cannot farm a high accuracy score by mass-flagging content nobody bothers to contest (which would otherwise let them build a spotless record and then flag a real target with disproportionate weight).
 
 ## Broader Community Review (`review.rs`)
 
@@ -738,10 +778,18 @@ pub enum ResolvedOutcome {
 
 ```rust
 /// Resolve a review after the review period has elapsed.
+///
+/// Beyond the `MIN_REVIEW_VOTES` quorum, the WINNING side's voters must span at
+/// least `MIN_REVIEW_FAMILIES` distinct lineage families (reuses `lineage_family`
+/// from 05-invitation.md) — otherwise the outcome is Inconclusive. Ties resolve
+/// Upheld (existing rule), so on a tie the winning side is the uphold voters and
+/// the family requirement applies to them. This stops a single lineage family
+/// from swinging a review on its own.
 pub fn resolve_review(
     counter_flag: &CounterFlag,
     review_votes: &[ReviewVote],
     eligible_accounts: &HashSet<PublicKey>,
+    tree: &HashMap<PublicKey, PublicKey>, // invitation tree, for lineage_family
     current_epoch: u64,
 ) -> Result<ReviewState, ModerationError> {
     // Must be past review period
@@ -782,7 +830,24 @@ pub fn resolve_review(
         });
     }
 
-    if overturn_count > uphold_count {
+    // Determine the winning side. Ties (overturn == uphold) resolve Upheld, so the
+    // uphold voters are the winning side and the family check applies to them.
+    let overturned = overturn_count > uphold_count;
+    let winning_side = if overturned { &votes_overturn } else { &votes_uphold };
+
+    // The winning coalition must span >= MIN_REVIEW_FAMILIES distinct lineage
+    // families; else the review is Inconclusive (one family cannot decide it alone).
+    let winning_families: HashSet<PublicKey> = winning_side
+        .iter()
+        .map(|voter| lineage_family(voter, tree).unwrap_or(*voter))
+        .collect();
+    if winning_families.len() < MIN_REVIEW_FAMILIES as usize {
+        return Ok(ReviewState::Inconclusive {
+            ended_at_epoch: current_epoch,
+        });
+    }
+
+    if overturned {
         Ok(ReviewState::Resolved {
             outcome: ResolvedOutcome::FlagOverturned {
                 uphold_count,
@@ -802,33 +867,54 @@ pub fn resolve_review(
 }
 ```
 
-## Key Derivation for Flags
+## Object-ID Derivation for Flags
 
-Each flag, counter-flag, and review vote is a separate GraphEntry. The derived key ensures:
-1. One flag per flagger per post (deterministic key from flagger + post address).
-2. One counter-flag per author per flag (deterministic key from author + flag reference).
-3. One review vote per reviewer per review (deterministic key from reviewer + counter-flag reference).
+Each flag, counter-flag, and review vote is a separate signed object addressed by a
+deterministic object id. The id (not a derived key — there are no child keys) enforces
+one-action-per-actor; authenticity comes from the single identity-key signature over
+the object:
+1. One flag per flagger per (post, reason, cycle) — deterministic id from flagger + post + reason + cycle.
+2. One counter-flag per author per flag — deterministic id from author + flag reference.
+3. One review vote per reviewer per review — deterministic id from reviewer + counter-flag reference.
 
 ```rust
-/// Derive the key used for a content flag GraphEntry.
-pub fn derive_flag_key(root_sk: &SecretKey, post_address: &ContentAddress) -> SecretKey {
-    root_sk.derive_child(&[b"flag", post_address.0.as_slice()].concat())
+/// Object id for a content flag. Including `reason` and `cycle` lets an author be
+/// flagged afresh under a new reason-class cycle after a prior overturn, while a
+/// duplicate (same flagger, post, reason, cycle) collides to the same id.
+/// `cycle` = the number of OVERTURN resolutions for (post_address, reason) at flag time.
+pub fn flag_object_id(
+    root_pk: &PublicKey,
+    post_address: &ContentAddress,
+    reason: FlagReason,
+    cycle: u32,
+) -> ContentAddress {
+    let bytes = [
+        root_pk.as_bytes(),
+        b"flag",
+        post_address.0.as_slice(),
+        &[reason as u8],
+        &cycle.to_le_bytes(),
+    ]
+    .concat();
+    ContentAddress(hash_blake3(&bytes))
 }
 
-/// Derive the key used for a counter-flag GraphEntry.
-pub fn derive_counter_flag_key(
-    root_sk: &SecretKey,
+/// Object id for a counter-flag: hash(root_pk || "counter-flag" || flag_ref).
+pub fn counter_flag_object_id(
+    root_pk: &PublicKey,
     flag_ref: &ContentAddress,
-) -> SecretKey {
-    root_sk.derive_child(&[b"counter-flag", flag_ref.0.as_slice()].concat())
+) -> ContentAddress {
+    let bytes = [root_pk.as_bytes(), b"counter-flag", flag_ref.0.as_slice()].concat();
+    ContentAddress(hash_blake3(&bytes))
 }
 
-/// Derive the key used for a review vote GraphEntry.
-pub fn derive_review_vote_key(
-    root_sk: &SecretKey,
+/// Object id for a review vote: hash(root_pk || "review-vote" || counter_flag_ref).
+pub fn review_vote_object_id(
+    root_pk: &PublicKey,
     counter_flag_ref: &ContentAddress,
-) -> SecretKey {
-    root_sk.derive_child(&[b"review-vote", counter_flag_ref.0.as_slice()].concat())
+) -> ContentAddress {
+    let bytes = [root_pk.as_bytes(), b"review-vote", counter_flag_ref.0.as_slice()].concat();
+    ContentAddress(hash_blake3(&bytes))
 }
 ```
 
@@ -850,6 +936,10 @@ pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
 
 /// Minimum number of unique review voters for a decisive outcome.
 pub const MIN_REVIEW_VOTES: u32 = 5;
+
+/// Minimum number of distinct lineage families the WINNING side of a review must
+/// span for a decisive outcome; otherwise the review is Inconclusive (tunable).
+pub const MIN_REVIEW_FAMILIES: u32 = 3;
 
 /// Flagger accuracy below which future flags are ignored.
 pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
@@ -1022,12 +1112,12 @@ A malicious indexer sets a hide threshold of 0 (hiding everything):
 
 ### `dsn-data`
 
-- Uses `GraphStore` trait to read/write flag, counter-flag, and review vote GraphEntries.
-- Uses `ChunkStore` to store flag explanations.
+- Uses `GraphStore` trait to read/write flag, counter-flag, and review vote signed objects.
+- Uses `ContentStore` to store flag explanations.
 
 ### `dsn-indexer`
 
-- The indexer calls `aggregate_moderation_score()` during its crawl cycle.
+- The indexer calls `aggregate_moderation_score()` during its ingest/aggregation.
 - The indexer computes the set of eligible accounts from on-chain data (invitation records, account creation epochs, donation counts) and passes it to the aggregation functions.
 - Applies its configured `ModerationPolicy` to decide visibility.
 - Maintains `FlaggerRecord` locally for reputation tracking.

@@ -10,7 +10,8 @@ Token Y is the native utility token. Supply is capped at 140,000,000,000 Y (140B
 crates/token-y/src/
   lib.rs
   emission.rs         # Halving math, emission_for_epoch(), scheduled_plus_drip()
-  reward_pool.rs      # Fee recycling, pool_drip()
+  reward_pool.rs      # Fee recycling, gross_drip(), treasury/creator drip split
+  referral.rs         # Referral annuity split math (canonical spec in 05-invitation.md)
   donation.rs         # Donation fee/creator split; weighting spec lives in 05-invitation.md
   bonding.rs          # Bonding curve pricing, fee-to-pool computation
   distribution.rs     # Per-epoch emission shares (donations -> emission allocation)
@@ -62,30 +63,50 @@ pub fn emission_for_epoch(epoch: u64) -> u64 {
 /// Total Y scheduled to be minted before a given epoch (sum of all prior epochs).
 pub fn total_emitted_before_epoch(epoch: u64) -> u64;
 
-/// Per-epoch total available to creators = scheduled emission + Reward Pool drip.
-/// u128 note applies via pool_drip; the sum saturates at u64::MAX defensively.
+/// Per-epoch total available to creators = scheduled emission + the creator
+/// share of the Reward Pool drip (`creator_drip` = gross drip minus the
+/// treasury slice; see § Reward Pool). u128 note applies via gross_drip; the
+/// sum saturates at u64::MAX defensively.
 pub fn scheduled_plus_drip(epoch: u64, pool_balance: u64) -> u64 {
-    emission_for_epoch(epoch).saturating_add(pool_drip(pool_balance))
+    emission_for_epoch(epoch).saturating_add(creator_drip(epoch, pool_balance))
 }
 ```
 
-The per-epoch total available to creators is **scheduled emission + pool drip** (§ Reward Pool). Only the scheduled part counts against the cumulative 140B cap; the drip redistributes tokens that were already minted. Any scheduled emission or drip left undistributed in an epoch (zero qualifying donations, per-creator caps binding) accrues back to the Reward Pool — no emission is orphaned.
+The per-epoch total available to creators is **scheduled emission + creator drip** (`creator_drip` = the pool's gross drip minus the treasury slice; § Reward Pool). Only the scheduled part counts against the cumulative 140B cap; the drip redistributes tokens that were already minted. Any scheduled emission or undistributed creator drip left over in an epoch (zero qualifying donations, per-creator caps binding) accrues back to the Reward Pool — no emission is orphaned.
 
 **Bootstrap (epoch 0).** At launch nobody holds Y, so there are no donations to direct the first epoch's emission. Epoch 0's scheduled emission (1.4B Y) is instead split **equally among the deployer-seeded genesis accounts**. From epoch 1 onward, distribution is donation-directed (§D). This resolves the launch circularity without a premine — the genesis split lives inside the 140B schedule.
 
 ## Reward Pool (`reward_pool.rs`)
 
-All protocol fees flow into a single Reward Pool: donation fees (5%), bond fees (10%), invitation costs, handle rent, force-buy fees, floor excesses from name takeovers, and rent arrears. No token is ever destroyed; every fee is **recycled** to the pool.
+All protocol fees flow into a single Reward Pool: donation fees (5%), bond fees (10%), invitation costs, handle rent, force-buy fees, floor excesses from name takeovers, and rent arrears. No token is ever destroyed; every fee is **recycled** to the pool. Fees reach the pool **after the referral cut** — `REFERRAL_BPS = 1000` (10%) of a fee attributable to an invitee still within their `REFERRAL_TERM_EPOCHS = 208`-epoch term is split off to their direct inviter first (`referral.rs`; canonical spec in [05-invitation.md](05-invitation.md)); only the remainder is deposited. The cut redirects already-paid fees and mints nothing.
 
-Each epoch the pool releases a **2% drip** (`REWARD_POOL_DRIP_BPS = 200`) of its balance, added to that epoch's scheduled creator emission (§D). Undistributed scheduled emission and undistributed drip both accrue back into the pool. As the halving schedule fades toward zero, the drip takes over: in the long run creator emission is entirely recycled fees, bounded by the hard 140B cap.
+Each epoch the pool releases a **2% gross drip** (`REWARD_POOL_DRIP_BPS = 200`) of its balance. That gross drip is split into a **treasury slice** and the **creator drip** (`gross_drip − treasury_slice`), the latter added to that epoch's scheduled creator emission (§A, §D). Undistributed scheduled emission and undistributed creator drip both accrue back into the pool. As the halving schedule fades toward zero, the drip takes over: in the long run creator emission is entirely recycled fees, bounded by the hard 140B cap.
+
+**Treasury slice.** `TREASURY_DRIP_SHARE_BPS = 1500` (15%) of the gross drip routes to a single disclosed Treasury address for the first `TREASURY_TERM_EPOCHS = 260` epochs (~5 years); after that the slice is `0` and 100% of the drip goes to creators. The Treasury holds **tokens, not powers** — a plain address whose funds reference the client, hosting, audits, and grants, with spending disclosed; it confers no protocol privileges. Any balance still sitting at the Treasury address at epoch `TREASURY_RECLAIM_EPOCH = 416` (~8 years) auto-returns to the Reward Pool. This is a time-boxed slice of an already-minted drip, **not** a premine (see Economic Design).
 
 ```rust
-pub const REWARD_POOL_DRIP_BPS: u64 = 200; // 2% of pool balance per epoch (tunable)
+pub const REWARD_POOL_DRIP_BPS: u64 = 200;       // 2% of pool balance per epoch (tunable)
+pub const TREASURY_DRIP_SHARE_BPS: u64 = 1_500;  // 15% of the gross drip -> Treasury (tunable); mirrors EpochConfig
+pub const TREASURY_TERM_EPOCHS: u64 = 260;       // treasury slice active ~5y, then 0 (tunable); mirrors EpochConfig
+pub const TREASURY_RECLAIM_EPOCH: u64 = 416;     // unspent treasury auto-returns to the pool ~8y (tunable); mirrors EpochConfig
 
-/// Amount the Reward Pool releases into creator emission this epoch.
+/// Gross drip the Reward Pool releases each epoch, before the treasury split.
 /// Payout: round DOWN. u128 intermediate -- balance * 200 overflows u64 at 140B scale.
-pub fn pool_drip(pool_balance: u64) -> u64 {
+pub fn gross_drip(pool_balance: u64) -> u64 {
     ((pool_balance as u128 * REWARD_POOL_DRIP_BPS as u128) / 10_000) as u64
+}
+
+/// Treasury slice of this epoch's gross drip: 15% until TREASURY_TERM_EPOCHS,
+/// then 0. Round DOWN.
+pub fn treasury_slice(epoch: u64, pool_balance: u64) -> u64 {
+    if epoch >= TREASURY_TERM_EPOCHS { return 0; }
+    ((gross_drip(pool_balance) as u128 * TREASURY_DRIP_SHARE_BPS as u128) / 10_000) as u64
+}
+
+/// Creator share of this epoch's gross drip = gross_drip - treasury_slice.
+/// Folded into creator emission by `scheduled_plus_drip` (§A).
+pub fn creator_drip(epoch: u64, pool_balance: u64) -> u64 {
+    gross_drip(pool_balance) - treasury_slice(epoch, pool_balance)
 }
 ```
 
@@ -127,6 +148,8 @@ pub struct DonationSplit {
 All functions are pure -- they take inputs and return outputs with no side effects.
 
 **Donor Recognition.** At the protocol level a donation stays a pure financial loss for the donor; the quality-signal property depends on it. Any social recognition of donors — superchat-style thread prominence, supporter badges, lifetime-donated leaderboards — is a client/indexer convention computed from public chain data (specified in [07-indexer.md](07-indexer.md)), never an on-chain reward.
+
+**Private donations.** A supporter who wants to give without linking the gift to their main identity signs it from a **fresh standalone keypair** — a brand-new account with no position in the invitation tree (nothing is derived from another key). Because the donor is outside the tree, its `pairwise_weight` is **0.0** by construction (see [05-invitation.md](05-invitation.md)), so the donation directs no emission; the 5% pool fee and the creator's share are **unchanged**. Such donors surface only as anonymous supporters in client/indexer recognition features (see [07-indexer.md](07-indexer.md)). No tree membership is required to donate — the 0.0 weight is the only gate. Honesty caveats: this is unlinkability **at the donation layer**, not chain-analysis resistance — the funding transfer that seeds the fresh keypair is public, so an observer who traces that funding can still de-anonymize it; and because the sponsored-gas paymaster only covers invited accounts, a private donor **pays their own gas**.
 
 ## C. Bonding (`bonding.rs`)
 
@@ -178,7 +201,7 @@ Per-epoch emission shares are computed from donations.
 
 ### Mechanics
 
-- The epoch's distributable emission = **scheduled emission + pool drip** (§A, § Reward Pool), computed before splitting.
+- The epoch's distributable emission = **scheduled emission + creator drip** (§A, § Reward Pool), computed before splitting.
 - Each creator's share = `weighted_donations_received / total_weighted_donations` applied to that distributable emission.
 - Weight for each donation = `donation_amount * pairwise_weight`, further shaped by lineage-family diminishing returns. Both are defined canonically in [05-invitation.md](05-invitation.md); this crate consumes precomputed weight + lineage-family id per donation.
 - Per-creator cap: no single creator receives more than `per_creator_cap_bps` of the distributable emission in a single epoch.
@@ -322,11 +345,13 @@ All functions are pure -- no storage lookups. The smart contract checks handle a
 
 ## Economic Design
 
-**Fee-recycling equilibrium.** Every protocol fee — donation (5%), bond (10%), invitation cost, handle rent, force-buy fees, floor excesses, rent arrears — flows into the Reward Pool, which drips 2% of its balance per epoch back into creator emission. Because those fees are assessed as a fraction of value that tracks real economic activity (donations, bonds, rent on desirable handles), the Y-denominated fee flow scales with activity and price. As scheduled emission halves toward zero, the pool drip takes over, so in the long run **every fee becomes creator rewards, under a hard 140B cap**. This closes a feedback loop: higher activity feeds a larger pool, a larger drip rewards more creators, and circulating supply moves countercyclically — heavy-fee epochs pull Y into the pool, the drip releases it steadily — damping price swings so price tracks activity/emission rather than spiking.
+**Fee-recycling equilibrium.** Every protocol fee — donation (5%), bond (10%), invitation cost, handle rent, force-buy fees, floor excesses, rent arrears — flows into the Reward Pool **after the referral cut** (`REFERRAL_BPS = 1000`, 10% of a fee an invitee pays within their `REFERRAL_TERM_EPOCHS = 208`-epoch term goes to the direct inviter first; see [05-invitation.md](05-invitation.md)). The pool then drips 2% of its balance per epoch, of which a **treasury slice** (`TREASURY_DRIP_SHARE_BPS = 1500`, 15%) routes to a disclosed Treasury address until epoch `TREASURY_TERM_EPOCHS = 260` — thereafter 100% of the drip goes to creators, and any Treasury balance unspent at epoch `TREASURY_RECLAIM_EPOCH = 416` returns to the pool — while the remaining **creator drip** feeds creator emission. Because those fees are assessed as a fraction of value that tracks real economic activity (donations, bonds, rent on desirable handles), the Y-denominated fee flow scales with activity and price. As scheduled emission halves toward zero, the pool drip takes over, so in the long run **every fee becomes creator rewards, under a hard 140B cap**. This closes a feedback loop: higher activity feeds a larger pool, a larger drip rewards more creators, and circulating supply moves countercyclically — heavy-fee epochs pull Y into the pool, the drip releases it steadily — damping price swings so price tracks activity/emission rather than spiking.
+
+**Fair launch, no premine.** Supply is still **100% emitted** — no sale, no team allocation, no premine. The Treasury is a **time-boxed slice of the drip** (already-minted, recycled fees), not an up-front allocation; it sunsets at epoch 260 and any unspent balance returns to the pool at epoch 416. Referral annuities likewise redirect already-paid fees and mint nothing.
 
 **Why halving-to-zero was rejected.** A pure halving schedule that terminates emission and permanently removes fee tokens from supply starves the system once the schedule fades: the creator subsidy that pays for curation dies, and a fixed, permanently shrinking float rewards hoarding over participation (holding Y beats spending it — a deflationary trap). Recycling fees through the pool instead keeps a perpetual creator subsidy alive under the cap without ever minting past 140B and without permanent supply destruction.
 
-**Wash-trading is an open risk (simulation-required before launch).** A controller who donates between related accounts they control pays ~5% in fees and receives 0.25-weighted claims on emission (the ancestor/descendant pairwise weight). Whether this is net-profitable depends on the emission-per-weighted-Y rate versus that fee: if a self-donated Y earns back more than roughly the fee in emission share, the loop is positive. Four mechanisms bound it — the 0.25 weight (4× less efficient than an honest arm's-length donation), lineage-family collapse (all of a controller's sybils share one depth-2 ancestor and count as a single family; see [05-invitation.md](05-invitation.md)), the per-creator emission cap, and per-invitation costs — but none proves it impossible. The parameters that set the margin (per-creator cap, `BRANCH_FAMILY_EXPONENT`, fee rate) MUST be tuned by simulation before launch; we document the profitability condition rather than claim immunity. See [05-invitation.md](05-invitation.md) Anti-Gaming for the matching treatment. The strongest adversarial statement of this attack — arguing that any donation-directed emission is inherently a mining algorithm — is preserved in [archive/09-first-principles-review.md](archive/09-first-principles-review.md) §2.1 (non-normative); the launch simulation must answer it.
+**Wash-trading is an open risk (simulation-required before launch).** A controller who donates between related accounts they control pays ~5% in fees and receives 0.25-weighted claims on emission (the ancestor/descendant pairwise weight). If the controller **also referred** the paying account, the referral annuity rebates 10% of that fee, so the *effective* fee is `f(1−r) ≈ 4.5%` and the break-even shifts from `e > f/w = 0.2` to `e > f(1−r)/w ≈ 0.18` (Y of emission per weighted-Y) — the referral annuity **slightly worsens** wash economics, though renewing an expired term costs a fresh 100 Y invitation fee, which prices the churn. Whether this is net-profitable depends on the emission-per-weighted-Y rate versus that effective fee. Four mechanisms bound it — the 0.25 weight (4× less efficient than an honest arm's-length donation), lineage-family collapse (all of a controller's sybils share one depth-2 ancestor and count as a single family; see [05-invitation.md](05-invitation.md)), the per-creator emission cap, and per-invitation costs — but none proves it impossible. The parameters that set the margin (per-creator cap, `BRANCH_FAMILY_EXPONENT`, fee rate, referral rate) MUST be tuned by simulation before launch; we document the profitability condition rather than claim immunity. See [05-invitation.md](05-invitation.md) Anti-Gaming for the matching treatment. The strongest adversarial statement of this attack — arguing that any donation-directed emission is inherently a mining algorithm — is preserved in [archive/09-first-principles-review.md](archive/09-first-principles-review.md) §2.1 (non-normative); the launch simulation must answer it.
 
 ## Error Types (`error.rs`)
 

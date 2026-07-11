@@ -98,7 +98,8 @@ pub struct KeyCommand {
 
 #[derive(Subcommand)]
 pub enum KeyAction {
-    /// Generate a new BLS keypair and store in local keyfile
+    /// Generate a new ed25519 keypair and store in local keyfile.
+    /// The genesis public key becomes your permanent IdentityId.
     Generate {
         /// Path to write keyfile (default: ~/.dsn/key.enc)
         #[arg(long)]
@@ -118,9 +119,84 @@ pub enum KeyAction {
         #[arg(long)]
         i_understand: bool,
     },
-    /// Show key info (public key, short ID, derived addresses)
+    /// Rotate the signing key: generate a fresh ed25519 keypair, register it in
+    /// the IdentityRegistry (effective next epoch), and rewrite the keyfile.
+    /// Your IdentityId is unchanged and previously signed objects stay valid.
+    Rotate {
+        /// Path to write the new keyfile (default: overwrite the current one)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Opt in to M-of-N social recovery by registering guardians (their
+    /// IdentityIds) and a threshold. Signed by your current key.
+    RecoverySetup {
+        /// Guardian IdentityId in hex (repeatable). Invitation-tree neighbors
+        /// are the natural choice.
+        #[arg(long = "guardian")]
+        guardians: Vec<String>,
+        /// Number of guardian approvals required (M of N).
+        #[arg(long)]
+        threshold: u32,
+    },
+    /// Guardian-side: propose a new key for an identity whose owner lost access.
+    /// Once M approvals land, a RECOVERY_VETO_EPOCHS = 2 veto window opens;
+    /// execution is automatic at the deadline (no separate command).
+    RecoveryPropose {
+        /// IdentityId being recovered (hex)
+        #[arg(long)]
+        identity: String,
+        /// New public key to install (hex)
+        #[arg(long)]
+        new_key: String,
+        /// Signature scheme of the new key (1 = ed25519)
+        #[arg(long, default_value = "1")]
+        scheme_id: u8,
+    },
+    /// Guardian-side: approve an open recovery proposal.
+    RecoveryApprove {
+        /// IdentityId being recovered (hex)
+        #[arg(long)]
+        identity: String,
+        /// Proposal id to approve
+        #[arg(long)]
+        proposal_id: String,
+    },
+    /// Owner-side: veto the active recovery proposal on your identity with your
+    /// current key. The current key's veto always wins during the veto window
+    /// (this is what makes recovery safe against loss but not against theft of
+    /// an active key).
+    RecoveryVeto {
+        /// IdentityId whose active recovery to veto (defaults to your own)
+        #[arg(long)]
+        identity: Option<String>,
+    },
+    /// Show key info: IdentityId (genesis key), current signing key + scheme,
+    /// and recovery status (guardians and any open recovery proposal).
     Info,
 }
+```
+
+Sample transcript (rotation and recovery setup):
+
+```bash
+# Rotate the signing key (IdentityId is permanent; old objects stay valid)
+$ dsn key rotate
+Enter passphrase: ********
+Key rotated. IdentityId unchanged: a1b2c3d4e5f6a7b8...
+  New signing key: 9f8e7d6c...   (ed25519, effective epoch 44)
+  Previously signed objects remain valid.
+
+# Register 2-of-3 guardians for social recovery
+$ dsn key recovery-setup --guardian b0c1d2e3... --guardian c1d2e3f4... --guardian d2e3f4a5... --threshold 2
+Enter passphrase: ********
+Guardians set: 2-of-3. Recovery proposals enter a RECOVERY_VETO_EPOCHS = 2
+veto window before taking effect; execution is automatic at the deadline.
+
+# Inspect identity + recovery status
+$ dsn key info
+IdentityId (genesis):  a1b2c3d4e5f6a7b8...
+Current signing key:   9f8e7d6c...   (ed25519, scheme 1)
+Recovery:              2-of-3 guardians set; no active proposal
 ```
 
 ### Profile Subcommands (`profile.rs`)
@@ -166,6 +242,12 @@ pub enum PostAction {
         /// hold public keys, never handles, so they survive handle changes.
         #[arg(long)]
         mention: Vec<String>,
+        /// Attach media by file path or existing content hash (repeatable).
+        /// A file is hashed locally and added to `Post.media` as a `MediaRef`
+        /// (content hash + optional server hints); bytes are published to a
+        /// media-hosting indexer and served honestly by content addressing.
+        #[arg(long)]
+        media: Vec<String>,
     },
     /// Reply to an existing post
     Reply {
@@ -257,6 +339,14 @@ pub enum TokenYAction {
         /// Amount of Y to donate
         #[arg(long)]
         amount: u64,
+        /// Donate privately: the client generates a fresh standalone keypair,
+        /// funds it, and donates from it. The donation carries zero emission
+        /// weight (the fresh key is outside your invitation tree) and appears
+        /// anonymous in supporter features. Privacy is unlinkability at the
+        /// donation layer only, NOT chain-analysis resistance (the funding
+        /// transfer is public); private donors pay their own gas.
+        #[arg(long)]
+        private: bool,
     },
     /// Tip Y to another user
     Tip {
@@ -410,6 +500,10 @@ pub enum ModAction {
     History,
 }
 
+/// User-selectable flag reasons. Labels must align with `dsn-moderation`'s
+/// `FlagReason` set (06-moderation.md): the reserved discriminants are omitted
+/// from the CLI, and there is deliberately no truth-adjudication category —
+/// truth disputes are handled by indexer vocabularies, not protocol flags.
 #[derive(Clone, clap::ValueEnum)]
 pub enum FlagReason {
     Spam,
@@ -439,7 +533,7 @@ on-chain privilege. The CLI surfaces three conventions:
 
 ### Keyfile Format
 
-The local keyfile stores the user's BLS secret key encrypted with a passphrase. The file lives at `~/.dsn/key.enc` by default.
+The local keyfile stores the user's ed25519 secret key encrypted with a passphrase. The file lives at `~/.dsn/key.enc` by default.
 
 ```rust
 /// On-disk keyfile structure.
@@ -467,7 +561,7 @@ pub struct KeyFile {
 
 1. User provides a passphrase at key generation or when unlocking
 2. Derive an encryption key: `Argon2id(passphrase, salt) -> 32-byte key`
-3. Encrypt the 32-byte BLS secret key with XChaCha20-Poly1305
+3. Encrypt the 32-byte ed25519 secret key with XChaCha20-Poly1305
 4. Store the result as a JSON keyfile
 
 ### Key Operations
@@ -512,10 +606,6 @@ impl Keystore {
 - For non-interactive use (scripts, CI), support the `DSN_PASSPHRASE` environment variable
 - The passphrase is zeroized from memory after use via `zeroize`
 - The decrypted secret key is held in memory only for the duration of the command
-
-### Key Derivation for Scratchpads
-
-When the CLI needs to write to a specific Scratchpad (profile, balance, etc.), it derives the purpose-specific child key from the root secret key using `dsn-data::derive_scratchpad_key()`. This is transparent to the user.
 
 ## Indexer Client (`indexer_client.rs`)
 
@@ -778,7 +868,7 @@ pub struct OwnershipRecord {
 
 ## Spot-Check Verification Flow (`spot_check.rs`)
 
-The CLI does not blindly trust indexer results. It performs probabilistic spot-checks by reading raw data from Autonomi (via dsn-data) and on-chain data (via dsn-chain) and verifying the indexer's claims.
+The CLI does not blindly trust indexer results. It performs probabilistic spot-checks by fetching the raw signed object from an alternate indexer or the local store (via dsn-data), verifying its signature locally against the key current for the author's IdentityId, and cross-checking on-chain data (via dsn-chain) against the indexer's claims. Where an existed-before bound matters, it also fetches the object's anchor proof via `GET /api/v1/spotcheck/anchor/:address` (a Merkle branch to an on-chain anchor root) — see 07-indexer.md.
 
 ### Strategy
 
@@ -804,10 +894,21 @@ impl SpotChecker {
     /// Decide whether to spot-check a given item (probabilistic).
     fn should_check(&self) -> bool;
 
-    /// Verify a post exists on Autonomi and matches the indexer's version.
+    /// Verify a post: fetch the signed object from an alternate indexer or the
+    /// local store, check its signature locally, and match it against the
+    /// indexer's version.
     pub async fn verify_post(
         &self,
         indexer_post: &PostDetail,
+    ) -> Result<SpotCheckResult, SpotCheckError>;
+
+    /// Verify a post's existed-before bound via its anchor proof
+    /// (`GET /api/v1/spotcheck/anchor/:address`): recompute the content address,
+    /// walk the Merkle branch to the anchor root, and confirm the anchoring
+    /// transaction's block predates any claimed timestamp dispute.
+    pub async fn verify_anchor(
+        &self,
+        post: &ContentAddress,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
     /// Verify bond data reported by the indexer against on-chain records.
@@ -833,11 +934,18 @@ impl SpotChecker {
 
 **Post verification:**
 
-1. Read the Chunk at the content address from Autonomi via `ChunkStore::get()`
-2. Deserialize the Chunk into a `Post`
-3. Verify the signature (`Post::verify()`)
+1. Fetch the signed object at the content address from an alternate indexer (or the local store) via `ContentStore::get()`
+2. Deserialize the object into a `Post`
+3. Verify the signature locally (`Post::verify()`) against the key current for the author's IdentityId at the object's epoch
 4. Compare author, content, and timestamp against the indexer's response
 5. If any field mismatches, flag the indexer result as untrustworthy
+
+**Anchor verification (existed-before bound):**
+
+1. Fetch the anchor proof via `GET /api/v1/spotcheck/anchor/:address` from any indexer whose anchor includes the object
+2. Recompute the content address from the signed bytes and confirm it is the Merkle-branch leaf
+3. Confirm the branch resolves to an on-chain anchor root; the anchoring transaction's block gives a trustless "existed before" bound (independent of the informational `claimed_epoch`)
+4. An un-anchored object is reported Inconclusive until the next anchor interval
 
 **Bond verification:**
 
@@ -867,7 +975,8 @@ pub enum SpotCheckResult {
         indexer_value: String,
         onchain_value: String,
     },
-    /// Could not verify (e.g., Autonomi data not found, network error).
+    /// Could not verify (e.g., object not found on any source, not yet
+    /// anchored, network error).
     Inconclusive {
         check_type: CheckType,
         target: String,
@@ -878,6 +987,7 @@ pub enum SpotCheckResult {
 pub enum CheckType {
     PostContent,
     PostSignature,
+    PostAnchor,
     BondData,
     DonationData,
 }
@@ -929,8 +1039,8 @@ min_trust_score = 0.8
 # HTTP timeout for indexer queries (seconds)
 indexer_timeout_secs = 30
 
-# HTTP timeout for Autonomi reads during spot-checks (seconds)
-autonomi_timeout_secs = 60
+# HTTP timeout for alternate-source (indexer/local-store) reads during spot-checks (seconds)
+alt_source_timeout_secs = 60
 ```
 
 ### Config Loading Precedence
@@ -950,7 +1060,7 @@ pub struct Config {
     pub spot_check_probability: f64,
     pub min_trust_score: f64,
     pub indexer_timeout: Duration,
-    pub autonomi_timeout: Duration,
+    pub alt_source_timeout: Duration,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -1055,7 +1165,7 @@ Keyfile written to: ~/.dsn/key.enc
 $ dsn profile create --name "Alice" --bio "Decentralization enthusiast"
 Enter passphrase: ********
 Profile created successfully.
-Profile scratchpad address: 7f8e9d0c...
+Profile record address: 7f8e9d0c...
 ```
 
 ### Posting and Reading
@@ -1076,6 +1186,13 @@ Enter passphrase: ********
 Post published.
 Content address: abcd1234efgh5678...
 Mentions resolved: @alice -> a1b2c3d4..., @bob -> e5f6a7b8...
+
+# Attach media by file (hashed locally into a MediaRef) or existing content hash
+$ dsn post create "Ship day!" --media ./demo.png --media 5c6d7e8f...
+Enter passphrase: ********
+Post published.
+Content address: bcde2345fghi6789...
+Media attached: demo.png -> 4a5b6c7d... , 5c6d7e8f...
 
 # View a post
 $ dsn post view abcd1234efgh5678
@@ -1161,6 +1278,7 @@ Total bonded: 150 Y
 # View Y balance
 $ dsn y balance
 Y Balance: 1,250.000000
+Referral earnings: 12.500000   (10% of invitees' protocol fees routed to you as their direct inviter)
 Nonce: 14
 
 # Donate Y to a post's creator
@@ -1168,6 +1286,18 @@ $ dsn y donate --post abcd1234efgh5678 --amount 25000000
 Enter passphrase: ********
 Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
   (5% fee to Reward Pool; the remainder weights the creator's next-epoch emission share)
+
+# Donate privately (fresh standalone keypair; zero emission weight, anonymous)
+$ dsn y donate --post abcd1234efgh5678 --amount 25000000 --private
+Enter passphrase: ********
+Generated a fresh standalone keypair and funded it.
+Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
+  (5% fee to Reward Pool; creator share unchanged)
+  Weight: 0.0 — the fresh key is outside your invitation tree, so this donation
+  carries no emission weight and appears anonymous in supporter features.
+  WARNING: privacy is unlinkability at the donation layer only, NOT
+  chain-analysis resistance — the funding transfer is public and its gas is
+  paid by you (the sponsored-gas paymaster covers only invited accounts).
 
 # Tip a user
 $ dsn y tip --to e5f6a7b8... --amount 25000000
@@ -1453,7 +1583,7 @@ async fn main() {
 |---|---|
 | Missing keyfile | Print setup instructions: `run dsn key generate` |
 | Wrong passphrase | Allow up to 3 retries, then exit |
-| Indexer unreachable | Warn and fall back to direct Autonomi reads where possible |
+| Indexer unreachable | Warn and fall back to an alternate indexer or the local store, verifying signatures locally |
 | Indexer data fails spot-check | Warn user, show both indexer and on-chain values |
 | Insufficient Y balance | Show current balance and required amount |
 | Post content too long | Show character count and maximum |
@@ -1481,10 +1611,10 @@ async fn main() {
                               │  REST API  │  │data │ │chain│
                               │  (remote)  │  └──┬──┘ └──┬──┘
                               └───────────┘     │       │
-                                              ┌─┴───────┴─┐
-                                              │ Autonomi  │
-                                              │ Network   │
-                                              └───────────┘
+                                              ┌─┴───────┴──────┐
+                                              │ Indexers        │
+                                              │ (+ local store) │
+                                              └────────────────┘
 ```
 
 ### Write Path (e.g., creating a post)
@@ -1496,9 +1626,9 @@ async fn main() {
    keys into `Post.mentions`. Mentions store public keys, never handles, so they
    keep pointing at the same account after a handle change; handles re-resolve to
    display text only at render time.
-4. `commands/post.rs` constructs a `Post`, signs it with the secret key
-5. CLI writes the post Chunk via `dsn-data::ChunkStore::put()`
-6. CLI updates the user's FeedIndex Scratchpad via `dsn-data::ScratchpadStore::update()`
+4. `commands/post.rs` constructs a `Post`, signs it with the current signing key
+5. CLI publishes the signed post object to K configured indexers (`POST /api/v1/publish`, signature-verified at ingest) and keeps a copy in the local store — a dead indexer is a re-publish event, not data loss
+6. CLI updates the user's FeedIndex mutable record via `dsn-data::MutableStore::update()`
 7. CLI prints the content address to stdout
 
 ### Read Path (e.g., viewing feed)
@@ -1507,7 +1637,7 @@ async fn main() {
 2. CLI loads config, reads public key from keyfile (no passphrase needed)
 3. `commands/social.rs` calls `IndexerClient::feed()` with the public key
 4. Indexer returns a list of `FeedItem` objects
-5. `spot_check.rs` probabilistically verifies a subset of results against Autonomi and on-chain data
+5. `spot_check.rs` probabilistically re-fetches a subset from an alternate indexer, verifies signatures locally, and cross-checks against on-chain and anchor data (`GET /api/v1/spotcheck/anchor/:address`)
 6. CLI renders the feed via `output.rs` in the selected format
 
 ## Workspace Dependencies

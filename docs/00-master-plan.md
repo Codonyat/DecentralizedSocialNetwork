@@ -9,7 +9,7 @@ The system is split into two layers:
 
 Smart contracts enforce economic rules atomically. Off-chain content is self-authenticating (content addresses + author signatures), stored and served by competing indexers, with clients keeping local copies of their own data. The indexer bridges both layers into a queryable REST API.
 
-**Identity**: PublicKey is the sole canonical identity; on-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, never a structural reference.
+**Identity**: The canonical identity is the **IdentityId** (a user's genesis public key), resolved to a current signing key through the **IdentityRegistry** (rotation + M-of-N guardian recovery — see 01-core-types.md, Identity Registry, Rotation & Recovery). Every structural reference (invitation tree, donations, flags, handle ownership) embeds the IdentityId, never a rotatable signing key directly. On-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, unchanged, never a structural reference.
 
 **Ranking**: indexers serve verifiable data and candidate sets; feed ranking runs client-side on a user-owned, swappable model (see 09-client-ranking.md). Indexers are paid through a market for query access in Y, not by the protocol (see 07-indexer.md, Indexer Economics).
 
@@ -17,10 +17,11 @@ Smart contracts enforce economic rules atomically. Off-chain content is self-aut
 
 ## Deployment Targets
 
-The `dsn-chain` trait abstraction keeps protocol logic chain-agnostic; these are the intended deployment targets, chosen July 2026:
+The `dsn-chain` trait abstraction keeps protocol logic chain-agnostic; the L2 that hosts the social economy is chosen at build time against binding criteria, not committed in this document.
 
 - **Canonical token home: Ethereum L1.** The YToken contract of record (and the bridge escrow) lives on L1 — the deepest-security, most credibly neutral settlement layer. L1 is settlement only; no social-frequency traffic.
-- **Social economy: Base (OP Stack, Stage-1 optimistic rollup).** Donations, bonds, handle rent, invitations, epochs, and the Reward Pool run on an L2 where fees are sub-cent. Base is chosen for consumer distribution (Farcaster/Zora ecosystem, Coinbase onboarding funnel) and the most mature sponsored-gas infrastructure. Known trade-off, accepted deliberately: the sequencer is centralized (Coinbase) and applies OFAC filtering — but content lives off-chain (the sequencer cannot censor speech, only delay payments), and L1 forced inclusion (~12h) turns payment censorship into delay, not denial. Portability hedge: OP Stack contracts redeploy near-verbatim to OP Mainnet, and the L1 canonical home preserves the option to migrate L2s.
+- **Social economy: an L2 meeting binding criteria (decision deferred behind `ChainClient`).** Donations, bonds, handle rent, invitations, epochs, and the Reward Pool need an L2 where fees are sub-cent. A candidate chain must clear all of: permissionless validity/fraud proofs; no upgrade keys and no exit-length timelocks that could strand users (Stage-2 rollup properties); usable forced inclusion (a censored user can force a transaction through L1 in bounded time); sub-cent fees; no single-company dependence for sequencing or upgrades.
+  **July 2026 snapshot** (informational, not a commitment — re-evaluate at build time): Arbitrum One is the decentralization leader — permissionless BoLD fraud proofs and a walkaway-safe upgrade path — but a live deployment against the full criteria list hasn't landed. Base is the distribution leader (Farcaster/Zora ecosystem, Coinbase onboarding funnel, the most mature sponsored-gas infrastructure) but remains Stage 1, with a centralized Coinbase sequencer and OFAC-filtered transaction inclusion. **No live L2 clears every criterion today.** For a decentralization-first wedge audience, sequencer centralization is a real cost, not a rounding error — so the chain is selected at deployment time behind the `ChainClient` seam, not fixed here.
 - **Onboarding: ERC-4337 sponsored gas, gated by the invitation tree.** A paymaster covers gas for invited accounts (per-account budget), so new users never need ETH; the invitation tree is the sybil gate that makes sponsorship non-drainable. The paymaster can also accept Y for gas beyond the sponsored budget.
 
 ## Project Structure
@@ -47,7 +48,7 @@ DecentralizedSocialNetwork/
 │   ├── token-y/                  # Token Y: emission, bonding, donations, handle rent (pure math)
 │   ├── invitation/               # On-chain invitation tree + trust distance
 │   ├── moderation/               # Content flagging + filtering
-│   ├── indexer/                  # Chain listener + content crawler + REST API
+│   ├── indexer/                  # Chain listener + ingest & sync + REST API
 │   └── cli/                      # CLI client
 └── .gitignore
 ```
@@ -95,7 +96,7 @@ DecentralizedSocialNetwork/
 | `dsn-token-y` | core | Pure computation: emission, bonding curves, donation math, handle rent math |
 | `dsn-invitation` | core, chain | On-chain invitation tree, trust distance, donation weighting |
 | `dsn-moderation` | core, data | Content flags, counter-flags, review, policies |
-| `dsn-indexer` | core, data, chain, token-y, invitation, moderation | Chain listener, content crawler, REST API, feed ranking |
+| `dsn-indexer` | core, data, chain, token-y, invitation, moderation | Chain listener, ingest & sync, REST API, feed ranking |
 | `dsn-cli` | core, data, chain, token-y, invitation, moderation, indexer | User-facing CLI client |
 
 ## Build Order
@@ -113,7 +114,7 @@ The crates must be implemented in this order (each depends on the previous):
 | Dependency | Purpose | Used By |
 |---|---|---|
 | `serde` + `serde_json` + `bincode` | Serialization (JSON for API, bincode for compact storage) | All crates |
-| `sha2` + `blake3` | Hashing (SHA-256 for compatibility, BLAKE3 for speed) | core |
+| `sha2` + `blake3` + `ed25519-dalek` | Hashing (SHA-256 for compatibility, BLAKE3 for speed) + ed25519 signature keypairs | core |
 | `tokio` + `async-trait` | Async runtime + trait support | data, chain, indexer, cli |
 | `thiserror` | Typed errors | All crates |
 | `chrono` | Timestamps (for local display; epochs are block-based on-chain) | core |
@@ -163,11 +164,11 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 | Invitation tree | On-chain | Sybil resistance, trust distance |
 | Epoch/emission | On-chain | Deterministic, auto-distributed |
 | Anchor roots | On-chain | Timestamp proofs for off-chain content (doc 12) |
-| Posts | Off-chain | Large content, indexer-replicated, self-authenticating; timestamps via anchor roots (doc 12) |
-| Profiles | Off-chain | Mutable user data, no economic value |
-| Follow graphs | Off-chain | User-signed, portable, no on-chain cost |
-| Feed indices | Off-chain | Mutable convenience data |
-| Moderation flags | Off-chain | GraphEntries, indexer-aggregated |
+| Posts | Off-chain | Signed object hosted by indexers (full replication), self-authenticating; timestamps via anchor roots (doc 12) |
+| Profiles | Off-chain | Signed mutable object hosted by indexers, no economic value |
+| Follow graphs | Off-chain | Signed object hosted by indexers, portable, no on-chain cost |
+| Feed indices | Off-chain | Signed mutable object hosted by indexers, convenience data |
+| Moderation flags | Off-chain | Signed object hosted by indexers, aggregated for scoring |
 
 ## Smart Contracts (documented, implemented separately)
 
@@ -179,8 +180,10 @@ The following smart contracts enforce on-chain rules. They are not part of this 
 4. **EmissionContract** — epoch tracking, auto-distribution to creators
 5. **NameRegistry** — Harberger registry: claim()/assess()/pay_rent()/force_buy()/resolve()
 6. **InvitationTree** — invite(), trust distance, genesis seeding
-7. **RewardPool** — receives all protocol fees, drips 2%/epoch into creator emission
+7. **RewardPool** — receives all protocol fees after a 10% referral cut (REFERRAL_BPS, routed to the payer's direct inviter for the payer's first REFERRAL_TERM_EPOCHS); drips 2%/epoch into creator emission, of which 15% (TREASURY_DRIP_SHARE_BPS) routes to the Treasury until epoch 260 (TREASURY_TERM_EPOCHS), then 100% to creators
 8. **AnchorLog** — event-only `anchor(bytes32 root)` for content timestamp proofs (doc 12 §4)
+9. **IdentityRegistry** — `rotate()` / `set_guardians()` / `recover()`: key rotation plus M-of-N guardian social recovery with a RECOVERY_VETO_EPOCHS = 2 veto window for the current key
+10. **Treasury** — a disclosed, timelocked address; holds tokens, not powers (no privileged protocol calls); unspent balance auto-reclaims to the Reward Pool at epoch 416 (TREASURY_RECLAIM_EPOCH)
 
 ## Cross-Cutting: Epoch Model
 

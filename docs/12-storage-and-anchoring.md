@@ -3,9 +3,10 @@
 > **Scope:** this document settles two questions the earlier docs left
 > implicit or answered by naming a storage network: (1) where off-chain
 > content actually lives, and (2) how a post's creation time can be proven
-> rather than merely claimed. Where docs 00, 02, or 07 refer to Autonomi or
-> IPFS as the storage foundation, read them per this document: those
-> references are historical, and "the network" is the indexer layer.
+> rather than merely claimed. Earlier revisions of docs 00, 02, and 07
+> referred to Autonomi or IPFS as the storage foundation; those references
+> have since been removed from docs 00/02/07, and "the network" is the
+> indexer layer.
 
 ## 1. Decisions
 
@@ -19,11 +20,14 @@
 3. **Clients keep their own data.** A client retains a full local copy of
    everything its user has signed (posts, profile, follow list). Losing an
    indexer is an availability blip, never data loss. This rule is normative.
+   (Voluntary removal is a separate, signed-object convention — retract
+   tombstones — not data loss; see doc 02, Privacy & Data Lifecycle.)
 4. **Timestamps come from the chain, not from signatures.** Indexers
-   periodically anchor a Merkle root of newly indexed content on-chain
-   (Base). A Merkle branch to an anchored root proves a post existed before
-   that block; an optional embedded block hash proves it was created after
-   one.
+   periodically anchor a Merkle root of newly indexed content on-chain, on
+   the chosen L2 (see 00 Deployment Targets — decision deferred behind the
+   ChainClient trait). A Merkle branch to an anchored root proves a post
+   existed before that block; an optional embedded block hash proves it was
+   created after one.
 
 ## 2. Why no storage network
 
@@ -129,7 +133,8 @@ explicitly informational (doc 01). Fix, in two independent halves:
 
 Each anchoring interval (e.g. hourly), an indexer computes the Merkle root
 (dsn-core `merkle_root`) of all content addresses it newly indexed, and
-calls a minimal contract on Base:
+calls a minimal contract on the chosen L2 (see 00 Deployment Targets —
+decision deferred behind the ChainClient trait):
 
 ```solidity
 // AnchorLog — event-only, no storage writes beyond the log
@@ -141,7 +146,7 @@ anchored root. The block timestamp of the anchor transaction is the bound.
 Properties:
 
 - **Free for users.** One transaction per indexer per interval, regardless
-  of post volume — sub-cent on Base. Posting itself stays free.
+  of post volume — sub-cent on the chosen L2. Posting itself stays free.
 - **Part of the indexer product.** Indexers anchor because provable
   timestamps make their index more valuable; clients and paying API
   consumers prefer indexers whose content is anchored. Anchoring is
@@ -154,7 +159,7 @@ Properties:
   interval. Sufficient for a social network.
 
 Indexers store the Merkle branches and serve them via the spot-check API
-(`GET /spotcheck/anchor/:post_address`). Note that on-chain economic
+(`GET /api/v1/spotcheck/anchor/:post_address`). Note that on-chain economic
 activity already anchors implicitly — a donation or bond referencing a
 post hash proves the post pre-dates that transaction's block. §4 extends
 the guarantee from "posts someone paid attention to" to everything.
@@ -162,8 +167,9 @@ the guarantee from "posts someone paid attention to" to everything.
 ### Created-after-T (optional freshness)
 
 A post MAY set an optional field `freshness_anchor: Option<[u8; 32]>` — a
-recent Base block hash, included under the signature. The author could not
-have known that hash earlier, so the post provably post-dates the block.
+recent block hash from the chosen L2, included under the signature. The
+author could not have known that hash earlier, so the post provably
+post-dates the block.
 Combined with the anchor above, creation time is bracketed. Optional
 because most posts don't need it; clients expose it where priority matters
 (original work, predictions, disputes).
@@ -176,16 +182,19 @@ because most posts don't need it; clients expose it where priority matters
 - `Post.freshness_anchor: Option<[u8; 32]>` in dsn-core (signed field).
 - Indexer: anchor loop (interval Merkle root + branch storage), the
   `spotcheck/anchor` route, and peer text-sync.
+- Key-revocation timing (doc 01, Identity Registry): an object signed by a
+  revoked key is valid only if it carries an anchor proof (or on-chain
+  reference) predating the revocation transaction's block.
 
 ## 5. Impact on the workspace
 
 | Piece | Change |
 |---|---|
-| `dsn-core` | Add `freshness_anchor` to `Post`; the BLS key choice was Autonomi-motivated — key scheme may align with the target chain instead (revisit in doc 01 before implementation) |
-| `dsn-data` | Traits stay (they describe what an indexer's storage backend must do); the Autonomi backend and Scratchpad key-derivation sections are dropped; `MutableStore` semantics simplify to "latest owner-signed version, highest counter wins" |
+| `dsn-core` | Add `freshness_anchor` to `Post`; key scheme resolved: doc 01 now specifies ed25519 with versioned schemes via the IdentityRegistry |
+| `dsn-data` | Traits stay (they describe what an indexer's storage backend must do); the indexer backend (`indexer.rs`) replaces the dropped storage-network backend and per-key derivation sections; `MutableStore` semantics simplify to "latest owner-signed version, highest counter wins" |
 | `dsn-chain` | Add `post_anchor` + `Anchored` event |
-| `dsn-indexer` | Anchor duty, `spotcheck/anchor` route, peer text-sync; the crawler crawls peer indexers and client uploads instead of Autonomi |
-| Docs 00/02/07 | Read "Autonomi/IPFS" as "indexer-served (this doc)" |
+| `dsn-indexer` | Anchor duty, `spotcheck/anchor` route, peer text-sync; ingest comes from client publishes and peer-to-peer sync (see 02, Storage Model — the relay pattern), not from a storage-network client |
+| Docs 00/02/07 | No longer reference an external storage network; indexer-served storage and anchoring are described directly in each doc (this doc governs storage semantics) |
 
 ## 6. What was considered and rejected
 

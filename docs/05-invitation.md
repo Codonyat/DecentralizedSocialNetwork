@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The invitation system provides Sybil resistance via an on-chain invitation tree. Each invitation costs Y (flat cost; the fee is recycled to the Reward Pool), creating an auditable tree structure. A donor's **subtree position** — depth, ancestry, and lineage family — weights donations for emission calculation.
+The invitation system provides Sybil resistance via an on-chain invitation tree. Each invitation costs Y (flat cost; the fee is recycled to the Reward Pool), creating an auditable tree structure. A donor's **subtree position** — depth, ancestry, and lineage family — weights donations for emission calculation. An invitation also opens a **referral annuity**: a bounded-term cut of every protocol fee the invitee later pays routes back to their direct inviter (see Referral Annuity below). A donor **outside** the invitation tree carries **zero** donation weight by construction — the property that makes private, unweighted donations safe.
 
 This document is the **canonical donation-weighting spec**. The weighting rules here (pairwise weight + lineage families) REPLACE both prior distance tables — the one that used to live in this file and the one in `03-token-y.md`. No other doc defines donation weights; 03 references this one.
 
@@ -31,6 +31,7 @@ dsn-invitation depends on:
 
 - Invitations are ON-CHAIN smart contract calls
 - Each invitation costs Y (flat cost, defined in `EpochConfig::invitation_cost_y`); the fee is recycled to the Reward Pool
+- Each invitation also opens a **depth-1 referral annuity** from the invitee to the inviter (see Referral Annuity below)
 - Tree structure: each account has exactly one inviter (except genesis accounts)
 - Genesis accounts seeded by contract deployer at depth 0
 
@@ -82,6 +83,7 @@ pub fn validate_invitation(
 - Creating sock puppets costs Y per invite (the fee is recycled to the Reward Pool)
 - Sock puppets sit CLOSE in the invitation tree (low donation weight when cross-donating)
 - Y cost is the natural limiter (optionally also a per-epoch cap in the contract)
+- **Self-referral is strictly unprofitable**: the referral annuity returns only 10% of fees that were already 100% the controller's money — a net loss after the pool fee — and the annuity scales with an invitee's *real* fee-paying usage, so quality recruiting beats puppet volume
 
 ## Trust Distance Computation (trust_distance.rs)
 
@@ -134,6 +136,7 @@ Donation weight has **two layers** applied together:
 ///
 /// | Relationship                                | Weight |
 /// |---------------------------------------------|--------|
+/// | donor not in the invitation tree (private)  | 0.0    |
 /// | same account (self-donation)                | 0.0    |
 /// | ancestor / descendant (any depth)           | 0.25   |
 /// | else, s = min(hops donor→LCA, recip→LCA):    |        |
@@ -144,6 +147,12 @@ pub fn pairwise_weight(
     recipient: &PublicKey,
     tree: &HashMap<PublicKey, PublicKey>, // invitee -> inviter
 ) -> f64 {
+    // FIRST rule: a donor with no position in the invitation tree
+    // (`trust_distance` = None) — e.g. a fresh standalone keypair used for a
+    // private donation — carries zero emission weight by construction.
+    if trust_distance(donor, tree).is_none() {
+        return 0.0;
+    }
     if donor == recipient {
         return 0.0;
     }
@@ -160,6 +169,8 @@ pub fn pairwise_weight(
     }
 }
 ```
+
+Any account not present in `tree` (no inviter chain — a fresh standalone keypair) resolves to weight **0.0**: this is what makes private donations safe, since such keypairs carry zero emission weight by construction. The donor still pays the 5% donation fee and the creator's share is unchanged; only the emission-directing weight is nulled (see the private-donations note in [03-token-y.md](03-token-y.md)).
 
 ### Lineage-Family Diminishing Returns
 
@@ -228,12 +239,28 @@ But pairwise independence does not create family independence. `Q` and every `Si
 - **Chained descendant**: A invites B (B is A's descendant) → `is_ancestor(A, B)` → 0.25 at ANY depth. Lengthening the chain never lifts a within-lineage donation above 0.25.
 - **Self**: donor == recipient → 0.0.
 
+## Referral Annuity
+
+Inviting someone is not only a Sybil gate — it opens a **referral annuity**. For an invitee's first `REFERRAL_TERM_EPOCHS = 208` epochs (~4 years per invitee), a `REFERRAL_BPS = 1000` (10%, tunable) cut of every Reward-Pool inflow **attributable to that invitee as the payer** is split off to their **direct inviter** (depth 1 only) before the remainder reaches the Reward Pool.
+
+**Base — every pool-bound fee the invitee pays as payer:** donation fees, bond fees (including the entire first bond, which is otherwise paid wholly into the pool), handle rent (including arrears), force-buy fees, and floor excesses on name takeovers. The payer is the account the Y left. Invitation fees are paid by the **inviter**, not the invitee — so an invitee's own later invitations carry a referral cut to *their* inviter one level up, never back to themselves.
+
+The annuity is a redirection of already-paid fees, so it **costs the emission schedule nothing**: no new Y is minted; the Reward Pool simply receives the post-referral remainder. The split math lives in `referral.rs` (see [03-token-y.md](03-token-y.md)); the constants mirror `EpochConfig` in [01-core-types.md](01-core-types.md) and are restated under Constants below.
+
 ## Constants
 
 ```rust
 /// Default invitation cost in Y (can be overridden in EpochConfig).
 /// The invitation fee is recycled to the Reward Pool. (tunable)
 pub const DEFAULT_INVITATION_COST_Y: u64 = 100_000_000; // 100 Y
+
+/// Referral annuity: fraction of an invitee's pool-bound fees redirected to
+/// their direct inviter, in basis points (1000 = 10%). (tunable)
+pub const REFERRAL_BPS: u64 = 1_000; // mirrors EpochConfig
+
+/// Referral annuity term: epochs an invitee's fees feed their inviter's
+/// annuity (~4 years per invitee). (tunable)
+pub const REFERRAL_TERM_EPOCHS: u64 = 208; // mirrors EpochConfig
 
 /// Depth of the lineage-family root: a donor's family is the subtree rooted
 /// at its ancestor at this depth. Depth-2 nodes are minted only by genesis
@@ -291,12 +318,12 @@ pub enum InvitationError {
 
 **Attack**: A controller cycles Y between related accounts it owns purely to convert fees into an emission claim on a recipient it also owns.
 
-**Analysis**: Each 1 Y washed pays the donation fee `f ≈ 0.05` (5%, recycled to the Reward Pool) and, if routed ancestor↔descendant, contributes pairwise weight `w = 0.25` of weighted-Y toward the controlled recipient — a claim of roughly `w · e` Y, where `e` = emission paid per unit of weighted-Y directed that epoch (epoch emission ÷ total weighted donations, at the margin). The cycle is profitable iff
+**Analysis**: Each 1 Y washed pays the donation fee `f ≈ 0.05` (5%, recycled to the Reward Pool) and, if routed ancestor↔descendant, contributes pairwise weight `w = 0.25` of weighted-Y toward the controlled recipient — a claim of roughly `w · e` Y, where `e` = emission paid per unit of weighted-Y directed that epoch (epoch emission ÷ total weighted donations, at the margin). If the controller **also referred** the paying account (still within its term), the referral annuity rebates `r = 0.10` of the fee, so the *effective* fee falls to `f(1−r) ≈ 0.045`. The cycle is profitable iff
 
 ```
-w · e > f      i.e.      e > f / w = 0.05 / 0.25 = 0.2  (Y of emission per weighted-Y)
+w · e > f(1−r)   i.e.   e > f(1−r) / w = 0.045 / 0.25 ≈ 0.18  (Y of emission per weighted-Y)
 ```
 
-so washing pays only when emission-per-weighted-Y exceeds ~0.2. Four factors bound the attack, none eliminates it: the 0.25 weight makes washing 4× less efficient than an honest arm's-length donation; the lineage-family `^0.5` concavity shrinks the marginal claim as the controller pushes more through one family; the per-creator emission cap ceilings the recoverable amount; and invitation costs price every extra account.
+so the referral annuity **slightly worsens** wash economics — it lowers the break-even emission rate from ~0.2 to ~0.18. The recovery is bounded: each invitee's referral term expires after `REFERRAL_TERM_EPOCHS = 208` epochs, and renewing it via a fresh invitee costs the 100 Y invitation fee, which prices the churn. Four factors still bound the attack, none eliminates it: the 0.25 weight makes washing 4× less efficient than an honest arm's-length donation; the lineage-family `^0.5` concavity shrinks the marginal claim as the controller pushes more through one family; the per-creator emission cap ceilings the recoverable amount; and invitation costs price every extra account.
 
-This is an **acknowledged open risk, NOT a solved problem**. Whether real emission rates sit above or below the `e > f/w` line, and how the per-creator cap, the exponent, and the fees should be set, is **simulation-required before launch** — the design does not claim the attack is impossible. (03 Economic Design states the matching profitability condition; the maximal adversarial case against donation-directed emission is archived in [archive/09-first-principles-review.md](archive/09-first-principles-review.md) §2.1, non-normative.) The parameters `f` (DONATION_FEE_BPS), `w` (pairwise weight floor), `BRANCH_FAMILY_EXPONENT`, and the per-creator cap are all tunable.
+This is an **acknowledged open risk, NOT a solved problem**. Whether real emission rates sit above or below the `e > f(1−r)/w` line, and how the per-creator cap, the exponent, the referral rate, and the fees should be set, is **simulation-required before launch** — the design does not claim the attack is impossible. (03 Economic Design states the matching profitability condition; the maximal adversarial case against donation-directed emission is archived in [archive/09-first-principles-review.md](archive/09-first-principles-review.md) §2.1, non-normative.) The parameters `f` (DONATION_FEE_BPS), `r` (REFERRAL_BPS), `w` (pairwise weight floor), `BRANCH_FAMILY_EXPONENT`, and the per-creator cap are all tunable.
