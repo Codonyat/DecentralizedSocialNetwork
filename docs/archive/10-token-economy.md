@@ -1,3 +1,5 @@
+> **ARCHIVED — NON-NORMATIVE.** This document belongs to a parallel spec effort that reviewed/redesigned the pre-2026-07-11 spec (`f9b3820`). The harmonization decision (2026-07-11, recorded in the merge history) kept the concurrent redesign in docs 00–09 as the normative spec: Reward Pool fee recycling instead of burns, donation-directed emission with lineage-family weighting, Harberger @handles, 140B supply, bonding retained. This file is preserved because its adversarial arguments remain the sharpest known attacks on the normative design — read it as a standing red-team brief, not as the spec. Internal references to "doc 09/10/11" mean files in this archive directory; references to docs 00–08 describe the OLD spec, not the current one.
+
 # Token Y: Economy, Functions, and Distribution
 
 Builds on doc 09. Premise accepted from that review: **the money layer

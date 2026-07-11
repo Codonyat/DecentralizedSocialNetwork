@@ -35,7 +35,8 @@ DecentralizedSocialNetwork/
 │   ├── 06-moderation.md
 │   ├── 07-indexer.md
 │   ├── 08-cli.md
-│   └── 09-client-ranking.md
+│   ├── 09-client-ranking.md
+│   └── archive/                  # Non-normative: parallel-spec critique (standing red-team brief)
 ├── crates/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction
