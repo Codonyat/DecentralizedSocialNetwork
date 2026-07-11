@@ -593,6 +593,8 @@ pub struct EpochInfo {
 
 ## Feed Builder (`feed_builder.rs`)
 
+Server-side ranked feeds exist for **thin clients** (low-power devices, simple integrations). The reference architecture ranks **client-side**: the indexer serves raw candidate sets (see the Candidates endpoint) and the client's local model does the ordering — see 09-client-ranking.md. Everything in this section is the thin-client path.
+
 ### Feed Ranking Strategies
 
 Clients choose a ranking strategy when requesting feeds. The indexer supports multiple strategies:
@@ -750,6 +752,32 @@ Response:
     "has_more": true
 }
 ```
+
+### Candidates (for client-side ranking)
+
+Bulk, un-ranked recall for clients that run their own ranking model (09-client-ranking.md). The indexer claims **no ordering** — candidates are grouped by source, each carrying the economic metadata the local ranker consumes as features. Cheap to serve (no per-user ranking state), which is what makes it the commodity product of the query-fee market below.
+
+```
+GET /api/v1/candidates/:user_pk?sources=follows,lineage,bonded,mentions&since=<epoch>&limit=2000
+
+Response:
+{
+    "candidates": [
+        {
+            "post": IndexedPost,
+            "source": "follows" | "lineage" | "bonded" | "mentions",
+            "total_donated": "2000000",
+            "unique_donors": 14,
+            "total_bonded": "150000000",
+            "author_lineage_hops": 3
+        }
+    ],
+    "next_cursor": 2000,
+    "has_more": true
+}
+```
+
+Sources: `follows` (recent posts from the follow list), `lineage` (the user's invitation-tree neighborhood, decaying by lineage distance — the cold-start source), `bonded` (top recently-bonded posts network-wide), `mentions` (posts whose `mentions` include the user). Completeness has the same trust status as feeds: not guaranteed, detectable by querying multiple indexers.
 
 ### Profiles
 
@@ -1078,6 +1106,8 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         // Feeds
         .route("/api/v1/feeds/:user_pk/home", get(feeds::home_feed))
         .route("/api/v1/feeds/:user_pk/timeline", get(feeds::user_timeline))
+        // Candidates (un-ranked recall for client-side ranking)
+        .route("/api/v1/candidates/:user_pk", get(feeds::candidates))
         // Profiles
         .route("/api/v1/profiles/:user_pk", get(profiles::get_profile))
         .route("/api/v1/profiles/:user_pk/followers", get(profiles::get_followers))
@@ -1397,6 +1427,15 @@ impl IndexerService {
     }
 }
 ```
+
+## Indexer Economics
+
+Indexing is a service, not a protocol role — the protocol cannot verify "this indexer served correct, complete results to that client", so indexer payment is **market-enforced, not consensus-enforced**. This is a deliberate design position:
+
+- **What the protocol contributes**: Y as the low-friction payment rail, and the spot-check verifiability that turns service quality into something clients can measure. Detection → reputation → churn is the enforcement mechanism, the same one every service market (RPC providers, ISPs) runs on.
+- **Payment mechanics (convention, not consensus)**: clients pay per-query with signed vouchers — small signed IOUs accumulated off-chain and settled in Y on-chain periodically — or buy a subscription for an epoch. The reference client speaks Y-vouchers natively; keeping that the zero-friction default is what keeps Y the de facto unit of account, since nothing at the protocol level prevents an indexer charging out-of-band.
+- **What was rejected**: a Reward Pool slice for indexers ("proof of indexing" is either gameable or requires The Graph-scale staking/slashing/dispute machinery — disproportionate for a social network), and free-rider reliance on altruism (the Nostr relay experience: chronically underfunded infrastructure drifts toward corporate subsidy and the influence-monetization incentive).
+- **Cost profile**: candidate serving and data queries are cheap and commodity-priced; server-side ranked feeds for thin clients are the premium tier. Running an indexer must stay within hobbyist reach — that, plus verifiability, is what keeps the market competitive rather than oligopolistic.
 
 ## Trust Model Summary
 

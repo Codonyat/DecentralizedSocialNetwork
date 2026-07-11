@@ -224,11 +224,23 @@ pub enum SocialAction {
         /// Show only posts after this content address
         #[arg(long)]
         after: Option<String>,
+        /// Rank locally: fetch un-ranked candidates from the indexer and
+        /// order them with the on-device model (see 09-client-ranking.md).
+        /// Without this flag the indexer's server-side ranking is used
+        /// (thin-client path).
+        #[arg(long)]
+        local: bool,
+        /// Ranker to use with --local (a weights file installed in the
+        /// ranker directory; defaults to the bundled open-weights ranker).
+        #[arg(long)]
+        ranker: Option<String>,
     },
     /// View followers (users who follow you) — requires indexer
     Followers,
 }
 ```
+
+**Local ranking mode.** With `--local`, the CLI calls `GET /api/v1/candidates/:user_pk` instead of the feed endpoint and ranks on-device using the local interaction log (dwell, replies, donations — recorded locally, never uploaded). Rankers are weights + a declared feature schema executed by the CLI's fixed runtime — never code — and are swappable per invocation. Full design: 09-client-ranking.md.
 
 ### Token Y Subcommands (`token_y.rs`)
 

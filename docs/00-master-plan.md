@@ -11,6 +11,16 @@ Smart contracts enforce economic rules atomically. Off-chain content storage pro
 
 **Identity**: PublicKey is the sole canonical identity; on-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, never a structural reference.
 
+**Ranking**: indexers serve verifiable data and candidate sets; feed ranking runs client-side on a user-owned, swappable model (see 09-client-ranking.md). Indexers are paid through a market for query access in Y, not by the protocol (see 07-indexer.md, Indexer Economics).
+
+## Deployment Targets
+
+The `dsn-chain` trait abstraction keeps protocol logic chain-agnostic; these are the intended deployment targets, chosen July 2026:
+
+- **Canonical token home: Ethereum L1.** The YToken contract of record (and the bridge escrow) lives on L1 — the deepest-security, most credibly neutral settlement layer. L1 is settlement only; no social-frequency traffic.
+- **Social economy: Base (OP Stack, Stage-1 optimistic rollup).** Donations, bonds, handle rent, invitations, epochs, and the Reward Pool run on an L2 where fees are sub-cent. Base is chosen for consumer distribution (Farcaster/Zora ecosystem, Coinbase onboarding funnel) and the most mature sponsored-gas infrastructure. Known trade-off, accepted deliberately: the sequencer is centralized (Coinbase) and applies OFAC filtering — but content lives off-chain (the sequencer cannot censor speech, only delay payments), and L1 forced inclusion (~12h) turns payment censorship into delay, not denial. Portability hedge: OP Stack contracts redeploy near-verbatim to OP Mainnet, and the L1 canonical home preserves the option to migrate L2s.
+- **Onboarding: ERC-4337 sponsored gas, gated by the invitation tree.** A paymaster covers gas for invited accounts (per-account budget), so new users never need ETH; the invitation tree is the sybil gate that makes sponsorship non-drainable. The paymaster can also accept Y for gas beyond the sponsored budget.
+
 ## Project Structure
 
 ```
@@ -24,7 +34,8 @@ DecentralizedSocialNetwork/
 │   ├── 05-invitation.md
 │   ├── 06-moderation.md
 │   ├── 07-indexer.md
-│   └── 08-cli.md
+│   ├── 08-cli.md
+│   └── 09-client-ranking.md
 ├── crates/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction
