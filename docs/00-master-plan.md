@@ -4,14 +4,16 @@
 
 The system is split into two layers:
 
-- **On-chain** (blockchain with smart contracts): Token Y, bonds, donations, name registry, invitation tree, epoch/emission management
-- **Off-chain** (IPFS/Autonomi): Content (posts), profiles, follow graphs, feed indices, moderation flags
+- **On-chain** (blockchain with smart contracts): Token Y, bonds, donations, name registry, invitation tree, epoch/emission management, anchor log (content timestamps)
+- **Off-chain** (indexer-served, see 12-storage-and-anchoring.md): Content (posts), profiles, follow graphs, feed indices, moderation flags — signed, content-addressed, transport-agnostic
 
-Smart contracts enforce economic rules atomically. Off-chain content storage provides cheap, permanent, content-addressed data. The indexer bridges both layers into a queryable REST API.
+Smart contracts enforce economic rules atomically. Off-chain content is self-authenticating (content addresses + author signatures), stored and served by competing indexers, with clients keeping local copies of their own data. The indexer bridges both layers into a queryable REST API.
 
 **Identity**: PublicKey is the sole canonical identity; on-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, never a structural reference.
 
 **Ranking**: indexers serve verifiable data and candidate sets; feed ranking runs client-side on a user-owned, swappable model (see 09-client-ranking.md). Indexers are paid through a market for query access in Y, not by the protocol (see 07-indexer.md, Indexer Economics).
+
+**Storage & timestamps**: there is no normative storage network — indexers store and serve all content (full text replication), clients keep local copies of their own signed data, and indexers periodically anchor Merkle roots of new content on-chain so any post's existence can be proven against a block timestamp (see 12-storage-and-anchoring.md).
 
 ## Deployment Targets
 
@@ -36,6 +38,7 @@ DecentralizedSocialNetwork/
 │   ├── 07-indexer.md
 │   ├── 08-cli.md
 │   ├── 09-client-ranking.md
+│   ├── 12-storage-and-anchoring.md
 │   └── archive/                  # Non-normative: parallel-spec critique (standing red-team brief)
 ├── crates/
 │   ├── core/                     # Types, crypto, serialization
@@ -122,9 +125,13 @@ The crates must be implemented in this order (each depends on the previous):
 
 ## Storage Strategy
 
-### Off-Chain (IPFS/Autonomi)
+### Off-Chain (indexer-served, doc 12)
 
-The `dsn-data` crate defines trait abstractions for content storage:
+There is no normative storage network. Content is signed and
+content-addressed, so integrity is transport-independent; indexers store
+and serve it (full text replication), and clients keep local copies of
+their own data. The `dsn-data` crate defines trait abstractions for
+content storage (what an indexer's storage backend must do):
 1. `ContentStore` — immutable, content-addressed data (posts)
 2. `MutableStore` — mutable, key-addressed data (profiles, follows, feed indices)
 3. `GraphStore` — directed graph edges (replies, content flags)
@@ -140,6 +147,7 @@ The `dsn-chain` crate defines the `ChainClient` trait abstracting all blockchain
 - Handle claim / assessment / rent / force-buy and resolution
 - Invitation creation and trust distance queries
 - Epoch info queries (emission is auto-distributed)
+- Anchor log: posting Merkle anchor roots, querying anchor events (doc 12)
 - Chain event listening (for indexer)
 
 A `MemoryChainClient` implementation enables testing without a real blockchain.
@@ -154,7 +162,8 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 | Name registry | On-chain | Global uniqueness guarantee |
 | Invitation tree | On-chain | Sybil resistance, trust distance |
 | Epoch/emission | On-chain | Deterministic, auto-distributed |
-| Posts | Off-chain | Large content, cheap permanent storage |
+| Anchor roots | On-chain | Timestamp proofs for off-chain content (doc 12) |
+| Posts | Off-chain | Large content, indexer-replicated, self-authenticating; timestamps via anchor roots (doc 12) |
 | Profiles | Off-chain | Mutable user data, no economic value |
 | Follow graphs | Off-chain | User-signed, portable, no on-chain cost |
 | Feed indices | Off-chain | Mutable convenience data |
@@ -171,6 +180,7 @@ The following smart contracts enforce on-chain rules. They are not part of this 
 5. **NameRegistry** — Harberger registry: claim()/assess()/pay_rent()/force_buy()/resolve()
 6. **InvitationTree** — invite(), trust distance, genesis seeding
 7. **RewardPool** — receives all protocol fees, drips 2%/epoch into creator emission
+8. **AnchorLog** — event-only `anchor(bytes32 root)` for content timestamp proofs (doc 12 §4)
 
 ## Cross-Cutting: Epoch Model
 
