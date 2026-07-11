@@ -2,7 +2,12 @@
 
 > **Design canon:** the economic and trust design was revised by docs
 > 09 (first-principles review), 10 (token economy), and 11 (service registry
-> & staking). Where any older phrasing conflicts, docs 09–11 govern.
+> & staking); the storage and timestamping design was revised by doc 12
+> (storage & anchoring). Where any older phrasing conflicts, docs 09–12
+> govern. Per doc 12: there is no normative storage network (Autonomi/IPFS
+> references are historical) — indexers store and serve content, clients
+> keep local copies, and indexers anchor Merkle roots on-chain for
+> timestamps.
 > Summary of the revision: bonding curves and donation-weighted emission are
 > removed; the economy is tips (transfer + flat burn), burned protocol fees
 > (names + renewals, invitations, promotion), a usage rebate pool, referral
@@ -13,10 +18,10 @@
 
 The system is split into two layers:
 
-- **On-chain** (one execution layer, per the co-location rule of doc 11 §1): Token Y, tips, protocol fee sinks (names + renewals, invitations, promotion), usage rebate pool, referral routing, identity registry (key rotation/recovery), invitation registry, service registry (indexer staking/slashing)
-- **Off-chain** (IPFS/Autonomi): Content (posts), profiles, follow graphs, feed indices, moderation flags
+- **On-chain** (one execution layer, per the co-location rule of doc 11 §1): Token Y, tips, protocol fee sinks (names + renewals, invitations, promotion), usage rebate pool, referral routing, identity registry (key rotation/recovery), invitation registry, service registry (indexer staking/slashing), anchor log (content timestamps)
+- **Off-chain** (indexer-served, doc 12): Content (posts), profiles, follow graphs, feed indices, moderation flags — signed, content-addressed, transport-agnostic
 
-Smart contracts enforce economic rules atomically. Off-chain content storage provides cheap, permanent, content-addressed data. The indexer bridges both layers into a queryable REST API.
+Smart contracts enforce economic rules atomically. Off-chain content is self-authenticating (content addresses + author signatures), stored and served by staked indexers, with clients keeping local copies of their own data. The indexer bridges both layers into a queryable REST API.
 
 ## Project Structure
 
@@ -34,7 +39,8 @@ DecentralizedSocialNetwork/
 │   ├── 08-cli.md
 │   ├── 09-first-principles-review.md
 │   ├── 10-token-economy.md
-│   └── 11-service-registry-staking.md
+│   ├── 11-service-registry-staking.md
+│   └── 12-storage-and-anchoring.md
 ├── crates/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction
@@ -120,9 +126,13 @@ The crates must be implemented in this order (each depends on the previous):
 
 ## Storage Strategy
 
-### Off-Chain (IPFS/Autonomi)
+### Off-Chain (indexer-served, doc 12)
 
-The `dsn-data` crate defines trait abstractions for content storage:
+There is no normative storage network. Content is signed and
+content-addressed, so integrity is transport-independent; staked indexers
+store and serve it (full text replication), and clients keep local copies
+of their own data. The `dsn-data` crate defines trait abstractions for
+content storage (what an indexer's storage backend must do):
 1. `ContentStore` — immutable, content-addressed data (posts)
 2. `MutableStore` — mutable, key-addressed data (profiles, follows, feed indices)
 3. `GraphStore` — directed graph edges (replies, content flags)
@@ -140,6 +150,7 @@ The `dsn-chain` crate defines the `ChainClient` trait abstracting all blockchain
 - Identity registry: key rotation, recovery configuration
 - Service registry: stakes, slashing state, endpoint records
 - Epoch info and rebate pool queries (rebates are auto-distributed)
+- Anchor log: posting Merkle anchor roots, querying anchor events (doc 12)
 - Chain event listening (for indexer)
 
 A `MemoryChainClient` implementation enables testing without a real blockchain.
@@ -157,7 +168,7 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 | Identity registry (rotation/recovery) | On-chain | Key rotation must be globally unambiguous |
 | Service registry (stakes/slashes) | On-chain | Slash must seize the exact escrow (doc 11) |
 | Epoch/rebate pool | On-chain | Deterministic, auto-distributed pro-rata to fees burned |
-| Posts | Off-chain | Large content, cheap permanent storage; posting is free |
+| Posts | Off-chain | Large content, indexer-replicated, self-authenticating; posting is free; timestamps via anchor roots (doc 12) |
 | Profiles | Off-chain | Mutable user data, no economic value |
 | Follow graphs | Off-chain | User-signed, portable, no on-chain cost |
 | Feed indices | Off-chain | Mutable convenience data |
@@ -180,6 +191,7 @@ contracts, never as changes to these.
 6. **RebatePool** — epoch tracking, scheduled drop distributed pro-rata to eligible fees burned
 7. **ServiceRegistry** — indexer staking, signed-claim fraud proofs, slashing, liveness challenges (doc 11)
 8. **IdentityRegistry** — stable identity ids, key rotation, M-of-N social recovery with veto window
+9. **AnchorLog** — event-only `anchor(bytes32 root)` for content timestamp proofs (doc 12 §4)
 
 ## Cross-Cutting: What Replaces R? (and what replaced the replacements)
 
