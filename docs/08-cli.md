@@ -13,13 +13,12 @@ crates/cli/src/
 │   ├── mod.rs          # Command enum re-exports
 │   ├── key.rs          # Key generation, import, export
 │   ├── profile.rs      # Profile create, update, view
-│   ├── post.rs         # Post create, read, reply, thread view
+│   ├── post.rs         # Post create, read, reply, repost, thread view
 │   ├── social.rs       # Follow, unfollow, feed view
 │   ├── token_y.rs      # Donate, tip, view balance, emission info
-│   ├── bond.rs         # Place bonds, view bonds, check prices
 │   ├── name.rs         # Claim/assess handles, rent status, pay rent, force-buy, lookup(+history)
 │   ├── invitation.rs   # Invite users, view invitation chain
-│   └── moderation.rs   # Flag content, counter-flag, view flags
+│   └── label.rs        # Add/list content labels
 ├── config.rs           # Configuration loading (file + env + flags)
 ├── keystore.rs         # Local encrypted keyfile management
 ├── indexer_client.rs   # HTTP client for indexer REST API
@@ -71,14 +70,12 @@ pub enum Command {
     /// Token Y operations
     #[command(name = "y")]
     TokenY(TokenYCommand),
-    /// Bonding on posts
-    Bond(BondCommand),
     /// Handle management (Harberger-rented @handles)
     Name(NameCommand),
     /// Invitation management
     Invite(InviteCommand),
-    /// Content moderation
-    Mod(ModCommand),
+    /// Content labels
+    Label(LabelCommand),
     /// View a creator's supporters (donor recognition; indexer convenience, NOT protocol)
     Supporters {
         /// Public key of the creator (short hex or full hex)
@@ -260,6 +257,16 @@ pub enum PostAction {
         #[arg(long)]
         mention: Vec<String>,
     },
+    /// Repost or quote an existing post. `repost_of` is set on the new post;
+    /// `reply_to` and `repost_of` may never both be set. Omit `--quote` for a
+    /// pure repost (empty content); pass it to create a quote post.
+    Repost {
+        /// Content address of the post to repost
+        address: String,
+        /// Add commentary to create a quote post
+        #[arg(long)]
+        quote: Option<String>,
+    },
     /// View a single post by content address
     View {
         /// Content address of the post
@@ -368,35 +375,6 @@ pub enum TokenYAction {
 }
 ```
 
-### Bond Subcommands (`bond.rs`)
-
-```rust
-#[derive(Subcommand)]
-pub enum BondAction {
-    /// Place a bond on a post
-    Place {
-        /// Content address of the post to bond on
-        #[arg(long)]
-        post: String,
-        /// Amount of Y to bond
-        #[arg(long)]
-        amount: u64,
-    },
-    /// View bonds on a post
-    View {
-        /// Content address of the post
-        post: String,
-    },
-    /// View your active bond positions
-    Mine,
-    /// Check the current bond price for a post
-    Price {
-        /// Content address of the post
-        post: String,
-    },
-}
-```
-
 ### Name Subcommands (`name.rs`)
 
 ```rust
@@ -465,51 +443,41 @@ pub enum InviteAction {
         /// Public key of the invitee
         #[arg(long)]
         to: String,
+        /// Starter grant: a plain Y transfer from inviter to invitee sent
+        /// alongside the invitation, so the new account can immediately donate
+        /// and rent a handle. Reference-client convention (default 5 Y), not a
+        /// contract rule — a starter grant is just a transfer.
+        #[arg(long, default_value = "5000000")]
+        grant: u64,
     },
     /// View your invitation chain (who invited you, who you invited)
     Chain,
 }
 ```
 
-### Moderation Subcommands (`moderation.rs`)
+### Label Subcommands (`label.rs`)
 
 ```rust
 #[derive(Subcommand)]
-pub enum ModAction {
-    /// Flag a post for rule violation
-    Flag {
-        /// Content address of the post to flag
-        #[arg(long)]
+pub enum LabelAction {
+    /// Attach a label to a post: an ordinary signed, content-addressed object
+    /// (see 06-moderation.md), not a protocol-adjudicated flag. Label strings
+    /// match `^[a-z0-9-]{1,64}$`; common values by convention are spam,
+    /// harassment, violence, illegal, nsfw, and dispute (the author-rebuttal
+    /// convention) — the namespace is open, not an enum.
+    Add {
+        /// Content address of the post to label
         post: String,
-        /// Reason category
-        #[arg(long)]
-        reason: FlagReason,
+        /// Label string (e.g. spam, harassment, dispute)
+        label: String,
     },
-    /// Counter-flag (dispute a flag)
-    CounterFlag {
-        /// Content address of the flag to dispute
-        #[arg(long)]
-        flag: String,
-    },
-    /// View flags on a post
-    Flags {
+    /// View labels on a post: the raw public label record. Aggregation,
+    /// thresholds, and any visibility verdict are client/indexer policy, not
+    /// protocol (see 06-moderation.md, 07-indexer.md).
+    List {
         /// Content address of the post
         post: String,
     },
-    /// View your flagging history
-    History,
-}
-
-/// User-selectable flag reasons. Labels must align with `dsn-moderation`'s
-/// `FlagReason` set (06-moderation.md): the reserved discriminants are omitted
-/// from the CLI, and there is deliberately no truth-adjudication category —
-/// truth disputes are handled by indexer vocabularies, not protocol flags.
-#[derive(Clone, clap::ValueEnum)]
-pub enum FlagReason {
-    Spam,
-    Abuse,
-    Illegal,
-    Impersonation,
 }
 ```
 
@@ -688,26 +656,6 @@ impl IndexerClient {
     /// emission, Reward Pool drip (2% of balance), and Reward Pool balance.
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
-    // --- Bond queries ---
-
-    /// Fetch bonds placed on a post.
-    pub async fn get_bonds(
-        &self,
-        post: &ContentAddress,
-    ) -> Result<BondInfo, IndexerError>;
-
-    /// Fetch the current bond price for a post.
-    pub async fn bond_price(
-        &self,
-        post: &ContentAddress,
-    ) -> Result<BondPrice, IndexerError>;
-
-    /// Fetch a user's active bond positions.
-    pub async fn my_bonds(
-        &self,
-        user: &PublicKey,
-    ) -> Result<Vec<BondPosition>, IndexerError>;
-
     // --- Handle queries ---
 
     /// Resolve an @handle to its current owner's public key.
@@ -739,13 +687,13 @@ impl IndexerClient {
         creator: &PublicKey,
     ) -> Result<CreatorSupporters, IndexerError>;
 
-    // --- Moderation queries ---
+    // --- Label queries ---
 
-    /// Fetch flags for a post.
-    pub async fn get_flags(
+    /// Fetch labels attached to a post (raw public record; see 06-moderation.md).
+    pub async fn get_labels(
         &self,
         post: &ContentAddress,
-    ) -> Result<Vec<FlagInfo>, IndexerError>;
+    ) -> Result<Vec<LabelInfo>, IndexerError>;
 
     // --- Invitation queries ---
 
@@ -766,8 +714,10 @@ pub struct FeedItem {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub bond_count: u64,
-    pub total_bonded: u64,
+    /// Content address of the original post, if this is a repost or quote.
+    pub repost_of: Option<ContentAddress>,
+    /// Count of reposts/quotes of this post.
+    pub repost_count: u64,
     pub donation_total: u64,
     /// Donor-recognition badge for the author (client convention, NOT protocol).
     pub author_badge: Option<SupporterBadge>,
@@ -779,10 +729,12 @@ pub struct PostDetail {
     pub address: ContentAddress,
     pub author_profile: Option<UserProfile>,
     pub reply_count: u64,
-    pub bonds: Vec<BondSummary>,
-    pub total_bonded: u64,
+    /// Content address of the original post, if this is a repost or quote.
+    pub repost_of: Option<ContentAddress>,
+    /// Count of reposts/quotes of this post.
+    pub repost_count: u64,
     pub donation_total: u64,
-    pub flags: Vec<FlagInfo>,
+    pub labels: Vec<LabelInfo>,
     /// Donor-recognition badge for the author (client convention, NOT protocol).
     pub author_badge: Option<SupporterBadge>,
     /// Thread-scoped donor prominence (atomic Y donated to this thread's root
@@ -911,13 +863,6 @@ impl SpotChecker {
         post: &ContentAddress,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
-    /// Verify bond data reported by the indexer against on-chain records.
-    pub async fn verify_bonds(
-        &self,
-        post: &ContentAddress,
-        indexer_bonds: &BondInfo,
-    ) -> Result<SpotCheckResult, SpotCheckError>;
-
     /// Verify donation data reported by the indexer against on-chain records.
     pub async fn verify_donations(
         &self,
@@ -946,12 +891,6 @@ impl SpotChecker {
 2. Recompute the content address from the signed bytes and confirm it is the Merkle-branch leaf
 3. Confirm the branch resolves to an on-chain anchor root; the anchoring transaction's block gives a trustless "existed before" bound (independent of the informational `claimed_epoch`)
 4. An un-anchored object is reported Inconclusive until the next anchor interval
-
-**Bond verification:**
-
-1. Read bond records for the post from on-chain data via `dsn-chain`
-2. Compare the total bonded amount and individual bond positions against the indexer's report
-3. If any values mismatch, flag the indexer result as untrustworthy
 
 **Donation verification:**
 
@@ -988,7 +927,6 @@ pub enum CheckType {
     PostContent,
     PostSignature,
     PostAnchor,
-    BondData,
     DonationData,
 }
 
@@ -1101,7 +1039,7 @@ Post by alice (a1b2c3d4...)
 
   This is my first post on the decentralized social network!
 
-  Replies: 3 | Bonds: 7 (1,250 Y) | Donations: 450 Y
+  Replies: 3 | Reposts: 2 | Donations: 450 Y
   Address: 0xabcd1234...
 ```
 
@@ -1113,8 +1051,8 @@ Post by alice (a1b2c3d4...)
   "author": "a1b2c3d4...",
   "content": "This is my first post on the decentralized social network!",
   "reply_count": 3,
-  "bond_count": 7,
-  "total_bonded": 1250,
+  "repost_of": null,
+  "repost_count": 2,
   "donation_total": 450,
   "created_at": "2026-01-15T10:32:00Z"
 }
@@ -1123,9 +1061,9 @@ Post by alice (a1b2c3d4...)
 **Table**: Compact tabular format for listing commands.
 
 ```
-ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  BONDS   DONATED
-abcd1234..   alice (a1b2) This is my first post on the decent..  3        7       450 Y
-ef567890..   bob (e5f6)   Replying to the above — great to se..  1        2       120 Y
+ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  REPOSTS  DONATED
+abcd1234..   alice (a1b2) This is my first post on the decent..  3        2        450 Y
+ef567890..   bob (e5f6)   Replying to the above — great to se..  1        0        120 Y
 ```
 
 ### Implementation
@@ -1201,13 +1139,25 @@ Post by Alice (a1b2c3d4...)
 
   Hello, decentralized world!
 
-  Replies: 0 | Bonds: 0 | Donations: 0 Y
+  Replies: 0 | Reposts: 0 | Donations: 0 Y
 
 # Reply to a post
 $ dsn post reply --to abcd1234efgh5678 "Welcome, Alice!"
 Enter passphrase: ********
 Reply published.
 Content address: 9876fedc...
+
+# Repost a post (pure repost, no added commentary)
+$ dsn post repost abcd1234efgh5678
+Enter passphrase: ********
+Repost published.
+Content address: fedc9876...
+
+# Quote a post (repost with commentary)
+$ dsn post repost abcd1234efgh5678 --quote "This is worth reading."
+Enter passphrase: ********
+Repost published.
+Content address: 1357bdf2...
 
 # View thread
 $ dsn post thread abcd1234efgh5678
@@ -1229,47 +1179,11 @@ Now following e5f6a7b8... (Bob)
 $ dsn social feed --limit 10
 [1] Bob (e5f6a7b8...) — 5 min ago
     Just deployed v0.2 of the indexer. Performance is 3x better!
-    Replies: 2 | Bonds: 5 (800 Y) | Donations: 320 Y
+    Replies: 2 | Reposts: 4 | Donations: 320 Y
 
 [2] Charlie (c9d0e1f2...) — 20 min ago
     Interesting paper on sybil resistance: https://...
-    Replies: 7 | Bonds: 12 (3,400 Y) | Donations: 1,050 Y
-```
-
-### Bonding
-
-```bash
-# Check the current bond price for a post
-$ dsn bond price abcd1234efgh5678
-Post: abcd1234efgh5678
-Current bond price: 15 Y
-Total bonded: 800 Y
-Bond count: 5
-
-# Place a bond on a post
-$ dsn bond place --post abcd1234efgh5678 --amount 100
-Enter passphrase: ********
-Bond placed.
-  Post: abcd1234efgh5678
-  Amount: 100 Y
-  Your Y after bond: 1,150 Y
-
-# View bonds on a post
-$ dsn bond view abcd1234efgh5678
-Post: abcd1234efgh5678
-Total bonded: 900 Y
-Bonders: 6
-  a1b2c3d4... (Alice) — 100 Y
-  e5f6a7b8... (Bob)   — 200 Y
-  c9d0e1f2... (Charlie) — 350 Y
-  [3 more]
-
-# View your active bond positions
-$ dsn bond mine
-Your bond positions:
-  abcd1234efgh5678 — 100 Y (placed epoch 43)
-  5678dcba4321...   — 50 Y  (placed epoch 41)
-Total bonded: 150 Y
+    Replies: 7 | Reposts: 9 | Donations: 1,050 Y
 ```
 
 ### Token Operations
@@ -1278,7 +1192,6 @@ Total bonded: 150 Y
 # View Y balance
 $ dsn y balance
 Y Balance: 1,250.000000
-Referral earnings: 12.500000   (10% of invitees' protocol fees routed to you as their direct inviter)
 Nonce: 14
 
 # Donate Y to a post's creator
@@ -1309,7 +1222,6 @@ $ dsn y history --limit 5
 TYPE      AMOUNT       TO/POST                  EPOCH
 donate    25.000000    abcd1234efgh5678         43
 tip       25.000000    e5f6a7b8... (Bob)        43
-bond      100.000000   abcd1234efgh5678         43
 emission  87.500000    (auto)                   42
 tip       10.000000    c9d0e1f2... (Charlie)    41
 
@@ -1432,12 +1344,22 @@ Error: force-buy not available for @decentralist (flat tier, len 12 — safe har
 ### Invitations
 
 ```bash
-# Invite a new user (costs Y)
+# Invite a new user (costs Y; a 5 Y starter grant is sent alongside by default
+# so the invitee can immediately donate and rent a handle)
 $ dsn invite send --to f3a4b5c6...
 Enter passphrase: ********
 Invitation sent.
   Invitee: f3a4b5c6...
   Y cost deducted from balance.
+  Starter grant: 5.000000 Y -> f3a4b5c6...   (plain transfer, not a protocol rule)
+
+# Send a larger starter grant
+$ dsn invite send --to f3a4b5c6... --grant 20000000
+Enter passphrase: ********
+Invitation sent.
+  Invitee: f3a4b5c6...
+  Y cost deducted from balance.
+  Starter grant: 20.000000 Y -> f3a4b5c6...
 
 # View your invitation chain
 $ dsn invite chain
@@ -1448,26 +1370,23 @@ You (a1b2c3d4...) — invited by d7e8f9a0... (epoch 12)
 └── [2 more invitees]
 ```
 
-### Moderation
+### Labels
 
 ```bash
-# Flag a post
-$ dsn mod flag --post abcd1234efgh5678 --reason spam
+# Attach a label to a post
+$ dsn label add abcd1234efgh5678 spam
 Enter passphrase: ********
-Flag submitted.
+Label published.
   Post: abcd1234efgh5678
-  Reason: spam
+  Label: spam
 
-# View flags on a post
-$ dsn mod flags abcd1234efgh5678
+# View labels on a post
+$ dsn label list abcd1234efgh5678
 Post: abcd1234efgh5678
-Flags: 3
-  [spam]   by a1b2c3d4... — epoch 43
-  [spam]   by e5f6a7b8... — epoch 43
-  [abuse]  by c9d0e1f2... — epoch 44
-
-Counter-flags: 1
-  by g1h2i3j4... — epoch 44
+Labels: 3
+  spam         by a1b2c3d4... — epoch 43
+  spam         by e5f6a7b8... — epoch 43
+  harassment   by c9d0e1f2... — epoch 44
 ```
 
 ### Supporters (Donor Recognition)
@@ -1535,8 +1454,8 @@ pub enum CliError {
     #[error("token Y error: {0}")]
     TokenY(#[from] TokenYError),
 
-    #[error("moderation error: {0}")]
-    Moderation(String),
+    #[error("label error: {0}")]
+    Label(String),
 
     // --- Crypto errors ---
     #[error("crypto error: {0}")]
@@ -1659,7 +1578,6 @@ async fn main() {
 | `rand` | latest | Spot-check probability, nonce generation |
 | `dsn-core` | workspace | Core types, crypto primitives |
 | `dsn-data` | workspace | Storage trait abstractions |
-| `dsn-chain` | workspace | On-chain data reading (bonds, donations, names) |
+| `dsn-chain` | workspace | On-chain data reading (donations, names) |
 | `dsn-token-y` | workspace | Y balance validation, transfer verification |
 | `dsn-invitation` | workspace | Invitation chain operations |
-| `dsn-moderation` | workspace | Content flagging operations |

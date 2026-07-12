@@ -4,7 +4,7 @@
 
 Signed content objects carry no query capability on their own. Clients cannot ask a raw object stream "give me Alice's feed" or "search for posts about Rust." The indexer bridges this gap: it ingests client-published signed objects, syncs the corpus from peer indexers, listens to blockchain events, builds queryable indices locally, and exposes a REST API for clients. Indexers double as the network's hot storage — they store what they serve (see `docs/12-storage-and-anchoring.md`, which governs storage semantics).
 
-Because ALL source content is a signed, content-addressed object (posts, mutable records, signed edges) and all economic activity (bonds, donations, transfers, emissions) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: verifiability = local signature verification (every object carries its author's signature and hashes to its own address) + cross-indexer checks + anchor proofs (`docs/12`) that bind a post to a provable existed-before time. Clients spot-check any result the indexer returns by re-verifying the underlying signed object, cross-checking a second indexer, or querying the blockchain.
+Because ALL source content is a signed, content-addressed object (posts, mutable records, signed edges) and all economic activity (donations, transfers, emissions) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: verifiability = local signature verification (every object carries its author's signature and hashes to its own address) + cross-indexer checks + anchor proofs (`docs/12`) that bind a post to a provable existed-before time. Clients spot-check any result the indexer returns by re-verifying the underlying signed object, cross-checking a second indexer, or querying the blockchain.
 
 Multiple competing indexers can run simultaneously. No single indexer can censor content without clients noticing — they simply switch to a different indexer, verify signatures locally, or re-publish from their own local copy.
 
@@ -13,7 +13,7 @@ Multiple competing indexers can run simultaneously. No single indexer can censor
 ```
 crates/indexer/src/
 ├── lib.rs              # Re-exports, IndexerService construction
-├── config.rs           # Configuration: sync settings, chain settings, moderation policy, storage paths
+├── config.rs           # Configuration: sync settings, chain settings, label policy, storage paths
 ├── chain_listener.rs   # Listens to blockchain events, populates local index
 ├── ingest.rs           # Ingest & sync: verify + store published objects, backfill from peers, anchor loop
 ├── publish.rs          # POST /publish handler: signature-verified object intake
@@ -26,40 +26,39 @@ crates/indexer/src/
 │   ├── profiles.rs     # GET /profiles/:user_pk — profile + stats
 │   ├── posts.rs        # GET /posts/:address — single post + thread
 │   ├── search.rs       # GET /search?q=... — full-text search
-│   ├── engagement.rs   # GET /engagement/:post_address — bonds, donations
-│   ├── moderation.rs   # GET /moderation/:post_address — flag status, verdicts
+│   ├── engagement.rs   # GET /engagement/:post_address — donations
+│   ├── labels.rs       # GET /labels/:address — raw labels + this indexer's visibility verdict
 │   ├── names.rs        # GET /names/:handle — handle resolution + lifecycle state
 │   ├── epoch.rs        # GET /epoch — scheduled emission, Reward Pool balance, drip, treasury
 │   ├── creators.rs     # GET /creators/:pk/supporters — donor recognition (not protocol)
 │   ├── spotcheck.rs    # GET /spotcheck/... — raw signed object + signature proof; anchor branch
 │   └── health.rs       # GET /health — indexer status, ingest stats
-├── feed_builder.rs     # Feed ranking: chronological, donated, bonded
+├── feed_builder.rs     # Feed ranking: chronological, donated
 └── error.rs            # Indexer error types
 ```
 
 ## Chain Listener (`chain_listener.rs`)
 
-The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (bonds, donations, emissions, transfers, invitations, handle lifecycle events, and Reward Pool state).
+The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (donations, emissions, transfers, invitations, handle lifecycle events, and Reward Pool state).
 
 ### Event Types
 
 The listener processes the following on-chain events:
 
-Variant names and payload fields below are canonical in `docs/01-core-types.md`; this table and the match arms mirror them field-for-field. Every fee-bearing event carries `referral_to: Option<IdentityId>` and `referral_amount: u64` — the referral cut is split off to the inviter's `referral_earnings` **before** the remainder is added to the Reward Pool (see 05 Referral Annuity; `REFERRAL_BPS = 1000`, first `REFERRAL_TERM_EPOCHS = 208` epochs).
+Variant names and payload fields below are canonical in `docs/01-core-types.md`; this table and the match arms mirror them field-for-field. Every fee-bearing event routes its fee portion to the Reward Pool in full.
 
 | Event | Description | Index Action |
 |---|---|---|
-| **Bond** | User bonds Y tokens to a post; the fee portion (10%; the entire first bond) routes to the Reward Pool, net of the referral cut | `route_referral`, `upsert_bond`, `add_pool_inflow` |
-| **Donation** | User donates Y tokens to an author via a post; the 5% fee routes to the Reward Pool, net of the referral cut | `route_referral`, `upsert_donation`, `add_pool_inflow` |
+| **Donation** | User donates Y tokens to an author via a post; the 5% fee routes to the Reward Pool | `upsert_donation`, `add_pool_inflow` |
 | **EmissionDistributed** | Scheduled emission plus creator drip distributed to a creator | Update recipient's `y_balance` |
 | **Transfer** | Y tokens transferred between users | Update sender/receiver `y_balance` |
-| **Invitation** | New user invited to the network; the invite fee routes to the Reward Pool, net of the referral cut (paid by the inviter — carries a cut to THEIR inviter) | `route_referral`, `ensure_user_known`, `record_invitation`, `add_pool_inflow` |
+| **Invitation** | New user invited to the network; the invite fee routes to the Reward Pool (paid by the inviter) | `ensure_user_known`, `record_invitation`, `add_pool_inflow` |
 | **EpochAdvanced** | Epoch boundary crossed | `update_epoch_state` (scheduled emission, gross drip, treasury slice, pool balance) |
 | **NameClaimed** | User claims an unowned @handle (sets assessed value, pays first-epoch rent) | `upsert_name` |
 | **AssessmentChanged** | Owner changes a handle's assessed value (decreases take effect after the lookback window) | `update_name_assessment` |
-| **NameRentPaid** | Handle rent paid through an epoch (→ Reward Pool, net of referral) | `route_referral`, `record_rent_payment` |
-| **ForceBuyInitiated** | A Harberger-tier handle receives a force-buy bid (fee → pool, net of referral) | `route_referral`, `mark_force_buy` |
-| **NameTransferred** | Handle ownership changes (force-buy completes or manual transfer; fee → pool, net of referral) | `route_referral`, `transfer_name` (appends to `name_history`) |
+| **NameRentPaid** | Handle rent paid through an epoch (→ Reward Pool) | `record_rent_payment` |
+| **ForceBuyInitiated** | A Harberger-tier handle receives a force-buy bid (fee → pool) | `mark_force_buy` |
+| **NameTransferred** | Handle ownership changes (force-buy completes or manual transfer; fee → pool) | `transfer_name` (appends to `name_history`) |
 | **NameLapsed** | Handle rent unpaid past grace; handle returns to unowned | `lapse_name` |
 | **KeyRotated** | An identity rotates its signing key (effective next epoch; prior objects stay valid) | `rotate_key` (update `current_key`) |
 | **GuardiansSet** | An identity sets/updates its recovery guardians and threshold | `set_guardians` |
@@ -125,19 +124,11 @@ async fn process_chain_event(
     index: &Arc<dyn IndexStore>,
     event: &ChainEvent,
 ) -> Result<(), IndexerError> {
-    // The referral cut (`referral_to`/`referral_amount`) is split off to the
-    // inviter's earnings BEFORE the net fee is added to the Reward Pool.
     match event {
-        // --- Economic events (fee portions feed the Reward Pool, net of referral) ---
-        ChainEvent::Bond { bonder, post_hash, amount, referral_to, referral_amount, fee_to_pool, block_number } => {
-            route_referral(index, referral_to, *referral_amount).await?;
-            index.upsert_bond(bonder, post_hash, *amount, *block_number).await?;
-            index.add_pool_inflow(fee_to_pool.saturating_sub(*referral_amount)).await?;
-        }
-        ChainEvent::Donation { donor, post_hash, author, amount, referral_to, referral_amount, fee_to_pool, block_number } => {
-            route_referral(index, referral_to, *referral_amount).await?;
+        // --- Economic events (fee portions feed the Reward Pool) ---
+        ChainEvent::Donation { donor, post_hash, author, amount, fee_to_pool, block_number } => {
             index.upsert_donation(donor, post_hash, author, *amount, *block_number).await?;
-            index.add_pool_inflow(fee_to_pool.saturating_sub(*referral_amount)).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
         ChainEvent::EmissionDistributed { creator, amount, .. } => {
             // Per-epoch total = scheduled emission + creator drip; both land here.
@@ -146,13 +137,11 @@ async fn process_chain_event(
         ChainEvent::Transfer { from, to, amount, .. } => {
             index.transfer_y_balance(from, to, *amount).await?;
         }
-        ChainEvent::Invitation { inviter, invitee, cost, referral_to, referral_amount } => {
-            // The invite fee is paid by the inviter; when an invitee later invites
-            // others, that fee carries a cut to THEIR inviter.
-            route_referral(index, referral_to, *referral_amount).await?;
+        ChainEvent::Invitation { inviter, invitee, cost } => {
+            // The invite fee is paid by the inviter.
             index.ensure_user_known(invitee).await?;
             index.record_invitation(inviter, invitee).await?;
-            index.add_pool_inflow(cost.saturating_sub(*referral_amount)).await?;
+            index.add_pool_inflow(*cost).await?;
         }
         ChainEvent::EpochAdvanced { epoch, scheduled_emission, gross_drip, treasury_slice, pool_balance } => {
             // gross_drip = pool × 2%; treasury_slice → Treasury (0 after epoch 260);
@@ -168,19 +157,16 @@ async fn process_chain_event(
         ChainEvent::AssessmentChanged { handle, new_value, effective_epoch, .. } => {
             index.update_name_assessment(handle, *new_value, *effective_epoch).await?;
         }
-        ChainEvent::NameRentPaid { handle, paid_through_epoch, referral_to, referral_amount, fee_to_pool, .. } => {
-            route_referral(index, referral_to, *referral_amount).await?;
+        ChainEvent::NameRentPaid { handle, paid_through_epoch, fee_to_pool, .. } => {
             index.record_rent_payment(handle, *paid_through_epoch).await?;
-            index.add_pool_inflow(fee_to_pool.saturating_sub(*referral_amount)).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
-        ChainEvent::ForceBuyInitiated { handle, bidder, bid, deadline_epoch, referral_to, referral_amount, fee_to_pool } => {
-            route_referral(index, referral_to, *referral_amount).await?;
+        ChainEvent::ForceBuyInitiated { handle, bidder, bid, deadline_epoch, fee_to_pool } => {
             index.mark_force_buy(handle, bidder, *bid, *deadline_epoch).await?;
-            index.add_pool_inflow(fee_to_pool.saturating_sub(*referral_amount)).await?;
+            index.add_pool_inflow(*fee_to_pool).await?;
         }
-        ChainEvent::NameTransferred { handle, from, to, referral_to, referral_amount } => {
+        ChainEvent::NameTransferred { handle, from, to } => {
             // Appends the prior owner's span to name_history, then sets the new owner.
-            route_referral(index, referral_to, *referral_amount).await?;
             index.transfer_name(handle, from, to).await?;
         }
         ChainEvent::NameLapsed { handle, epoch, .. } => {
@@ -220,24 +206,11 @@ async fn process_chain_event(
     }
     Ok(())
 }
-
-/// Route a referral cut to the inviter's `referral_earnings` before the net
-/// fee is deposited to the Reward Pool. No-op when the payer is out of term.
-async fn route_referral(
-    index: &Arc<dyn IndexStore>,
-    referral_to: &Option<IdentityId>,
-    referral_amount: u64,
-) -> Result<(), IndexerError> {
-    if let Some(inviter) = referral_to {
-        index.add_referral_earnings(inviter, referral_amount).await?;
-    }
-    Ok(())
-}
 ```
 
 ## Ingest & Sync (`ingest.rs`, `publish.rs`, `stream.rs`)
 
-Content reaches an indexer two ways: clients **publish** their signed objects directly (`POST /api/v1/publish`), and indexers **sync** the corpus from peers (`GET /api/v1/stream?cursor=`). There is no polling of a storage network — the indexer stores what it serves. Content handling never touches economic data (bonds, donations, balances, emissions); that stays the chain listener's responsibility.
+Content reaches an indexer two ways: clients **publish** their signed objects directly (`POST /api/v1/publish`), and indexers **sync** the corpus from peers (`GET /api/v1/stream?cursor=`). There is no polling of a storage network — the indexer stores what it serves. Content handling never touches economic data (donations, balances, emissions); that stays the chain listener's responsibility.
 
 ### `POST /api/v1/publish` — signature-verified intake
 
@@ -278,7 +251,7 @@ pub async fn ingest_object(
 
 ### `GET /api/v1/stream?cursor=` — peer backfill
 
-Indexers replicate the full text corpus (posts, profiles, follow graph) from one another. The stream is an ordered feed of signed objects; the `cursor` is the caller's last-seen position, and anchor roots serve as checkpoint markers within it — so "give me everything since root R" is the cursor contract. Every streamed item is verified **item-by-item** exactly as in publish intake (signatures and addresses are self-checking), so a peer cannot inject forgeries. Discovery of new authors comes from chain **Invitation** events (the primary channel — everyone enters through the invitation tree) and from peer exchange; there is no follow-list walk or priority queue.
+Indexers replicate the full text corpus (posts, profiles, follow graph, labels, retract tombstones) from one another. The stream is an ordered feed of signed objects; the `cursor` is the caller's last-seen position, and anchor roots serve as checkpoint markers within it — so "give me everything since root R" is the cursor contract. Every streamed item is verified **item-by-item** exactly as in publish intake (signatures and addresses are self-checking), so a peer cannot inject forgeries. Discovery of new authors comes from chain **Invitation** events (the primary channel — everyone enters through the invitation tree) and from peer exchange; there is no follow-list walk or priority queue.
 
 ### Anchor loop (`ingest.rs`)
 
@@ -307,7 +280,7 @@ Objects circulate un-anchored at first and are marked unproven until the next in
 
 ### Retract handling
 
-A signed **retract** tombstone (see 02 Privacy & Data Lifecycle) is ingested and streamed like any other object. A compliant indexer stops serving the retracted target, renders a thread placeholder in its place, and MAY drop the stored bytes; any moderation score on the retracted content becomes moot. Retracts appear in `GET /api/v1/stream` alongside every other object so peers converge on the same tombstone. Honoring a retract is a convention, not consensus — a mirror MAY retain bytes (stated honestly).
+A signed **retract** tombstone (see 02 Privacy & Data Lifecycle) is ingested and streamed like any other object. A compliant indexer stops serving the retracted target, renders a thread placeholder in its place, and MAY drop the stored bytes; any label-derived visibility verdict on the retracted content becomes moot. Retracts appear in `GET /api/v1/stream` alongside every other object so peers converge on the same tombstone. Honoring a retract is a convention, not consensus — a mirror MAY retain bytes (stated honestly).
 
 ## Internal Data Model (`models.rs`, `store.rs`)
 
@@ -354,15 +327,9 @@ pub struct IndexedUser {
     /// Aggregate donation stats (from on-chain events).
     pub total_donations_received: u64,
     pub total_donations_given: u64,
-    /// Lifetime referral annuity earned as a direct inviter (10% of invitees'
-    /// protocol fees during their first 208 epochs; see 05 Referral Annuity).
-    /// Atomic Y; rendered as a JSON string.
-    pub referral_earnings: u64,
     /// Invitation chain.
     pub invited_by: Option<IdentityId>,
     pub invitation_depth: u32,
-    /// Moderation state.
-    pub active_flags: u32,
     /// Ingest metadata.
     pub last_indexed_at: chrono::DateTime<chrono::Utc>,
     pub mutable_record_versions: MutableRecordVersions,
@@ -395,18 +362,22 @@ pub struct IndexedPost {
     /// Threading.
     pub reply_to: Option<ContentAddress>,
     pub reply_count: u64,
+    /// Repost/quote target (mirrors `Post.repost_of` from 01). Set = this post
+    /// reposts or quotes another; `reply_to` and `repost_of` are mutually
+    /// exclusive. Reposts flow through feeds/candidates as ordinary posts.
+    pub repost_of: Option<ContentAddress>,
+    /// Number of posts that repost or quote this post (from ingested reposts).
+    pub repost_count: u64,
     /// Sequence in author's post history.
     pub sequence: u64,
     /// Timestamp (informational).
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Bond metrics (from on-chain events).
-    pub total_bonded: u64,
-    pub bond_count: u64,
     /// Donation metrics (from on-chain events).
     pub total_donated: u64,
     pub unique_donors: u32,
-    /// Moderation state.
-    pub flag_count: u32,
+    /// Label state: count of distinct labels applied to this post and this
+    /// indexer's local, non-normative visibility verdict derived from them.
+    pub label_count: u32,
     pub moderation_verdict: Option<ModerationVerdict>,
 }
 
@@ -422,14 +393,7 @@ pub struct MediaRef {
 /// Engagement detail for a post.
 pub struct IndexedEngagement {
     pub post_address: ContentAddress,
-    pub bonds: Vec<IndexedBond>,
     pub donations: Vec<IndexedDonation>,
-}
-
-pub struct IndexedBond {
-    pub bonder: PublicKey,
-    pub amount: u64,
-    pub block_number: u64,
 }
 
 pub struct IndexedDonation {
@@ -450,18 +414,21 @@ pub struct IndexedThreadReply {
     pub parent_address: ContentAddress,
 }
 
-/// Moderation verdict as determined by this indexer's policy.
+/// This indexer's LOCAL, NON-NORMATIVE visibility decision for a target,
+/// derived from the public label record under this indexer's own policy (see
+/// 06 Content Labels). The protocol mandates nothing here; another indexer may
+/// decide differently, and a client can recompute or override it.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ModerationVerdict {
-    /// No flags, content visible.
+    /// No labels above policy thresholds; content visible.
     Clean,
-    /// Flagged but below threshold, content visible with warning.
-    Warned { flag_count: u32 },
-    /// Flags exceed threshold, content hidden by this indexer.
-    Hidden { flag_count: u32 },
+    /// Labeled but below the hide threshold; content visible with warning.
+    Warned { label_count: u32 },
+    /// Labels exceed the hide threshold; content hidden by this indexer.
+    Hidden { label_count: u32 },
 }
 
-/// Handle pricing tier, derived from handle length (see 03 §E Name Registry).
+/// Handle pricing tier, derived from handle length (see 03 §D Name Registry).
 #[derive(Clone, Serialize, Deserialize)]
 pub enum HandleTier {
     /// Length 1–6: Harberger tax on the assessed value; force-buyable.
@@ -489,14 +456,13 @@ pub enum HandleRentStatus {
 | `users` | `public_key` | User profiles, stats, token balances |
 | `posts` | `address` | Post content, engagement counts |
 | `follows` | `(follower, followee)` | Follow relationships |
-| `bonds` | `(bonder, post_address, block_number)` | Bond records (from chain) |
 | `donations` | `(donor, post_address, block_number)` | Donation records (from chain) |
 | `names` | `handle` | Current handle ownership: owner, assessed value, tier, rent status, last-paid epoch, force-buy state (from chain) |
 | `name_history` | `(handle, claimed_at_epoch)` | Past ownership spans of a handle ("formerly @x") |
 | `supporters` | `(creator, supporter)` | Per-creator lifetime donation totals — donor recognition (derived from `donations`) |
 | `reply_links` | `(parent_address, child_address)` | Thread structure |
 | `invitations` | `(inviter, invitee)` | Invitation graph |
-| `flags` | `(flagger, post_address)` | Content flags |
+| `labels` | `(author, target, label)` | Content labels (signed objects; one per `(author, target, label)`, first-seen wins) |
 | `reward_pool` | singleton | Reward Pool balance, current epoch, last scheduled emission, last gross drip, treasury slice, treasury balance |
 | `identities` | `identity_id` | Registry mirror: current key, key history (with per-key revocation block), guardians/threshold, active recovery proposal |
 | `chain_state` | singleton | Last indexed block number, block hashes for reorg detection |
@@ -520,6 +486,12 @@ pub trait IndexStore: Send + Sync {
     async fn upsert_post(&self, post: &SignedPost) -> Result<(), IndexerError>;
     async fn upsert_reply_link(&self, entry: &GraphEntryData) -> Result<(), IndexerError>;
     async fn ensure_user_known(&self, pk: &IdentityId) -> Result<(), IndexerError>;
+    /// Record a verified Label object into the `labels` table (one per
+    /// (author, target, label); first-seen wins, ties broken by lowest object
+    /// hash — see 06 Content Labels).
+    async fn store_label(&self, label: &Label) -> Result<(), IndexerError>;
+    /// Record this indexer's local, non-normative visibility verdict for a
+    /// target, computed from its labels under the operator's policy.
     async fn update_moderation_verdict(&self, post: &ContentAddress,
                                         verdict: ModerationVerdict) -> Result<(), IndexerError>;
     /// Store a verified, servable signed object (highest valid version wins).
@@ -532,8 +504,6 @@ pub trait IndexStore: Send + Sync {
     async fn author_keys(&self, identity: &IdentityId) -> Result<AuthorKeys, IndexerError>;
 
     // --- Write operations (used by chain listener) ---
-    async fn upsert_bond(&self, user: &PublicKey, post: &ContentAddress,
-                         amount: u64, block_number: u64) -> Result<(), IndexerError>;
     async fn upsert_donation(&self, donor: &PublicKey, post: &ContentAddress,
                              author: &PublicKey, amount: u64, block_number: u64) -> Result<(), IndexerError>;
     // Handle lifecycle (six on-chain events). All atomic Y amounts are u64.
@@ -549,12 +519,8 @@ pub trait IndexStore: Send + Sync {
     async fn record_invitation(&self, inviter: &IdentityId, invitee: &IdentityId) -> Result<(), IndexerError>;
     async fn add_y_balance(&self, user: &IdentityId, amount: u64) -> Result<(), IndexerError>;
     async fn transfer_y_balance(&self, from: &IdentityId, to: &IdentityId, amount: u64) -> Result<(), IndexerError>;
-    /// Add a protocol fee (bond/donation/invite/rent/force-buy) to the Reward Pool total.
-    /// Callers pass the fee NET of the referral cut (see `add_referral_earnings`).
+    /// Add a protocol fee (donation/invite/rent/force-buy) to the Reward Pool total.
     async fn add_pool_inflow(&self, fee: u64) -> Result<(), IndexerError>;
-    /// Credit a direct inviter's referral annuity earnings (10% of an in-term
-    /// invitee's protocol fee, split off before the pool deposit; see 05).
-    async fn add_referral_earnings(&self, inviter: &IdentityId, amount: u64) -> Result<(), IndexerError>;
     /// Snapshot the authoritative epoch state on each EpochAdvanced event.
     /// `gross_drip = pool × 2%`; `treasury_slice` (0 after epoch 260) accumulates
     /// into the mirrored treasury balance; `creator_drip = gross_drip − treasury_slice`.
@@ -597,10 +563,13 @@ pub trait IndexStore: Send + Sync {
     async fn search_posts(&self, query: &str, cursor: Option<u64>,
                           limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
     async fn get_engagement(&self, post: &ContentAddress) -> Result<IndexedEngagement, IndexerError>;
-    async fn get_bonds_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedBond>, IndexerError>;
     async fn get_donations_for_post(&self, post: &ContentAddress) -> Result<Vec<IndexedDonation>, IndexerError>;
+    /// Raw public label record for a target (all labels applied to it), backing
+    /// `GET /api/v1/labels/:address`.
+    async fn get_labels(&self, target: &ContentAddress) -> Result<Vec<Label>, IndexerError>;
     async fn get_moderation_status(&self, post: &ContentAddress) -> Result<ModerationVerdict, IndexerError>;
-    async fn get_flagged_posts(&self, min_flags: u32, cursor: Option<u64>,
+    /// Posts carrying at least `min_count` instances of `label`.
+    async fn get_labeled_posts(&self, label: &str, min_count: u32, cursor: Option<u64>,
                                 limit: u32) -> Result<Vec<IndexedPost>, IndexerError>;
     /// Resolve a handle to its current owner plus lifecycle state and ownership history.
     async fn resolve_name(&self, handle: &str) -> Result<Option<ResolvedHandle>, IndexerError>;
@@ -635,7 +604,6 @@ pub trait IndexStore: Send + Sync {
 pub struct IngestStats {
     pub total_users: u64,
     pub total_posts: u64,
-    pub total_bonds: u64,
     pub total_donations: u64,
     pub last_sync_completed: Option<chrono::DateTime<chrono::Utc>>,
     pub last_sync_duration_ms: u64,
@@ -739,13 +707,10 @@ pub enum FeedRanking {
     Chronological,
     /// Weighted by donation volume and donor diversity.
     Donated,
-    /// Weighted by bond volume (staked visibility).
-    Bonded,
-    /// Combined: donations + bonds + recency, with configurable weights.
+    /// Combined: donations + recency, with configurable weights.
     Blended {
         recency_weight: f64,
         donation_weight: f64,
-        bond_weight: f64,
     },
 }
 ```
@@ -765,7 +730,7 @@ pub async fn build_home_feed(
 ) -> Result<Vec<IndexedPost>, IndexerError> {
     // 1. Get user's follow list from the index
     // 2. Gather recent posts from all followed users
-    // 3. Apply moderation filtering (hide posts that exceed flag threshold)
+    // 3. Apply label-visibility filtering (hide posts per this indexer's label policy)
     // 4. Rank by selected strategy
     // 5. Paginate with cursor
     index.get_home_feed(user_pk, cursor, limit, ranking).await
@@ -789,12 +754,8 @@ pub fn blended_score(
     let donation = (1.0 + post.total_donated as f64).ln()
         * (1.0 + post.unique_donors as f64).ln();
 
-    // Bond signal: log-scaled total bonded
-    let bond = (1.0 + post.total_bonded as f64).ln();
-
     recency * weights.recency_weight
         + donation * weights.donation_weight
-        + bond * weights.bond_weight
 }
 ```
 
@@ -810,7 +771,7 @@ Donor recognition is a **presentation layer** built entirely from public chain d
 
 Within the replies to a given post, an indexer may rank a donor's replies higher **in that thread only**, proportional to how much that donor has donated to the thread's author. This is the "superchat" pattern: paying to stand out where you already gave support.
 
-The prominence is deliberately **thread-local and never global**. It must not raise a donor's reach in home feeds, timelines, or search. The reason is anti-corruption: if Y could buy general reach, the network would degrade into pay-for-distribution and the ranking signals (bonds, donations, recency) would stop reflecting genuine engagement. Confining bought prominence to the one thread the donation supported keeps the incentive honest — it rewards supporting a creator's conversation without letting money purchase audience elsewhere.
+The prominence is deliberately **thread-local and never global**. It must not raise a donor's reach in home feeds, timelines, or search. The reason is anti-corruption: if Y could buy general reach, the network would degrade into pay-for-distribution and the ranking signals (donations, recency) would stop reflecting genuine engagement. Confining bought prominence to the one thread the donation supported keeps the incentive honest — it rewards supporting a creator's conversation without letting money purchase audience elsewhere.
 
 ```rust
 /// Thread-local prominence weight for a donor's replies under `thread_author`'s post.
@@ -862,9 +823,9 @@ Donor annotations (badge, thread prominence rank) also appear inline on donation
 
 All endpoints return JSON. Pagination uses cursor-based pagination with `?cursor=<sequence>&limit=<n>`.
 
-**API convention — `:user_pk` is an IdentityId.** Every `:user_pk` path parameter and every `public_key`/author field in a response is the user's **IdentityId** (the genesis public key that anchors the invitation tree, handle ownership, flags, and donation tuples), never a rotated signing key. The current signing key is consulted only for signature verification via the registry (see 01 Identity Principle, A9). Clients resolve display handles from the IdentityId at render time.
+**API convention — `:user_pk` is an IdentityId.** Every `:user_pk` path parameter and every `public_key`/author field in a response is the user's **IdentityId** (the genesis public key that anchors the invitation tree, handle ownership, labels, and donation tuples), never a rotated signing key. The current signing key is consulted only for signature verification via the registry (see 01 Identity Principle, A9). Clients resolve display handles from the IdentityId at render time.
 
-**API convention — atomic Y amounts are JSON strings.** Every token amount (balances, donation/bond totals, assessed values, rent, emission, pool balances) is a **base-10 string of atomic Y** (6 decimals, so `"1000000"` = 1 Y). At the 140B-Y hard cap the supply is `140_000_000_000_000_000` atomic, which exceeds JSON's safe integer range (2^53 ≈ 9.0×10^15); serializing these as numbers would silently lose precision in JavaScript clients. Counts, block numbers, epochs, and other small integers remain JSON numbers. All sample responses below follow this convention.
+**API convention — atomic Y amounts are JSON strings.** Every token amount (balances, donation totals, assessed values, rent, emission, pool balances) is a **base-10 string of atomic Y** (6 decimals, so `"1000000"` = 1 Y). At the 140B-Y hard cap the supply is `140_000_000_000_000_000` atomic, which exceeds JSON's safe integer range (2^53 ≈ 9.0×10^15); serializing these as numbers would silently lose precision in JavaScript clients. Counts, block numbers, epochs, and other small integers remain JSON numbers. All sample responses below follow this convention.
 
 ### Feeds
 
@@ -895,17 +856,16 @@ Response:
 Bulk, un-ranked recall for clients that run their own ranking model (09-client-ranking.md). The indexer claims **no ordering** — candidates are grouped by source, each carrying the economic metadata the local ranker consumes as features. Cheap to serve (no per-user ranking state), which is what makes it the commodity product of the query-fee market below.
 
 ```
-GET /api/v1/candidates/:user_pk?sources=follows,lineage,bonded,mentions&since=<epoch>&limit=2000
+GET /api/v1/candidates/:user_pk?sources=follows,lineage,donated,mentions&since=<epoch>&limit=2000
 
 Response:
 {
     "candidates": [
         {
             "post": IndexedPost,
-            "source": "follows" | "lineage" | "bonded" | "mentions",
+            "source": "follows" | "lineage" | "donated" | "mentions",
             "total_donated": "2000000",
             "unique_donors": 14,
-            "total_bonded": "150000000",
             "author_lineage_hops": 3
         }
     ],
@@ -914,7 +874,7 @@ Response:
 }
 ```
 
-Sources: `follows` (recent posts from the follow list), `lineage` (the user's invitation-tree neighborhood, decaying by lineage distance — the cold-start source), `bonded` (top recently-bonded posts network-wide), `mentions` (posts whose `mentions` include the user). Completeness has the same trust status as feeds: not guaranteed, detectable by querying multiple indexers.
+Sources: `follows` (recent posts from the follow list), `lineage` (the user's invitation-tree neighborhood, decaying by lineage distance — the cold-start source), `donated` (top recently-donated posts network-wide, ranked by recent donation volume + donor diversity), `mentions` (posts whose `mentions` include the user). Completeness has the same trust status as feeds: not guaranteed, detectable by querying multiple indexers.
 
 ### Profiles
 
@@ -938,7 +898,6 @@ Response:
     "trust_distance": 2,
     "total_donations_received": "12000000000",
     "total_donations_given": "3500000000",
-    "referral_earnings": "900000000",
     "invited_by": "hex or null"
 }
 ```
@@ -1019,15 +978,6 @@ GET /api/v1/engagement/:post_address
 Response:
 {
     "post_address": "hex...",
-    "total_bonded": "1500000000",
-    "bond_count": 3,
-    "bonds": [
-        {
-            "bonder": "pk_hex",
-            "amount": "500000000",
-            "block_number": 12345
-        }
-    ],
     "total_donated": "2000000000",
     "unique_donors": 8,
     "donations": [
@@ -1097,24 +1047,7 @@ Response:
 
 Reports the current epoch's economics: `scheduled_emission` is the schedule's mint for this epoch (1.4B Y = `"1400000000000000"` atomic while epoch < 50, halving every 50 epochs); `gross_drip` is 2% of the Reward Pool balance; `treasury_slice` is 15% of the gross drip routed to the disclosed Treasury address (`TREASURY_DRIP_SHARE_BPS = 1500`, dropping to 0 after `TREASURY_TERM_EPOCHS = 260`); `creator_drip = gross_drip − treasury_slice` is what reaches creators; `total_emission` is `scheduled_emission + creator_drip`; `pool_balance` is the pool's current holdings; and `treasury_balance` is the balance mirrored from the Treasury address (auto-returns to the pool at `TREASURY_RECLAIM_EPOCH = 416`). All amounts are atomic-Y strings. This is the read path behind the CLI `epoch_info` command.
 
-### Bonds and Donations per User/Post
-
-```
-GET /api/v1/users/:pk/bonds?cursor=0&limit=20
-
-Response:
-{
-    "bonds": [
-        {
-            "post_address": "hex...",
-            "amount": "500000000",
-            "block_number": 12345
-        }
-    ],
-    "next_cursor": 20,
-    "has_more": false
-}
-```
+### Donations per User/Post
 
 ```
 GET /api/v1/users/:pk/donations?cursor=0&limit=20
@@ -1135,17 +1068,6 @@ Response:
 ```
 
 ```
-GET /api/v1/posts/:addr/bonds?cursor=0&limit=20
-
-Response:
-{
-    "bonds": [IndexedBond],
-    "next_cursor": 20,
-    "has_more": false
-}
-```
-
-```
 GET /api/v1/posts/:addr/donations?cursor=0&limit=20
 
 Response:
@@ -1156,27 +1078,28 @@ Response:
 }
 ```
 
-### Moderation Status
+### Content Labels
 
 ```
-GET /api/v1/moderation/:post_address
+GET /api/v1/labels/:address
 
 Response:
 {
-    "post_address": "hex...",
-    "verdict": "Clean" | "Warned" | "Hidden",
-    "flag_count": 2,
-    "flags": [
+    "target": "hex...",
+    "labels": [
         {
-            "flagger": "pk_hex",
-            "reason_hash": "hex..."
+            "author": "pk_hex",
+            "label": "spam",
+            "claimed_epoch": 37
         }
     ],
+    "label_count": 2,
+    "verdict": "Clean" | "Warned" | "Hidden",
     "policy": "default-v1"
 }
 ```
 
-The verdict depends on this indexer's moderation policy configuration (see Configuration section). Different indexers may reach different verdicts for the same content -- this is by design.
+`labels` is the raw, public label record — each an immutable, content-addressed signed object (see 06 Content Labels). `verdict` is this indexer's LOCAL, NON-NORMATIVE visibility decision derived from those labels under its own `policy`; the protocol mandates nothing here. Different indexers may reach different verdicts for the same target -- this is by design, and a client can recompute the verdict from the same public labels or apply its own filter (see 06, 09).
 
 ### Spot-Check (Verification) API
 
@@ -1217,12 +1140,9 @@ GET /api/v1/spotcheck/engagement/:post_address
 
 Response:
 {
-    "indexed_bond_count": 3,
     "indexed_donation_count": 8,
     "chain_proof": {
-        "bonds_on_chain": 3,
         "donations_on_chain": 8,
-        "bonds_match": true,
         "donations_match": true
     },
     "match": true
@@ -1296,13 +1216,12 @@ Response:
     "ingest_stats": {
         "total_users": 1250,
         "total_posts": 48000,
-        "total_bonds": 5200,
         "total_donations": 31000,
         "last_sync_completed": "2026-03-03T12:00:00Z",
         "last_sync_duration_ms": 45000,
         "last_indexed_block": 128500
     },
-    "moderation_policy": "default-v1",
+    "label_policy": "default-v1",
     "uptime_seconds": 86400
 }
 ```
@@ -1325,7 +1244,6 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         // Posts & Threads
         .route("/api/v1/posts/:address", get(posts::get_post))
         .route("/api/v1/posts/:address/thread", get(posts::get_thread))
-        .route("/api/v1/posts/:address/bonds", get(engagement::get_post_bonds))
         .route("/api/v1/posts/:address/donations", get(engagement::get_post_donations))
         // Search
         .route("/api/v1/search", get(search::search_posts))
@@ -1335,13 +1253,12 @@ pub fn build_router(index: Arc<dyn IndexStore>, storage: Arc<dyn Storage>) -> Ro
         .route("/api/v1/epoch", get(epoch::get_epoch))
         // Donor recognition (client convention, not protocol)
         .route("/api/v1/creators/:pk/supporters", get(creators::get_supporters))
-        // Users — bonds & donations
-        .route("/api/v1/users/:pk/bonds", get(engagement::get_user_bonds))
+        // Users — donations
         .route("/api/v1/users/:pk/donations", get(engagement::get_user_donations))
         // Engagement
         .route("/api/v1/engagement/:address", get(engagement::get_engagement))
-        // Moderation
-        .route("/api/v1/moderation/:address", get(moderation::get_status))
+        // Content labels
+        .route("/api/v1/labels/:address", get(labels::get_labels))
         // Spot-check
         .route("/api/v1/spotcheck/post/:address", get(spotcheck::verify_post))
         .route("/api/v1/spotcheck/engagement/:address", get(spotcheck::verify_engagement))
@@ -1382,8 +1299,8 @@ pub struct IndexerConfig {
     /// Ingest & sync settings.
     pub sync: SyncConfig,
 
-    /// Moderation policy.
-    pub moderation: ModerationPolicyConfig,
+    /// Label visibility policy.
+    pub labels: LabelPolicyConfig,
 
     /// Local storage path for SQLite index and served objects.
     pub db_path: String,               // default: "./indexer.db"
@@ -1428,19 +1345,24 @@ pub struct SyncConfig {
     pub seed_users: Vec<String>,       // hex-encoded IdentityIds
 }
 
+/// Indexer-local label visibility policy. Labels are public protocol data (see
+/// 06 Content Labels); how this indexer aggregates them into a visibility
+/// verdict is its own choice — indexer-local, NOT protocol. Operator blocklists
+/// are likewise local config.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ModerationPolicyConfig {
+pub struct LabelPolicyConfig {
     /// Policy name (for display in /health endpoint).
     pub policy_name: String,           // default: "default-v1"
 
-    /// Minimum number of flags required to trigger a "Warned" verdict.
-    pub warn_threshold_flags: u32,     // default: 3
+    /// Minimum number of matching labels to trigger a "Warned" verdict.
+    /// Optional: an indexer may disable label-based visibility entirely.
+    pub warn_threshold_labels: u32,    // default: 3
 
-    /// Minimum number of flags required to trigger a "Hidden" verdict.
-    pub hide_threshold_flags: u32,     // default: 10
+    /// Minimum number of matching labels to trigger a "Hidden" verdict.
+    pub hide_threshold_labels: u32,    // default: 10
 
-    /// Minimum number of unique flaggers required (regardless of count).
-    pub min_unique_flaggers: u32,      // default: 3
+    /// Minimum number of distinct label authors required (regardless of count).
+    pub min_unique_authors: u32,       // default: 3
 
     /// Custom blocked public keys (operator-level override).
     /// Posts from these users are always hidden.
@@ -1449,6 +1371,12 @@ pub struct ModerationPolicyConfig {
     /// Custom blocked content addresses (operator-level override).
     /// These specific posts are always hidden.
     pub blocked_posts: Vec<String>,    // hex-encoded content addresses
+
+    /// Content-hash blocklists applied at INGEST (e.g. published CSAM hash
+    /// lists). An object whose content address matches is refused at intake —
+    /// this is the host's legal responsibility and edge policy at each host's
+    /// discretion, NOT protocol-level deletion (see 06).
+    pub ingest_hash_blocklists: Vec<String>, // hex-encoded content addresses / list URLs
 }
 ```
 
@@ -1494,25 +1422,19 @@ seed_users = [
     "a1b2c3d4..."
 ]
 
-[moderation]
+[labels]
 policy_name = "default-v1"
-warn_threshold_flags = 3
-hide_threshold_flags = 10
-min_unique_flaggers = 3
+warn_threshold_labels = 3
+hide_threshold_labels = 10
+min_unique_authors = 3
 blocked_users = []
 blocked_posts = []
+ingest_hash_blocklists = []
 ```
 
-### Moderation Policy Design
+### Label Visibility Policy
 
-Each indexer operator chooses their own moderation policy. This is a feature, not a bug:
-
-- **Strict indexers** may set low thresholds and aggressively hide flagged content
-- **Permissive indexers** may set high thresholds and show everything
-- **Community indexers** may maintain curated block lists for specific communities
-- **Unmoderated indexers** may disable moderation entirely (set thresholds to `u32::MAX`)
-
-Clients choose which indexer to use based on the moderation policy they prefer. The `/health` endpoint exposes the policy name so clients can make informed choices.
+Labels are public, immutable signed objects (see 06 Content Labels); the protocol only records them. Each indexer computes its own visibility defaults over that public record — strict operators hide aggressively, permissive ones show everything, and an unmoderated indexer applies no thresholds at all. Clients may ignore the indexer's verdict and run their own label filters (see 06, 09), and users choose indexers whose visibility policy they agree with. The `/health` endpoint exposes the policy name so those choices are informed.
 
 ## Error Types (`error.rs`)
 
@@ -1685,8 +1607,8 @@ The indexer is an **untrusted convenience layer**. Its trust model is:
 | **Completeness** | NOT guaranteed by a single indexer, but omission is maximally detectable: since full indexers replicate the whole text corpus, any peer can produce a missing item **plus its anchor proof**, publicly demonstrating the omission. Omission disputes therefore carry anchor proofs as evidence. Clients detect gaps by querying multiple indexers. |
 | **Timestamp provability** | An indexer periodically anchors a Merkle root of newly indexed content addresses on-chain (`AnchorLog`, `docs/12 §4`). A Merkle branch to an anchored root proves a post existed before that block; an optional `freshness_anchor` proves it was created after one. Anchors from indexers that later disappear remain valid forever, so prior timestamps stay provable. |
 | **Ranking fairness** | NOT guaranteed. An indexer may bias feed rankings. Clients can request `Chronological` ranking as a neutral baseline. |
-| **Moderation accuracy** | Subjective by design. Each indexer applies its own moderation policy. Clients choose the indexer whose policy they agree with. |
-| **Donor recognition** | Derived and subjective, like moderation — NOT part of the economic-accuracy guarantee. Badges, thread-scoped superchat prominence, and per-creator leaderboards are presentation conventions, not protocol, and confer no on-chain rights. The underlying donation totals they summarize are verifiable against the chain, but their display (tier cutoffs, prominence weighting, thread-local ordering) is the indexer's choice; a different indexer may show them differently or not at all. |
-| **Economic accuracy** | On-chain events are the source of truth for bonds, donations, emissions, transfers, handle rent, referral routing, and Reward Pool / Treasury flows. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
+| **Visibility policy** | Indexer-local by design. Each indexer derives its own visibility verdict from the public label record under its own policy; the protocol mandates nothing. Because the label record is public and auditable, any hiding decision can be compared against it, and a client can recompute or override it (see 06, 09). |
+| **Donor recognition** | Derived and subjective, like the visibility policy — NOT part of the economic-accuracy guarantee. Badges, thread-scoped superchat prominence, and per-creator leaderboards are presentation conventions, not protocol, and confer no on-chain rights. The underlying donation totals they summarize are verifiable against the chain, but their display (tier cutoffs, prominence weighting, thread-local ordering) is the indexer's choice; a different indexer may show them differently or not at all. |
+| **Economic accuracy** | On-chain events are the source of truth for donations, emissions, transfers, handle rent, and Reward Pool / Treasury flows. The indexer merely mirrors this data for queryability. Any discrepancy can be detected by checking the chain directly. |
 | **Availability & durability** | NOT guaranteed by any single indexer. Durability comes from independently chosen indexers + the author's local copy + trustless third-party mirrors (mirroring is trustless because objects are self-authenticating) + permissionless republication — any dropped indexer is a re-publish event, not data loss. No storage venue is normative; out-of-protocol archival services may exist but none is required. |
 | **Censorship-resistance** | Suppressing a user requires suppressing **every** indexer AND their permissionless ability to republish (from a local copy, to any indexer, including one they run themselves); anchors keep prior timestamps provable forever. |

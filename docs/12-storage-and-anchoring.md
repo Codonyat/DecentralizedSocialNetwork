@@ -160,8 +160,8 @@ Properties:
 
 Indexers store the Merkle branches and serve them via the spot-check API
 (`GET /api/v1/spotcheck/anchor/:post_address`). Note that on-chain economic
-activity already anchors implicitly — a donation or bond referencing a
-post hash proves the post pre-dates that transaction's block. §4 extends
+activity already anchors implicitly — a donation referencing a post hash
+proves the post pre-dates that transaction's block. §4 extends
 the guarantee from "posts someone paid attention to" to everything.
 
 ### Created-after-T (optional freshness)
@@ -176,7 +176,7 @@ because most posts don't need it; clients expose it where priority matters
 
 ### New surface (delta to docs 00/01)
 
-- Contract #8: **AnchorLog** — `anchor(bytes32)`, event-only (doc 00 list).
+- Contract #7: **AnchorLog** — `anchor(bytes32)`, event-only (doc 00 list).
 - `ChainEvent::Anchored { sender: PublicKey, root: [u8; 32] }`.
 - `ChainClient::post_anchor(root)` and anchor-event queries.
 - `Post.freshness_anchor: Option<[u8; 32]>` in dsn-core (signed field).

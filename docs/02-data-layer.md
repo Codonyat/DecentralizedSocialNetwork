@@ -11,7 +11,7 @@ Design goals:
 - **Simplicity is an explicit goal.** The protocol specifies a data format (signed, content-addressed objects) and stays silent on transport — no bespoke storage network.
 - **Storage is other participants' responsibility.** Indexers are the hot-storage tier, priced by the existing query-fee market (doc 07); the client always keeps a full local copy of everything its user signs. `docs/12-storage-and-anchoring.md` governs storage semantics; this document aligns with it.
 
-On-chain operations (tokens, bonds, donations, names, invitations, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
+On-chain operations (tokens, donations, names, invitations, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
 
 ## Module Structure
 
@@ -31,6 +31,8 @@ Publishing is a relay, not a write to a storage network:
 1. The client signs an object and publishes it to K chosen indexers via `POST /api/v1/publish`. Indexers verify the signature at ingest and reject anything that doesn't check out.
 2. Indexers sync and backfill from each other over an ordered cursor stream, `GET /api/v1/stream?cursor=` — "give me everything since this position" — verified item-by-item because every object is signed.
 3. The client always keeps a full local copy. A dead indexer is a re-publish event, not data loss: the client re-publishes its originals to any willing indexer (including one it runs itself).
+
+The design assumes a single writing device per identity today: mutable records carry a monotonic `version` (see Core Storage Traits and Concurrency Model below), and concurrent writes from two devices for the same record collide rather than merge. Multi-device sync is a client roadmap item; export/import between devices is available today.
 
 The full text corpus is small (≈ 1 GB/day network-wide even at scale), and registered indexers replicate all of it. Hosting is already paid for by the query-fee market (doc 07, Indexer Economics) — the relay adds no new economic layer.
 
@@ -136,7 +138,7 @@ pub enum ContentType {
 
 ### GraphStore
 
-Handles directed graph edges (reply threading, content flags).
+Handles directed graph edges (reply threading).
 
 ```rust
 #[async_trait]
@@ -152,8 +154,8 @@ pub trait GraphStore: Send + Sync {
     async fn exists(&self, owner: &PublicKey) -> Result<bool, DataError>;
 }
 
-/// A DSN protocol object: a signed directed edge (reply threading, content
-/// flags). A native DSN type — no association with any external network.
+/// A DSN protocol object: a signed directed edge (reply threading). A native
+/// DSN type — no association with any external network.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GraphEntryData {
     pub owner: PublicKey,          // author_identity (IdentityId)
@@ -206,17 +208,15 @@ The `ChainClient` trait is defined in the `dsn-chain` crate and provides access 
 `ChainClient` covers the following operations:
 
 - **Y token**: balance queries, transfers between accounts
-- **Bonds**: placing bonds on posts, querying bond state and bonding curves
-- **Donations**: executing donations from donor to creator (protocol fee routed to the Reward Pool, after the referral cut), querying donation history
+- **Donations**: executing donations from donor to creator (protocol fee routed to the Reward Pool), querying donation history
 - **Names**: claiming/assessing/renting handles (Harberger), resolving handle to public key
 - **Invitations**: creating invitations, querying tree position (depth, ancestry)
 - **Epochs**: querying current epoch info, emission schedule, treasury drip
 - **Reward Pool**: querying pool balance, per-epoch drip, and the treasury slice
 - **Identity (IdentityRegistry)**: resolving `IdentityId → current key`; `rotate`; `set_guardians`; `recover`
-- **Referral**: querying referral earnings owed to an inviter
 - **Treasury**: querying the disclosed treasury address and its balance
 - **Anchoring**: `post_anchor(root)` and anchor-event queries (Merkle-root timestamp anchors, doc 12 §4)
-- **Events**: listening for on-chain events (bonds, donations, epoch transitions, identity events, `Anchored`)
+- **Events**: listening for on-chain events (donations, epoch transitions, identity events, `Anchored`)
 
 See the `dsn-chain` crate documentation for the full trait definition and implementation details.
 
@@ -270,9 +270,8 @@ The real backend relays signed objects to a set of configured indexers. Not impl
 | `FeedIndex` | Signed object, hosted by indexers | logical address blake3(root_pk‖tag) | Rolling list of post addresses |
 | `FollowList` | Signed object, hosted by indexers | logical address blake3(root_pk‖tag) | Mutable list |
 | Reply link | Signed object (graph), hosted by indexers | blake3(root_pk‖tag) | Immutable edge parent→child |
-| Content flag | Signed object (graph), hosted by indexers | blake3(root_pk‖tag) | Immutable moderation flag |
+| Label | Signed object, hosted by indexers | content hash | One per (author, target, label), first-seen wins (06) |
 | Y Balance | On-chain | smart contract | ERC-20 token |
-| Bonds | On-chain | smart contract | Per-post bonding curve |
 | Donations | On-chain | smart contract | Donor→creator, fee to Reward Pool |
 | Names | On-chain | smart contract | Handle→public key mapping (Harberger) |
 | Invitations | On-chain | smart contract | Invitation tree |
@@ -315,23 +314,20 @@ pub enum DataError {
 
 ```
 GraphEntry {
-    owner: reply_object_id,              // blake3(root_pk ‖ tag ‖ ref)
-    parents: [post_author_pk],           // Points to parent post's author
-    content: reply_content_address,      // 32-byte address of the reply content object
-    descendants: [],                     // Replies to this reply will point back
+    owner: reply_author_pk,              // the replying author's PublicKey (IdentityId)
+    parents: [parent_post_author_pk],    // parent post's author, by public key
+    content: reply_content_address,      // 32-byte content address of the reply's own content object
+    descendants: [(parent_post_author_pk, parent_post_content_address)],
+                                          // outgoing edge to the parent post: (author pk, content address).
+                                          // The content address is required because the author's public
+                                          // key alone does not identify *which* post by that author is
+                                          // the parent — this pairing does.
 }
 ```
 
-### Content Flag
+(`claimed_epoch` and `signature` are envelope fields, present on every entry but omitted above for brevity — see Signed-Object Envelope.)
 
-```
-GraphEntry {
-    owner: flag_object_id,               // blake3(root_pk ‖ tag ‖ ref)
-    parents: [flagger_pk],               // Who flagged
-    content: flagged_post_address,       // 32-byte address of the flagged content object
-    descendants: [(post_author_pk, flag_reason_hash)],
-}
-```
+Content labels (spam, harassment, dispute, etc.) are standalone signed objects, not GraphStore entries — see `docs/06-moderation.md`.
 
 ## Concurrency Model
 
@@ -368,11 +364,15 @@ A user can publish a signed **retract** tombstone against one of their own objec
 - Compliant indexers stop serving the target and render a placeholder in threads; hosts MAY drop the stored bytes.
 - Trustless mirrors may retain the bytes — stated honestly: a retract is a convention, not consensus, so it cannot force deletion off machines the author doesn't control.
 - The default client treats its own retract as a delete.
-- Moderation scores on retracted content become moot.
+- Label-derived visibility on retracted content becomes moot.
 
 ### Private follows (roadmap)
 
 Follow lists are public today. Private follow lists — encrypted to the owner and opaque to indexers — are a roadmap item; they require an encryption scheme and a private-read path not yet specified.
+
+### Direct messages (roadmap)
+
+E2E-encrypted DMs, relayed through indexers acting as untrusted mailboxes, fit this architecture — but require an encryption scheme and a private-read path, the same family of open problem as private follows. Out of scope for now; stated here rather than left silent.
 
 ### Erasure / GDPR (best-effort)
 

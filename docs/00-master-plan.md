@@ -4,12 +4,12 @@
 
 The system is split into two layers:
 
-- **On-chain** (blockchain with smart contracts): Token Y, bonds, donations, name registry, invitation tree, epoch/emission management, anchor log (content timestamps)
-- **Off-chain** (indexer-served, see 12-storage-and-anchoring.md): Content (posts), profiles, follow graphs, feed indices, moderation flags — signed, content-addressed, transport-agnostic
+- **On-chain** (blockchain with smart contracts): Token Y, donations, name registry, invitation tree, epoch/emission management, anchor log (content timestamps)
+- **Off-chain** (indexer-served, see 12-storage-and-anchoring.md): Content (posts), profiles, follow graphs, feed indices, labels — signed, content-addressed, transport-agnostic
 
 Smart contracts enforce economic rules atomically. Off-chain content is self-authenticating (content addresses + author signatures), stored and served by competing indexers, with clients keeping local copies of their own data. The indexer bridges both layers into a queryable REST API.
 
-**Identity**: The canonical identity is the **IdentityId** (a user's genesis public key), resolved to a current signing key through the **IdentityRegistry** (rotation + M-of-N guardian recovery — see 01-core-types.md, Identity Registry, Rotation & Recovery). Every structural reference (invitation tree, donations, flags, handle ownership) embeds the IdentityId, never a rotatable signing key directly. On-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §E) are a resolvable label layer on top, unchanged, never a structural reference.
+**Identity**: The canonical identity is the **IdentityId** (a user's genesis public key), resolved to a current signing key through the **IdentityRegistry** (rotation + M-of-N guardian recovery — see 01-core-types.md, Identity Registry, Rotation & Recovery). Every structural reference (invitation tree, donations, labels, handle ownership) embeds the IdentityId, never a rotatable signing key directly. On-chain @handles (claim/assess/rent/force-buy — see 01-core-types.md, 03-token-y.md §D) are a resolvable label layer on top, unchanged, never a structural reference.
 
 **Ranking**: indexers serve verifiable data and candidate sets; feed ranking runs client-side on a user-owned, swappable model (see 09-client-ranking.md). Indexers are paid through a market for query access in Y, not by the protocol (see 07-indexer.md, Indexer Economics).
 
@@ -20,9 +20,15 @@ Smart contracts enforce economic rules atomically. Off-chain content is self-aut
 The `dsn-chain` trait abstraction keeps protocol logic chain-agnostic; the L2 that hosts the social economy is chosen at build time against binding criteria, not committed in this document.
 
 - **Canonical token home: Ethereum L1.** The YToken contract of record (and the bridge escrow) lives on L1 — the deepest-security, most credibly neutral settlement layer. L1 is settlement only; no social-frequency traffic.
-- **Social economy: an L2 meeting binding criteria (decision deferred behind `ChainClient`).** Donations, bonds, handle rent, invitations, epochs, and the Reward Pool need an L2 where fees are sub-cent. A candidate chain must clear all of: permissionless validity/fraud proofs; no upgrade keys and no exit-length timelocks that could strand users (Stage-2 rollup properties); usable forced inclusion (a censored user can force a transaction through L1 in bounded time); sub-cent fees; no single-company dependence for sequencing or upgrades.
+- **Social economy: an L2 meeting binding criteria (decision deferred behind `ChainClient`).** Donations, handle rent, invitations, epochs, and the Reward Pool need an L2 where fees are sub-cent. A candidate chain must clear all of: permissionless validity/fraud proofs; no upgrade keys and no exit-length timelocks that could strand users (Stage-2 rollup properties); usable forced inclusion (a censored user can force a transaction through L1 in bounded time); sub-cent fees; no single-company dependence for sequencing or upgrades.
   **July 2026 snapshot** (informational, not a commitment — re-evaluate at build time): Arbitrum One is the decentralization leader — permissionless BoLD fraud proofs and a walkaway-safe upgrade path — but a live deployment against the full criteria list hasn't landed. Base is the distribution leader (Farcaster/Zora ecosystem, Coinbase onboarding funnel, the most mature sponsored-gas infrastructure) but remains Stage 1, with a centralized Coinbase sequencer and OFAC-filtered transaction inclusion. **No live L2 clears every criterion today.** For a decentralization-first wedge audience, sequencer centralization is a real cost, not a rounding error — so the chain is selected at deployment time behind the `ChainClient` seam, not fixed here.
 - **Onboarding: ERC-4337 sponsored gas, gated by the invitation tree.** A paymaster covers gas for invited accounts (per-account budget), so new users never need ETH; the invitation tree is the sybil gate that makes sponsorship non-drainable. The paymaster can also accept Y for gas beyond the sponsored budget.
+
+## Parameter Immutability & Upgrades
+
+Every contract in the Smart Contracts list below is deployed immutable: no admin keys, no upgrade proxies, no post-deployment parameter setters. Where a doc marks a constant "(tunable)", that means tunable during design and simulation, frozen at deployment — no on-chain actor can change it afterward. A protocol change takes the form of a new deployment plus opt-in migration by users and indexers, the same standard the L2 selection criteria above demand of the underlying chain, applied here to our own contracts.
+
+Immutability raises the stakes on calibration: a miscalibrated constant cannot be patched, only replaced through migration. This is why the design favors structural invariants that hold across parameter choices — e.g., the emission match cap (03-token-y.md §C) — over hand-tuned knobs whose safety depends on picking the right number.
 
 ## Project Structure
 
@@ -45,9 +51,8 @@ DecentralizedSocialNetwork/
 │   ├── core/                     # Types, crypto, serialization
 │   ├── data/                     # Off-chain content storage abstraction
 │   ├── chain/                    # Blockchain abstraction layer
-│   ├── token-y/                  # Token Y: emission, bonding, donations, handle rent (pure math)
+│   ├── token-y/                  # Token Y: emission, donations, handle rent (pure math)
 │   ├── invitation/               # On-chain invitation tree + trust distance
-│   ├── moderation/               # Content flagging + filtering
 │   ├── indexer/                  # Chain listener + ingest & sync + REST API
 │   └── cli/                      # CLI client
 └── .gitignore
@@ -71,10 +76,6 @@ DecentralizedSocialNetwork/
            │        │dsn-invite │     │
            │        └────┬──────┘     │
            │             │            │
-           │   ┌─────────┴──────┐    │
-           │   │ dsn-moderation │    │
-           │   └─────────┬──────┘    │
-           │             │            │
            └─────────────┼────────────┘
                          │
              ┌───────────┴───────────┐
@@ -93,11 +94,10 @@ DecentralizedSocialNetwork/
 | `dsn-core` | (none) | Shared types, crypto primitives |
 | `dsn-data` | core | Off-chain content storage traits + in-memory mock |
 | `dsn-chain` | core | On-chain blockchain abstraction traits + in-memory mock |
-| `dsn-token-y` | core | Pure computation: emission, bonding curves, donation math, handle rent math |
+| `dsn-token-y` | core | Pure computation: emission, donation math, handle rent math |
 | `dsn-invitation` | core, chain | On-chain invitation tree, trust distance, donation weighting |
-| `dsn-moderation` | core, data | Content flags, counter-flags, review, policies |
-| `dsn-indexer` | core, data, chain, token-y, invitation, moderation | Chain listener, ingest & sync, REST API, feed ranking |
-| `dsn-cli` | core, data, chain, token-y, invitation, moderation, indexer | User-facing CLI client |
+| `dsn-indexer` | core, data, chain, token-y, invitation | Chain listener, ingest & sync, REST API, feed ranking |
+| `dsn-cli` | core, data, chain, token-y, invitation, indexer | User-facing CLI client |
 
 ## Build Order
 
@@ -105,7 +105,7 @@ The crates must be implemented in this order (each depends on the previous):
 
 1. **dsn-core** — Zero internal workspace dependencies. All other crates depend on this.
 2. **dsn-data, dsn-chain, dsn-token-y** — These three depend only on dsn-core. They are independent of each other and can be built in parallel.
-3. **dsn-invitation, dsn-moderation** — These depend on core + chain or core + data. Independent of each other, can be built in parallel.
+3. **dsn-invitation** — Depends on core + chain.
 4. **dsn-indexer** — Depends on all protocol crates. Integrates everything.
 5. **dsn-cli** — Depends on everything. Final integration point.
 
@@ -135,7 +135,7 @@ their own data. The `dsn-data` crate defines trait abstractions for
 content storage (what an indexer's storage backend must do):
 1. `ContentStore` — immutable, content-addressed data (posts)
 2. `MutableStore` — mutable, key-addressed data (profiles, follows, feed indices)
-3. `GraphStore` — directed graph edges (replies, content flags)
+3. `GraphStore` — directed graph edges (replies)
 
 A `MemoryContentStorage` implementation enables fast testing and simulation without a real network.
 
@@ -143,7 +143,6 @@ A `MemoryContentStorage` implementation enables fast testing and simulation with
 
 The `dsn-chain` crate defines the `ChainClient` trait abstracting all blockchain operations:
 - Y balance queries and transfers
-- Bond placement and queries
 - Donation execution and queries
 - Handle claim / assessment / rent / force-buy and resolution
 - Invitation creation and trust distance queries
@@ -158,7 +157,6 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 | Data | Layer | Rationale |
 |---|---|---|
 | Y token balances | On-chain | Atomic enforcement, no double-spend |
-| Bonds | On-chain | Bonding curve state needs atomic updates |
 | Donations | On-chain | Fee routing to Reward Pool, emission accounting |
 | Name registry | On-chain | Global uniqueness guarantee |
 | Invitation tree | On-chain | Sybil resistance, trust distance |
@@ -168,22 +166,21 @@ A `MemoryChainClient` implementation enables testing without a real blockchain.
 | Profiles | Off-chain | Signed mutable object hosted by indexers, no economic value |
 | Follow graphs | Off-chain | Signed object hosted by indexers, portable, no on-chain cost |
 | Feed indices | Off-chain | Signed mutable object hosted by indexers, convenience data |
-| Moderation flags | Off-chain | Signed object hosted by indexers, aggregated for scoring |
+| Labels | Off-chain | Signed object hosted by indexers, aggregated client/indexer-side |
 
 ## Smart Contracts (documented, implemented separately)
 
 The following smart contracts enforce on-chain rules. They are not part of this Rust workspace — they are implemented in a separate repo (Solidity/Vyper/etc.) and deployed to the target blockchain.
 
 1. **YToken** — ERC-20 + mint (scheduled emission, hard 140B cap); tokens are never destroyed
-2. **BondingContract** — bond(), bonding curve state per post hash
-3. **DonationContract** — donate(), fee to Reward Pool, forward to creator
-4. **EmissionContract** — epoch tracking, auto-distribution to creators
-5. **NameRegistry** — Harberger registry: claim()/assess()/pay_rent()/force_buy()/resolve()
-6. **InvitationTree** — invite(), trust distance, genesis seeding
-7. **RewardPool** — receives all protocol fees after a 10% referral cut (REFERRAL_BPS, routed to the payer's direct inviter for the payer's first REFERRAL_TERM_EPOCHS); drips 2%/epoch into creator emission, of which 15% (TREASURY_DRIP_SHARE_BPS) routes to the Treasury until epoch 260 (TREASURY_TERM_EPOCHS), then 100% to creators
-8. **AnchorLog** — event-only `anchor(bytes32 root)` for content timestamp proofs (doc 12 §4)
-9. **IdentityRegistry** — `rotate()` / `set_guardians()` / `recover()`: key rotation plus M-of-N guardian social recovery with a RECOVERY_VETO_EPOCHS = 2 veto window for the current key
-10. **Treasury** — a disclosed, timelocked address; holds tokens, not powers (no privileged protocol calls); unspent balance auto-reclaims to the Reward Pool at epoch 416 (TREASURY_RECLAIM_EPOCH)
+2. **DonationContract** — donate(), fee to Reward Pool, forward to creator
+3. **EmissionContract** — epoch tracking, auto-distribution to creators
+4. **NameRegistry** — Harberger registry: claim()/assess()/pay_rent()/force_buy()/resolve()
+5. **InvitationTree** — invite(), trust distance, genesis seeding
+6. **RewardPool** — receives all protocol fees; drips 2%/epoch into creator emission, of which 15% routes to the Treasury until epoch 260, then 100% to creators
+7. **AnchorLog** — event-only `anchor(bytes32 root)` for content timestamp proofs (doc 12 §4)
+8. **IdentityRegistry** — `rotate()` / `set_guardians()` / `recover()`: key rotation plus M-of-N guardian social recovery with a RECOVERY_VETO_EPOCHS = 2 veto window for the current key
+9. **Treasury** — a disclosed, timelocked address; holds tokens, not powers (no privileged protocol calls); unspent balance auto-reclaims to the Reward Pool at epoch 416 (TREASURY_RECLAIM_EPOCH)
 
 ## Cross-Cutting: Epoch Model
 

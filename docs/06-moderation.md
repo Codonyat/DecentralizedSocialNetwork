@@ -1,1123 +1,161 @@
-# Decentralized Content Moderation Protocol (`dsn-moderation`)
+# Content Labels (`dsn-core::label`)
 
 ## Purpose
 
-Content moderation separates **existence** from **visibility**. Existence is guaranteed by portable signed objects replicated across independently chosen indexers, the author's own local copies, and trustless third-party mirrors — anyone may re-publish, and anchors keep prior timestamps provable forever (existence). Indexers decide what to serve, and users choose which indexer to trust (visibility). This crate provides the flagging, counter-flagging, aggregation, and policy machinery that indexers use to make visibility decisions.
+Content moderation separates **existence** from **visibility**. Existence is
+guaranteed by portable signed objects replicated across independently chosen
+indexers, the author's own local copies, and trustless third-party mirrors —
+anyone may re-publish, and anchors keep prior timestamps provable forever.
+Visibility is decided at the edge: indexers choose what to serve, and every
+client can filter further.
 
-The protocol is fully transparent: all flags are public signed objects served by indexers, all scoring is deterministic, and any observer can audit the moderation history of any post or user.
+The protocol's contribution to moderation is deliberately minimal, for the same
+reason ranking needs no consensus (09-client-ranking.md): **visibility, like a
+feed, is consumed by exactly one person**. What is hidden from you is hidden
+for you alone — nobody else needs to verify or agree with your filter. A
+network-wide moderation verdict is therefore not just unnecessary machinery; it
+is a quasi-consensus layer on an inherently per-viewer question. The protocol
+specifies only a **data format** — one signed object, the Label — so that
+reports are portable across indexers and every visibility decision is auditable
+against a public record. Everything above the data format (aggregation,
+weighting, thresholds, reputation) is client and indexer policy.
 
-## Module Structure
-
-```
-crates/moderation/src/
-├── lib.rs              # Re-exports
-├── flag.rs             # ContentFlag creation, validation, serialization
-├── counter_flag.rs     # Counter-flag (contest) creation and validation
-├── aggregation.rs      # Flag score aggregation and uniform scoring
-├── policy.rs           # ModerationPolicy trait + built-in policies
-├── reputation.rs       # Flagger reputation tracking (accuracy-based)
-├── review.rs           # Broader community review triggered by counter-flags
-└── error.rs            # Moderation error types
-```
-
-## Design Principles
-
-1. **No censorship at the data layer** -- indexers serve signed objects and clients keep local copies, so suppressing a user requires suppressing every indexer AND their permissionless ability to republish; anchors keep prior timestamps provable forever. Flags are metadata *about* content, not deletion requests.
-2. **Indexer sovereignty** -- Each indexer chooses its own `ModerationPolicy`. Users who disagree switch indexers.
-3. **Eligibility-gated flagging** -- Only users who are invited, have sufficient account age, and have donated enough can flag, preventing flag spam from bots.
-4. **Uniform influence** -- Each eligible flagger/reviewer contributes weight 1.0, preventing any single account from dominating moderation outcomes.
-5. **Accountability** -- Flags are signed and permanent. Flaggers who abuse the system lose credibility (low accuracy causes their flags to be ignored by indexers).
-6. **Contestability** -- Flagged content authors can counter-flag, triggering broader community review.
-
-**Ingest blocklists (host policy, not protocol censorship).** Indexers, media hosts, and any out-of-protocol mirrors MAY apply hash blocklists (for example, published CSAM hash lists) at ingest, declining to store or serve matching bytes. This is edge policy at each host's discretion, not a protocol-level deletion: the object may still exist on other hosts, and a host applying a different blocklist can still serve it. The protocol neither mandates nor forbids such lists.
-
-## Eligibility Criteria
-
-A user is **eligible** to flag or review if all of the following are true:
-
-1. **Invited**: The user has an on-chain invitation record (exists in the web-of-trust graph).
-2. **Account age**: The user's account is at least `MIN_ACCOUNT_AGE_EPOCHS` epochs old.
-3. **Donation count**: The user has made at least `MIN_DONATION_COUNT` donations of at least `MIN_ELIGIBLE_DONATION` (1 Y, tunable) each, to recipients with pairwise weight ≥ 0.5 (outside the flagger's own subtree — see 05-invitation.md).
-
-Each eligible user receives a uniform weight of **1.0** for flagging and reviewing.
+## The Label Object
 
 ```rust
-/// Check whether a user is eligible to flag or review.
-pub fn is_eligible(
-    user: &PublicKey,
-    eligible_accounts: &HashSet<PublicKey>,
-) -> bool {
-    eligible_accounts.contains(user)
-}
-```
-
-Indexers are responsible for computing the set of eligible accounts based on on-chain data (invitation records, account creation epochs, donation counts).
-
-## Type Definitions
-
-### Flag Reason (`flag.rs`)
-
-```rust
-/// Reason categories for flagging content.
-/// Encoded as a u8 within the flag object.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
-#[repr(u8)]
-pub enum FlagReason {
-    /// Unsolicited commercial content, bot-generated spam.
-    Spam = 0,
-    /// Targeted abuse, threats, or doxxing directed at an individual.
-    Harassment = 1,
-    /// Content depicting or promoting violence.
-    Violence = 2,
-    /// Reserved. Formerly a "false/harmful" category; removed because
-    /// truth-by-plebiscite invites brigading — indexer vocabularies handle truth
-    /// disputes, not the protocol. Discriminant 3 stays reserved so the other
-    /// values remain stable.
-    Reserved3 = 3,
-    /// Content illegal in most jurisdictions (e.g., CSAM).
-    IllegalContent = 4,
-    /// Not safe for work (nudity, explicit material). Not inherently rule-breaking;
-    /// some indexers may allow NSFW with a content warning.
-    Nsfw = 5,
-    /// Catch-all for violations not covered above.
-    Other = 255,
-}
-```
-
-### Content Flag (`flag.rs`)
-
-```rust
-/// A content flag submitted by a user.
-/// A signed, content-addressed object published to indexers (immutable once published).
-///
-/// Object mapping:
-///   object_id:   flag_object_id (see Object-ID Derivation for Flags)
-///   author:      flagger identity key (signs the object)
-///   references:  flagged post address, post author, reason, cycle
+/// A signed content label: one user attaching one string to one object.
+/// An ordinary immutable, content-addressed signed object (envelope of 02,
+/// version 0), published, synced, anchored, and retracted like any other.
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ContentFlag {
-    /// Public key of the user who submitted the flag.
-    pub flagger: PublicKey,
+pub struct Label {
+    /// The labeler's IdentityId (genesis public key).
+    pub author: IdentityId,
 
-    /// Content address of the flagged post.
-    pub post_address: ContentAddress,
+    /// Content address of the labeled object (usually a post).
+    pub target: ContentAddress,
 
-    /// Public key of the post's author.
-    pub post_author: PublicKey,
+    /// The label string: `^[a-z0-9-]{1,64}$`. Open namespace; well-known
+    /// values below are conventions, not an enum.
+    pub label: String,
 
-    /// Reason for the flag.
-    pub reason: FlagReason,
+    /// Epoch the author claims the label was created in. Display metadata
+    /// only — never enters validity (anchors prove time; see 12 §4).
+    pub claimed_epoch: u64,
 
-    /// Reason-class cycle this flag belongs to: the number of prior OVERTURN
-    /// resolutions for (post_address, reason) at flag time. Aggregation counts
-    /// only current-cycle flags, so an overturn zeroes the prior cycle's flags.
-    pub cycle: u32,
-
-    /// Optional free-text explanation (max 512 chars).
-    /// Stored as a separate content object; this field holds its ContentAddress.
-    pub explanation: Option<ContentAddress>,
-
-    /// Epoch in which the flag was submitted.
-    pub flagged_at_epoch: u64,
-
-    /// Monotonic flag sequence per flagger (prevents replay).
-    pub sequence: u64,
-
-    /// ed25519 signature over all fields above.
+    /// ed25519 signature over all fields above (verified against the
+    /// author's registry key history per the validity rule, 01).
     pub signature: Signature,
 }
 ```
 
-### Flag Metadata Hash
-
-The `flag_metadata_hash` included in the flag object's metadata is computed as:
-
-```rust
-/// Compute the 32-byte metadata hash included in the flag object.
-pub fn flag_metadata_hash(flag: &ContentFlag) -> [u8; 32] {
-    let bytes = bincode::serialize(&(
-        flag.reason as u8,
-        flag.flagged_at_epoch,
-        flag.sequence,
-    )).unwrap();
-    hash_blake3(&bytes)
-}
-```
-
-### Counter-Flag (`counter_flag.rs`)
-
-```rust
-/// A counter-flag (contest) submitted by the author of flagged content.
-/// A signed, content-addressed object published to indexers.
-///
-/// Object mapping:
-///   object_id:   counter_flag_object_id (see Object-ID Derivation for Flags)
-///   author:      contester identity key (signs the object)
-///   references:  original flag object, original flagger, post address
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct CounterFlag {
-    /// The user contesting the flag (must be the flagged post's author).
-    pub contester: PublicKey,
-
-    /// Content address of the flagged post.
-    pub post_address: ContentAddress,
-
-    /// Reference to the original flag being contested.
-    /// This is the ContentAddress of the serialized ContentFlag.
-    pub original_flag_ref: ContentAddress,
-
-    /// The original flagger's public key.
-    pub original_flagger: PublicKey,
-
-    /// Reason for contesting.
-    pub contest_reason: ContestReason,
-
-    /// Optional evidence (ContentAddress of a content object with supporting material).
-    pub evidence: Option<ContentAddress>,
-
-    /// Epoch in which the counter-flag was submitted.
-    pub countered_at_epoch: u64,
-
-    /// Monotonic counter-flag sequence per contester.
-    pub sequence: u64,
-
-    /// ed25519 signature over all fields above.
-    pub signature: Signature,
-}
-
-/// Reason for contesting a flag.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
-#[repr(u8)]
-pub enum ContestReason {
-    /// The flag reason does not apply to this content.
-    Inapplicable = 0,
-    /// The content has been taken out of context.
-    OutOfContext = 1,
-    /// The flagger is acting in bad faith (targeted harassment via flags).
-    BadFaithFlag = 2,
-    /// The content is clearly satire, parody, or artistic expression.
-    SatireOrArt = 3,
-    /// Other reason.
-    Other = 255,
-}
-```
-
-### Review Vote (`review.rs`)
-
-```rust
-/// A community review vote cast during a broader review triggered by a counter-flag.
-/// A signed, content-addressed object published to indexers.
-///
-/// Object mapping:
-///   object_id:   review_vote_object_id (see Object-ID Derivation for Flags)
-///   author:      reviewer identity key (signs the object)
-///   references:  counter-flag object, post address
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ReviewVote {
-    /// The community member casting the review vote.
-    pub reviewer: PublicKey,
-
-    /// Reference to the counter-flag that triggered this review.
-    pub counter_flag_ref: ContentAddress,
-
-    /// The flagged post's content address.
-    pub post_address: ContentAddress,
-
-    /// The vote: uphold the original flag, or overturn it.
-    pub verdict: ReviewVerdict,
-
-    /// Epoch of the vote.
-    pub voted_at_epoch: u64,
-
-    /// Monotonic review sequence per reviewer.
-    pub sequence: u64,
-
-    /// ed25519 signature.
-    pub signature: Signature,
-}
-
-/// The outcome a reviewer votes for.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
-pub enum ReviewVerdict {
-    /// The original flag was correct; content should remain hidden.
-    UpholdFlag,
-    /// The original flag was incorrect; content should be restored.
-    OverturnFlag,
-}
-```
-
-### Aggregated Flag Score (`aggregation.rs`)
-
-```rust
-/// The aggregated moderation score for a single post.
-/// Computed by indexers from all flags, counter-flags, and review votes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PostModerationScore {
-    /// The post being scored.
-    pub post_address: ContentAddress,
-
-    /// Weighted flag score: count of eligible flaggers (each weight 1.0).
-    pub weighted_flag_score: f64,
-
-    /// Weighted counter-flag score: count of eligible overturn voters (each weight 1.0).
-    pub weighted_overturn_score: f64,
-
-    /// Weighted uphold score: count of eligible uphold voters (each weight 1.0).
-    pub weighted_uphold_score: f64,
-
-    /// Net moderation score: flag_score + uphold_score - overturn_score.
-    /// Positive = content is flagged. Negative or zero = content is clean.
-    pub net_score: f64,
-
-    /// Number of unique flaggers.
-    pub flag_count: u32,
-
-    /// Number of active counter-flags.
-    pub counter_flag_count: u32,
-
-    /// Number of review votes cast.
-    pub review_vote_count: u32,
-
-    /// Whether a broader review is currently active.
-    pub review_active: bool,
-
-    /// Breakdown by flag reason.
-    pub reason_scores: HashMap<FlagReason, f64>,
-
-    /// Epoch at which this score was last computed.
-    pub computed_at_epoch: u64,
-}
-```
-
-## Flag Flow (Step-by-Step)
-
-### Step 1: User Submits a Flag
-
-1. Alice sees a post she considers spam.
-2. Alice's client verifies she is eligible (invited, sufficient account age, sufficient donations).
-3. Alice's client constructs a `ContentFlag` with reason `Spam`.
-4. Alice's client computes the flag's object id: `flag_object_id = hash(alice_pk || "flag" || post_address || reason || cycle)` (see Object-ID Derivation for Flags).
-5. Alice's client serializes the flag, signs it with her identity key, and publishes it to K chosen indexers (keeping a local copy):
-   ```
-   Signed flag object {
-       object_id:   flag_object_id,
-       author:      alice_pk,
-       post:        post_content_address,
-       post_author: post_author_pk,
-       reason, cycle,
-   }
-   ```
-6. The flag is now served by those indexers and synced to their peers.
-
-### Step 2: Indexers Aggregate Flags
-
-1. Indexers ingest published objects and sync from peers, discovering new flags.
-2. For each flagged post, the indexer computes `PostModerationScore` (see Aggregation below).
-3. The indexer applies its `ModerationPolicy` to decide visibility.
-4. If `net_score >= policy.hide_threshold`, the indexer hides the post from its feeds.
-
-### Step 3 (Optional): Author Contests via Counter-Flag
-
-1. Bob, the post author, sees his post was hidden.
-2. Bob's client constructs a `CounterFlag` referencing the original flag.
-3. Bob's client computes `counter_flag_object_id`, signs the counter-flag with his identity key, and publishes it to K indexers (keeping a local copy):
-   ```
-   Signed counter-flag object {
-       object_id: counter_flag_object_id,
-       author:    bob_pk,
-       flag:      original_flag_ref,
-       flagger:   alice_pk,
-   }
-   ```
-4. The counter-flag triggers a broader community review.
-
-### Step 4: Broader Community Review
-
-1. Indexers detect the counter-flag and mark the post as "under review."
-2. Eligible community members (invited + account age >= N epochs + donation count >= M) can cast `ReviewVote` entries.
-3. The review window lasts `REVIEW_PERIOD_EPOCHS` epochs.
-4. Each eligible reviewer contributes weight 1.0.
-5. Each reviewer may only vote once per review (enforced by derived key uniqueness).
-
-### Step 5: Review Resolution
-
-1. After the review period, indexers tally `weighted_uphold_score` vs `weighted_overturn_score`.
-2. If `weighted_overturn_score > weighted_uphold_score`:
-   - The flag is **overturned**. The post is restored to visibility.
-   - The original flagger's accuracy is penalized (see Reputation below).
-3. If `weighted_uphold_score >= weighted_overturn_score`:
-   - The flag is **upheld**. The post remains hidden.
-   - The contester receives no penalty (contesting is free except for the effort).
-
-## Flag Aggregation and Scoring (`aggregation.rs`)
-
-### Core Scoring Formula
-
-```rust
-/// Aggregate all flags, counter-flags, and review votes for a post.
-///
-/// Overturn nullification: a resolved review that OVERTURNS a (post, reason-class)
-/// advances that reason-class's cycle by one. Aggregation counts only flags whose
-/// `cycle` matches the reason-class's current cycle, so overturning a reason zeroes
-/// every flag filed under it — those flags are excluded from the net entirely, not
-/// merely outweighed. New flags filed after the overturn carry the new cycle and
-/// start fresh. Upheld reviews do NOT advance the cycle (upheld flags keep counting).
-pub fn aggregate_moderation_score(
-    flags: &[ContentFlag],
-    counter_flags: &[CounterFlag],
-    review_votes: &[ReviewVote],
-    resolved_reviews: &[(FlagReason, u32, ResolvedOutcome)], // (reason-class, cycle, outcome)
-    eligible_accounts: &HashSet<PublicKey>,  // Eligible accounts computed by indexer
-    current_epoch: u64,
-) -> PostModerationScore {
-    let mut weighted_flag_score = 0.0_f64;
-    let mut weighted_overturn_score = 0.0_f64;
-    let mut weighted_uphold_score = 0.0_f64;
-    let mut reason_scores: HashMap<FlagReason, f64> = HashMap::new();
-    let mut unique_flaggers: HashSet<PublicKey> = HashSet::new();
-
-    // 0. Current cycle per reason-class = number of OVERTURN resolutions for it.
-    //    Upheld resolutions do not advance the cycle.
-    let mut current_cycle: HashMap<FlagReason, u32> = HashMap::new();
-    for (reason, _cycle, outcome) in resolved_reviews {
-        if matches!(outcome, ResolvedOutcome::FlagOverturned { .. }) {
-            *current_cycle.entry(*reason).or_insert(0) += 1;
-        }
-    }
-
-    // 1. Score all flags (each eligible flagger contributes weight 1.0), but only
-    //    flags at their reason-class's CURRENT cycle count. Old-cycle flags (a
-    //    reason-class that was overturned) are auto-excluded -> that class is zeroed.
-    for flag in flags {
-        if !eligible_accounts.contains(&flag.flagger) {
-            continue; // Not eligible, ignore flag
-        }
-
-        let cur = current_cycle.get(&flag.reason).copied().unwrap_or(0);
-        if flag.cycle != cur {
-            continue; // Stale cycle: this reason-class was overturned, flag zeroed
-        }
-
-        // Each flagger counted only once per post
-        if !unique_flaggers.insert(flag.flagger.clone()) {
-            continue;
-        }
-
-        let weight = 1.0;
-        weighted_flag_score += weight;
-
-        *reason_scores.entry(flag.reason).or_insert(0.0) += weight;
-    }
-
-    // 2. Determine if a review is active
-    let review_active = !counter_flags.is_empty()
-        && counter_flags.iter().any(|cf| {
-            current_epoch < cf.countered_at_epoch + REVIEW_PERIOD_EPOCHS
-        });
-
-    // 3. Score live review votes (an in-progress review). A review that has already
-    //    resolved is folded into `resolved_reviews` above; an overturn there zeroes
-    //    its reason-class in step 1 rather than being netted here.
-    let mut unique_reviewers: HashSet<PublicKey> = HashSet::new();
-    for vote in review_votes {
-        if !eligible_accounts.contains(&vote.reviewer) {
-            continue;
-        }
-
-        if !unique_reviewers.insert(vote.reviewer.clone()) {
-            continue;
-        }
-
-        let weight = 1.0;
-        match vote.verdict {
-            ReviewVerdict::UpholdFlag => weighted_uphold_score += weight,
-            ReviewVerdict::OverturnFlag => weighted_overturn_score += weight,
-        }
-    }
-
-    // 4. Compute net score. Overturned reason-classes contribute nothing because
-    //    their flags were excluded in step 1.
-    let net_score = weighted_flag_score + weighted_uphold_score - weighted_overturn_score;
-
-    PostModerationScore {
-        post_address: flags.first()
-            .map(|f| f.post_address.clone())
-            .unwrap_or(ContentAddress([0u8; 32])),
-        weighted_flag_score,
-        weighted_overturn_score,
-        weighted_uphold_score,
-        net_score,
-        flag_count: unique_flaggers.len() as u32,
-        counter_flag_count: counter_flags.len() as u32,
-        review_vote_count: unique_reviewers.len() as u32,
-        review_active,
-        reason_scores,
-        computed_at_epoch: current_epoch,
-    }
-}
-```
-
-### Score Examples
-
-| Scenario | Eligible Flaggers | Flag Score | Outcome (default policy, threshold=10.0) |
-|---|---|---|---|
-| 1 eligible user flags | 1 | 1.0 | Visible (below threshold) |
-| 10 eligible users flag | 10 | 10.0 | Hidden |
-| 3 eligible users flag | 3 | 3.0 | Visible (below threshold) |
-| 12 flags (Spam, cycle 0), review resolves **Overturned** (8 vs 3) | 12 | reason-class zeroed (cycle→1) → 0.0 | Visible (overturn nullifies the whole reason-class, not merely outweighs it) |
-| 15 flags (Spam, cycle 0), review resolves **Upheld** (5 vs 2) | 15 | 15.0 (cycle unchanged) | Hidden (upheld) |
-
-The overturn row shows the fix: an overturned reason-class advances its cycle, so its flags are permanently excluded from the net (not merely subtracted). A genuinely new problem filed after the overturn carries the new cycle (1) and is counted afresh; a late-arriving old-cycle flag is auto-excluded. The last (`resolved_reviews`) row is what feeds `aggregate_moderation_score`; live, unresolved reviews still tally `uphold − overturn` into the net.
-
-## Moderation Policy Abstraction (`policy.rs`)
-
-### The Trait
-
-```rust
-/// A moderation policy that an indexer applies to decide post visibility.
-/// Different indexers can implement different policies, giving users choice.
-pub trait ModerationPolicy: Send + Sync {
-    /// Decide whether a post should be visible given its moderation score.
-    fn should_hide(&self, score: &PostModerationScore) -> bool;
-
-    /// Decide whether a post should show a content warning instead of being hidden.
-    fn should_warn(&self, score: &PostModerationScore) -> bool;
-
-    /// Return human-readable description of this policy (for indexer metadata).
-    fn description(&self) -> &str;
-
-    /// Return the policy's unique identifier (for user preference storage).
-    fn policy_id(&self) -> &str;
-}
-```
-
-### Built-In Policies
-
-```rust
-/// Default moderation policy: moderate threshold, hides clearly flagged content.
-pub struct DefaultPolicy {
-    /// Net score above which content is hidden.
-    pub hide_threshold: f64,
-    /// Net score above which a content warning is shown (below hide threshold).
-    pub warn_threshold: f64,
-}
-
-impl Default for DefaultPolicy {
-    fn default() -> Self {
-        Self {
-            hide_threshold: 10.0,
-            warn_threshold: 5.0,
-        }
-    }
-}
-
-impl ModerationPolicy for DefaultPolicy {
-    fn should_hide(&self, score: &PostModerationScore) -> bool {
-        score.net_score >= self.hide_threshold
-    }
-
-    fn should_warn(&self, score: &PostModerationScore) -> bool {
-        score.net_score >= self.warn_threshold && score.net_score < self.hide_threshold
-    }
-
-    fn description(&self) -> &str {
-        "Default: hides content with net flag score >= 10.0, warns at >= 5.0"
-    }
-
-    fn policy_id(&self) -> &str {
-        "default-v1"
-    }
-}
-
-/// Strict moderation policy: lower thresholds, also applies reason-specific rules.
-pub struct StrictPolicy {
-    pub hide_threshold: f64,
-    pub warn_threshold: f64,
-    /// Reason-specific overrides: some reasons trigger hiding at lower thresholds.
-    pub reason_overrides: HashMap<FlagReason, f64>,
-}
-
-impl Default for StrictPolicy {
-    fn default() -> Self {
-        let mut overrides = HashMap::new();
-        overrides.insert(FlagReason::IllegalContent, 3.0);  // Very low threshold for illegal
-        overrides.insert(FlagReason::Violence, 5.0);
-
-        Self {
-            hide_threshold: 7.0,
-            warn_threshold: 3.0,
-            reason_overrides: overrides,
-        }
-    }
-}
-
-impl ModerationPolicy for StrictPolicy {
-    fn should_hide(&self, score: &PostModerationScore) -> bool {
-        // Check reason-specific overrides first
-        for (reason, threshold) in &self.reason_overrides {
-            if let Some(reason_score) = score.reason_scores.get(reason) {
-                if *reason_score >= *threshold {
-                    return true;
-                }
-            }
-        }
-        score.net_score >= self.hide_threshold
-    }
-
-    fn should_warn(&self, score: &PostModerationScore) -> bool {
-        score.net_score >= self.warn_threshold && !self.should_hide(score)
-    }
-
-    fn description(&self) -> &str {
-        "Strict: lower thresholds, reason-specific overrides for illegal/violent content"
-    }
-
-    fn policy_id(&self) -> &str {
-        "strict-v1"
-    }
-}
-
-/// Permissive moderation policy: only hides content with overwhelming consensus.
-pub struct PermissivePolicy {
-    pub hide_threshold: f64,
-}
-
-impl Default for PermissivePolicy {
-    fn default() -> Self {
-        Self {
-            hide_threshold: 25.0,
-        }
-    }
-}
-
-impl ModerationPolicy for PermissivePolicy {
-    fn should_hide(&self, score: &PostModerationScore) -> bool {
-        score.net_score >= self.hide_threshold
-    }
-
-    fn should_warn(&self, score: &PostModerationScore) -> bool {
-        score.net_score >= 10.0 && score.net_score < self.hide_threshold
-    }
-
-    fn description(&self) -> &str {
-        "Permissive: only hides content with net flag score >= 25.0"
-    }
-
-    fn policy_id(&self) -> &str {
-        "permissive-v1"
-    }
-}
-
-/// No moderation at all. Indexer serves everything.
-pub struct UnmoderatedPolicy;
-
-impl ModerationPolicy for UnmoderatedPolicy {
-    fn should_hide(&self, _score: &PostModerationScore) -> bool {
-        false
-    }
-
-    fn should_warn(&self, _score: &PostModerationScore) -> bool {
-        false
-    }
-
-    fn description(&self) -> &str {
-        "Unmoderated: no content is hidden or warned"
-    }
-
-    fn policy_id(&self) -> &str {
-        "unmoderated-v1"
-    }
-}
-```
-
-### Indexer Policy Selection
-
-Indexers advertise their policy in their public metadata. Users query the indexer's policy before subscribing:
-
-```rust
-/// Metadata an indexer publishes about its moderation stance.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct IndexerModerationMetadata {
-    /// The policy ID this indexer uses.
-    pub policy_id: String,
-    /// Human-readable description.
-    pub policy_description: String,
-    /// The numeric thresholds (for transparency).
-    pub hide_threshold: f64,
-    pub warn_threshold: f64,
-    /// Whether the indexer applies reason-specific overrides.
-    pub has_reason_overrides: bool,
-}
-```
-
-## Flagger Reputation Tracking (`reputation.rs`)
-
-### Flagger Record
-
-```rust
-/// Tracks a flagger's moderation history.
-/// Indexers maintain this locally; the underlying data (flags, reviews) is all
-/// public signed objects served by indexers.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FlaggerRecord {
-    pub flagger: PublicKey,
-
-    /// Total flags submitted by this user.
-    pub total_flags: u64,
-
-    /// Flags upheld by a resolved community review. Uncontested flags are never
-    /// counted here — they do not affect accuracy at all.
-    pub upheld_flags: u64,
-
-    /// Flags that were overturned by community review.
-    pub overturned_flags: u64,
-
-    /// Flags currently under review.
-    pub pending_review_flags: u64,
-
-    /// Computed accuracy rate: upheld / (upheld + overturned) over RESOLVED reviews
-    /// only. Uncontested flags never enter this ratio, which prevents a predator
-    /// from farming a high accuracy score by mass-flagging content no one contests.
-    pub accuracy_rate: f64,
-}
-```
-
-### Reputation Tracking
-
-```rust
-/// Threshold: if a flagger's accuracy drops below this, their future flags
-/// are ignored by indexers.
-pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
-
-/// Determine if a flagger should be trusted based on their track record.
-pub fn is_flagger_trusted(record: &FlaggerRecord) -> bool {
-    // New flaggers (< 3 flags) are trusted by default
-    if record.total_flags < 3 {
-        return true;
-    }
-    record.accuracy_rate >= MIN_FLAGGER_ACCURACY
-}
-
-/// Update a flagger's record after a review concludes.
-pub fn update_flagger_record(
-    record: &mut FlaggerRecord,
-    outcome: ReviewOutcome,
-) {
-    match outcome {
-        ReviewOutcome::Upheld => {
-            record.upheld_flags += 1;
-        }
-        ReviewOutcome::Overturned => {
-            record.overturned_flags += 1;
-        }
-    }
-
-    let total_resolved = record.upheld_flags + record.overturned_flags;
-    if total_resolved > 0 {
-        record.accuracy_rate = record.upheld_flags as f64 / total_resolved as f64;
-    }
-}
-
-/// The outcome of a review for a specific flag.
-pub enum ReviewOutcome {
-    /// The flag was correct.
-    Upheld,
-    /// The flag was overturned; the flagger loses credibility (no economic penalty).
-    Overturned,
-}
-```
-
-Bad flaggers (those with low accuracy) have their flags ignored by indexers -- no economic penalty, just credibility loss. Once a flagger's accuracy drops below `MIN_FLAGGER_ACCURACY`, their flags are effectively invisible to the moderation system. Only RESOLVED reviews move the ratio: an uncontested flag never counts as upheld, so a predator cannot farm a high accuracy score by mass-flagging content nobody bothers to contest (which would otherwise let them build a spotless record and then flag a real target with disproportionate weight).
-
-## Broader Community Review (`review.rs`)
-
-### Review Lifecycle
-
-```rust
-/// Configuration constants for the review process.
-pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
-pub const MIN_REVIEW_VOTES: u32 = 5;   // Minimum votes for a decisive review
-
-/// State machine for a review triggered by a counter-flag.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ReviewState {
-    /// Review is active; votes are being collected.
-    Active {
-        counter_flag_ref: ContentAddress,
-        started_at_epoch: u64,
-        votes_uphold: Vec<PublicKey>,
-        votes_overturn: Vec<PublicKey>,
-    },
-    /// Review period ended; outcome decided.
-    Resolved {
-        outcome: ResolvedOutcome,
-        resolved_at_epoch: u64,
-    },
-    /// Not enough votes were cast; flag remains in its pre-review state.
-    Inconclusive {
-        ended_at_epoch: u64,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ResolvedOutcome {
-    /// Community upheld the flag.
-    FlagUpheld {
-        uphold_count: u32,
-        overturn_count: u32,
-    },
-    /// Community overturned the flag.
-    FlagOverturned {
-        uphold_count: u32,
-        overturn_count: u32,
-    },
-}
-```
-
-### Review Resolution Logic
-
-```rust
-/// Resolve a review after the review period has elapsed.
-///
-/// Beyond the `MIN_REVIEW_VOTES` quorum, the WINNING side's voters must span at
-/// least `MIN_REVIEW_FAMILIES` distinct lineage families (reuses `lineage_family`
-/// from 05-invitation.md) — otherwise the outcome is Inconclusive. Ties resolve
-/// Upheld (existing rule), so on a tie the winning side is the uphold voters and
-/// the family requirement applies to them. This stops a single lineage family
-/// from swinging a review on its own.
-pub fn resolve_review(
-    counter_flag: &CounterFlag,
-    review_votes: &[ReviewVote],
-    eligible_accounts: &HashSet<PublicKey>,
-    tree: &HashMap<PublicKey, PublicKey>, // invitation tree, for lineage_family
-    current_epoch: u64,
-) -> Result<ReviewState, ModerationError> {
-    // Must be past review period
-    if current_epoch < counter_flag.countered_at_epoch + REVIEW_PERIOD_EPOCHS {
-        return Err(ModerationError::ReviewPeriodNotOver);
-    }
-
-    let mut uphold_count = 0_u32;
-    let mut overturn_count = 0_u32;
-    let mut votes_uphold = Vec::new();
-    let mut votes_overturn = Vec::new();
-    let mut unique_voters: HashSet<PublicKey> = HashSet::new();
-
-    for vote in review_votes {
-        if !eligible_accounts.contains(&vote.reviewer) {
-            continue;
-        }
-        if !unique_voters.insert(vote.reviewer.clone()) {
-            continue;
-        }
-
-        match vote.verdict {
-            ReviewVerdict::UpholdFlag => {
-                uphold_count += 1;
-                votes_uphold.push(vote.reviewer.clone());
-            }
-            ReviewVerdict::OverturnFlag => {
-                overturn_count += 1;
-                votes_overturn.push(vote.reviewer.clone());
-            }
-        }
-    }
-
-    // Not enough votes for a decisive outcome
-    if unique_voters.len() < MIN_REVIEW_VOTES as usize {
-        return Ok(ReviewState::Inconclusive {
-            ended_at_epoch: current_epoch,
-        });
-    }
-
-    // Determine the winning side. Ties (overturn == uphold) resolve Upheld, so the
-    // uphold voters are the winning side and the family check applies to them.
-    let overturned = overturn_count > uphold_count;
-    let winning_side = if overturned { &votes_overturn } else { &votes_uphold };
-
-    // The winning coalition must span >= MIN_REVIEW_FAMILIES distinct lineage
-    // families; else the review is Inconclusive (one family cannot decide it alone).
-    let winning_families: HashSet<PublicKey> = winning_side
-        .iter()
-        .map(|voter| lineage_family(voter, tree).unwrap_or(*voter))
-        .collect();
-    if winning_families.len() < MIN_REVIEW_FAMILIES as usize {
-        return Ok(ReviewState::Inconclusive {
-            ended_at_epoch: current_epoch,
-        });
-    }
-
-    if overturned {
-        Ok(ReviewState::Resolved {
-            outcome: ResolvedOutcome::FlagOverturned {
-                uphold_count,
-                overturn_count,
-            },
-            resolved_at_epoch: current_epoch,
-        })
-    } else {
-        Ok(ReviewState::Resolved {
-            outcome: ResolvedOutcome::FlagUpheld {
-                uphold_count,
-                overturn_count,
-            },
-            resolved_at_epoch: current_epoch,
-        })
-    }
-}
-```
-
-## Object-ID Derivation for Flags
-
-Each flag, counter-flag, and review vote is a separate signed object addressed by a
-deterministic object id. The id (not a derived key — there are no child keys) enforces
-one-action-per-actor; authenticity comes from the single identity-key signature over
-the object:
-1. One flag per flagger per (post, reason, cycle) — deterministic id from flagger + post + reason + cycle.
-2. One counter-flag per author per flag — deterministic id from author + flag reference.
-3. One review vote per reviewer per review — deterministic id from reviewer + counter-flag reference.
-
-```rust
-/// Object id for a content flag. Including `reason` and `cycle` lets an author be
-/// flagged afresh under a new reason-class cycle after a prior overturn, while a
-/// duplicate (same flagger, post, reason, cycle) collides to the same id.
-/// `cycle` = the number of OVERTURN resolutions for (post_address, reason) at flag time.
-pub fn flag_object_id(
-    root_pk: &PublicKey,
-    post_address: &ContentAddress,
-    reason: FlagReason,
-    cycle: u32,
-) -> ContentAddress {
-    let bytes = [
-        root_pk.as_bytes(),
-        b"flag",
-        post_address.0.as_slice(),
-        &[reason as u8],
-        &cycle.to_le_bytes(),
-    ]
-    .concat();
-    ContentAddress(hash_blake3(&bytes))
-}
-
-/// Object id for a counter-flag: hash(root_pk || "counter-flag" || flag_ref).
-pub fn counter_flag_object_id(
-    root_pk: &PublicKey,
-    flag_ref: &ContentAddress,
-) -> ContentAddress {
-    let bytes = [root_pk.as_bytes(), b"counter-flag", flag_ref.0.as_slice()].concat();
-    ContentAddress(hash_blake3(&bytes))
-}
-
-/// Object id for a review vote: hash(root_pk || "review-vote" || counter_flag_ref).
-pub fn review_vote_object_id(
-    root_pk: &PublicKey,
-    counter_flag_ref: &ContentAddress,
-) -> ContentAddress {
-    let bytes = [root_pk.as_bytes(), b"review-vote", counter_flag_ref.0.as_slice()].concat();
-    ContentAddress(hash_blake3(&bytes))
-}
-```
-
-## Constants
-
-```rust
-/// Minimum account age (in epochs) required to flag or review.
-pub const MIN_ACCOUNT_AGE_EPOCHS: u64 = 2;
-
-/// Minimum number of donations required to flag or review.
-pub const MIN_DONATION_COUNT: u64 = 5;
-
-/// Minimum size of each qualifying donation (in atomic Y) counted toward
-/// MIN_DONATION_COUNT; tunable.
-pub const MIN_ELIGIBLE_DONATION: u64 = 1_000_000; // 1 Y (6 decimals)
-
-/// Number of epochs a review remains open for voting.
-pub const REVIEW_PERIOD_EPOCHS: u64 = 2;
-
-/// Minimum number of unique review voters for a decisive outcome.
-pub const MIN_REVIEW_VOTES: u32 = 5;
-
-/// Minimum number of distinct lineage families the WINNING side of a review must
-/// span for a decisive outcome; otherwise the review is Inconclusive (tunable).
-pub const MIN_REVIEW_FAMILIES: u32 = 3;
-
-/// Flagger accuracy below which future flags are ignored.
-pub const MIN_FLAGGER_ACCURACY: f64 = 0.5;
-
-/// Maximum length of flag explanation text (characters).
-pub const MAX_EXPLANATION_CHARS: usize = 512;
-```
-
-## Validation Rules
-
-### Flag Validation
-
-```rust
-/// Validate a content flag before accepting it.
-pub fn validate_flag(
-    flag: &ContentFlag,
-    eligible_accounts: &HashSet<PublicKey>,
-) -> Result<(), ModerationError> {
-    // 1. Signature must verify
-    if !flag.verify_signature() {
-        return Err(ModerationError::InvalidSignature);
-    }
-
-    // 2. Flagger must be eligible
-    if !eligible_accounts.contains(&flag.flagger) {
-        return Err(ModerationError::NotEligible {
-            reason: "flagger is not eligible (must be invited, have sufficient account age, and sufficient donations)".to_string(),
-        });
-    }
-
-    // 3. Cannot flag own content
-    if flag.flagger == flag.post_author {
-        return Err(ModerationError::CannotFlagOwnContent);
-    }
-
-    Ok(())
-}
-```
-
-### Counter-Flag Validation
-
-```rust
-/// Validate a counter-flag.
-pub fn validate_counter_flag(
-    counter_flag: &CounterFlag,
-    original_flag: &ContentFlag,
-) -> Result<(), ModerationError> {
-    // 1. Signature must verify
-    if !counter_flag.verify_signature() {
-        return Err(ModerationError::InvalidSignature);
-    }
-
-    // 2. Contester must be the flagged post's author
-    if counter_flag.contester != original_flag.post_author {
-        return Err(ModerationError::NotPostAuthor);
-    }
-
-    // 3. Must reference the correct flag
-    if counter_flag.original_flagger != original_flag.flagger {
-        return Err(ModerationError::FlagReferenceMismatch);
-    }
-
-    // 4. Post addresses must match
-    if counter_flag.post_address != original_flag.post_address {
-        return Err(ModerationError::PostAddressMismatch);
-    }
-
-    Ok(())
-}
-```
-
-## Error Types (`error.rs`)
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum ModerationError {
-    #[error("invalid signature on moderation action")]
-    InvalidSignature,
-
-    #[error("not eligible: {reason}")]
-    NotEligible { reason: String },
-
-    #[error("cannot flag own content")]
-    CannotFlagOwnContent,
-
-    #[error("not the post author: only the post author can counter-flag")]
-    NotPostAuthor,
-
-    #[error("flag reference mismatch")]
-    FlagReferenceMismatch,
-
-    #[error("post address mismatch between flag and counter-flag")]
-    PostAddressMismatch,
-
-    #[error("review period not yet over")]
-    ReviewPeriodNotOver,
-
-    #[error("already flagged this post")]
-    AlreadyFlagged,
-
-    #[error("already voted on this review")]
-    AlreadyVoted,
-
-    #[error("flag not found: {0:?}")]
-    FlagNotFound(ContentAddress),
-
-    #[error("counter-flag not found: {0:?}")]
-    CounterFlagNotFound(ContentAddress),
-
-    #[error("explanation too long: {size} chars, max {max}")]
-    ExplanationTooLong { size: usize, max: usize },
-
-    #[error("flagger accuracy too low: {accuracy:.2}, minimum {minimum:.2}")]
-    FlaggerAccuracyTooLow { accuracy: f64, minimum: f64 },
-
-    #[error("invalid flag sequence: expected > {expected}, got {actual}")]
-    InvalidSequence { expected: u64, actual: u64 },
-
-    #[error("data layer error: {0}")]
-    Data(#[from] DataError),
-
-    #[error("serialization error: {0}")]
-    Serialization(String),
-}
-```
-
-## Anti-Gaming Analysis
-
-### Flag Spam from Bots
-
-Bots cannot meet eligibility requirements: they lack on-chain invitations, have no account age, and have zero donations. Even if a bot obtains an invitation, it must wait `MIN_ACCOUNT_AGE_EPOCHS` epochs and make `MIN_DONATION_COUNT` donations of at least `MIN_ELIGIBLE_DONATION` each to recipients with pairwise weight ≥ 0.5 outside its own subtree before it can flag -- dust donations and donations to self-created sockpuppets don't count, so the size and targeting requirement is a meaningful cost that deters automated spam.
-
-### Coordinated Flag Brigading
-
-A group conspires to flag legitimate content:
-- Each eligible flagger contributes exactly 1.0, so the damage is proportional to headcount.
-- The author counter-flags, triggering review.
-- Independent reviewers (not part of the brigade) vote to overturn.
-- Every brigade member who flagged loses accuracy, and once accuracy drops below `MIN_FLAGGER_ACCURACY`, their future flags are ignored entirely.
-- All flags are public and auditable, so brigading patterns are visible.
-- The eligibility threshold (invitations + account age + donations) makes it expensive to create many sockpuppet accounts for brigading.
-
-### Retaliatory Flagging
-
-A user flags someone's content out of personal grudge:
-- A single flagger contributes weight 1.0, which alone cannot reach the hide threshold (depending on indexer policy).
-- The author counter-flags, and community review corrects the injustice.
-- The retaliatory flagger loses accuracy, weakening future flags.
-
-### Flag-to-Harass
-
-A user repeatedly flags a target's content:
-- Each overturn costs the flagger accuracy.
-- After accuracy drops below `MIN_FLAGGER_ACCURACY`, the flagger's future flags are ignored entirely.
-- The flagger effectively silences themselves, not their target.
-
-### Indexer Collusion
-
-A malicious indexer sets a hide threshold of 0 (hiding everything):
-- Users can simply switch to a different indexer.
-- The indexer's policy is publicly advertised; users can evaluate before subscribing.
-- Competing indexers have an economic incentive to offer fair moderation.
-
-## Integration with Other Crates
-
-### `dsn-core`
-
-- Uses `PublicKey`, `SecretKey`, `Signature`, `ContentAddress` for identity and addressing.
-- Uses `Post` type for looking up flagged content metadata.
-
-### `dsn-data`
-
-- Uses `GraphStore` trait to read/write flag, counter-flag, and review vote signed objects.
-- Uses `ContentStore` to store flag explanations.
-
-### `dsn-indexer`
-
-- The indexer calls `aggregate_moderation_score()` during its ingest/aggregation.
-- The indexer computes the set of eligible accounts from on-chain data (invitation records, account creation epochs, donation counts) and passes it to the aggregation functions.
-- Applies its configured `ModerationPolicy` to decide visibility.
-- Maintains `FlaggerRecord` locally for reputation tracking.
+### Validation
+
+- `label` matches `^[a-z0-9-]{1,64}$`.
+- `target` is a well-formed content address.
+- `signature` verifies per the validity rule (01) — any non-revoked key in the
+  author's registry history; revoked-key labels need a pre-revocation proof
+  like every other object (07, ingest).
+- Anyone may label anything, including their own content — there are no
+  eligibility gates, because weighting is the consumer's job, not the
+  protocol's. Labeling your own post `dispute` is the rebuttal convention.
+
+### Uniqueness (an indexing rule, not an addressing rule)
+
+A Label is content-addressed like any object (its address is the hash of its
+bytes). Indexers additionally keep **one label per `(author, target, label)`**:
+the first-seen object wins, and a duplicate triple with different bytes
+resolves deterministically by lowest object hash — the same tiebreak 02 uses
+for same-version mutable records. Republishing a label is idempotent.
+
+### Retraction
+
+A signed retract tombstone (02, Privacy & Data Lifecycle) against one's own
+label withdraws it; compliant indexers drop it from their label sets. The same
+honesty caveat applies: a retract is a convention, not consensus.
+
+### Well-Known Label Values (convention)
+
+| Label | Meaning |
+|---|---|
+| `spam` | Unsolicited commercial content, bot-generated spam |
+| `harassment` | Targeted abuse, threats, or doxxing |
+| `violence` | Content depicting or promoting violence |
+| `illegal` | Content illegal in most jurisdictions (e.g., CSAM) |
+| `nsfw` | Nudity or explicit material (not inherently rule-breaking) |
+| `dispute` | The author's (or anyone's) rebuttal of other labels on the target |
+
+The namespace is open: indexers and communities can mint labels (`ai-generated`,
+`satire`, `unverified-claim`, …) without a protocol change, and unrecognized
+labels are simply ignored by consumers that don't understand them. There is no
+truth category by design — truth-by-plebiscite invites brigading; disputes over
+accuracy are label vocabularies and client filters, not protocol state.
+
+## Consuming Labels (client/indexer policy, non-normative)
+
+Everything in this section is a convention layered on the public label record.
+Different indexers and clients will do it differently; that is the design.
+
+- **Indexer defaults.** An indexer MAY compute a visibility verdict per post
+  (e.g., `Clean` / `Warned` / `Hidden`) from labels under its own thresholds
+  and weighting, advertise the policy, and apply it to the feeds it serves
+  (07). This is an indexer-local convenience — primarily for thin clients —
+  not a protocol verdict. Users who disagree switch indexers.
+- **Client-side filtering.** The stronger path mirrors 09: a client weights the
+  public labels itself — for example by the labeler's proximity in the user's
+  follow graph or invitation lineage, by an explicit trust list of labelers, or
+  by any published "moderation ranker" installed like a feed ranker. A brigade
+  of strangers has approximately zero weight in a graph-proximity filter, which
+  handles coordinated flagging better than any global quorum can.
+- **Labeler reputation.** The full label history of every author is public, so
+  any consumer can compute its own reputation view (e.g., "how often do I end
+  up agreeing with this labeler?"). Reputation is a derived, local view — never
+  protocol state.
+- **Auditability.** Because labels are public signed objects and indexer
+  policies are advertised, anyone can compare what an indexer hides against
+  the public label record. Censorship beyond the advertised policy is
+  detectable with evidence, the same cross-indexer verification 07 relies on.
+
+## Host Policy (retained, out of protocol)
+
+Indexers, media hosts, and mirrors MAY apply ingest-time hash blocklists (for
+example, published CSAM hash lists), declining to store or serve matching
+bytes — hosts carry legal responsibility for what they serve regardless of
+what this spec says. This is edge policy at each host's discretion, not
+protocol-level deletion (07, Configuration). Operator-level blocked-user and
+blocked-post lists are likewise indexer-local configuration.
+
+## What Was Removed, and Why
+
+Earlier revisions of this document specified eligibility gates (invitation +
+account age + donation history), uniform-weight flag aggregation, counter-flag
+objects, community review votes with quorums and lineage-family spans,
+overturn cycles, and flagger accuracy scores. All of it is deleted, for three
+reasons stated honestly:
+
+1. **It was consensus where none is needed.** Each indexer already chose its
+   own policy, so the "global" verdict was a fiction; and the viewer is the
+   only consumer of a visibility decision, so per-viewer weighting is both
+   sufficient and more faithful to what moderation is.
+2. **The machinery was attack surface.** Quorum-gated reviews failed toward
+   the flaggers (a brigade wins whenever reviewers don't assemble), and every
+   gate, cycle, and accuracy rule was a parameter to game.
+3. **Simplicity.** One object type replaces five, and the `dsn-moderation`
+   crate disappears — the Label type lives in `dsn-core`, and consumption is
+   ordinary indexer/client code.
+
+Trade-off owned: thin clients that rely on an indexer's defaults get that
+indexer's judgment — the same trust they already extend for feed completeness,
+and equally auditable.
+
+## Integration
+
+- **`dsn-core`** — defines `Label` (`label.rs`), validated like every signed
+  object.
+- **`dsn-data` / storage** — labels are ordinary immutable signed objects; no
+  dedicated store. GraphStore remains for reply threading only.
+- **`dsn-indexer`** — ingests labels via publish/stream like any object,
+  maintains a `labels (author, target, label)` index, serves
+  `GET /api/v1/labels/:post_address` (raw labels plus this indexer's own
+  non-normative visibility verdict), and applies its advertised defaults to
+  the feeds it builds (07).
+- **`dsn-cli`** — `dsn label add <post> <label>`, `dsn label list <post>` (08).

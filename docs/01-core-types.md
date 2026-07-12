@@ -9,7 +9,8 @@ crates/core/src/
 ├── post.rs             # Post, reply, thread types
 ├── profile.rs          # User profile
 ├── social.rs           # Follow list, feed index
-├── token.rs            # Bond, Donation, NameRecord (on-chain types)
+├── label.rs            # Content label (canonical spec: 06)
+├── token.rs            # Donation, NameRecord (on-chain types)
 ├── epoch.rs            # Block-based epoch definitions, emission schedule
 ├── chain_events.rs     # ChainEvent enum (smart contract events)
 ├── crypto.rs           # Hashing, signing helpers
@@ -71,7 +72,7 @@ sign. A handle is a convenience layer, never an identity:
 - The on-chain registry keeps queryable ownership history, so a client can render "formerly @x" and warn when a handle recently changed hands. Handles are rented, so a handle pointing at an identity today is no guarantee it did yesterday.
 
 **IdentityId convention (binding).** Wherever protocol data references a user — the
-invitation tree, donation tuples, flags, handle ownership, API `:user_pk` params, CLI
+invitation tree, donation tuples, labels, handle ownership, API `:user_pk` params, CLI
 output — the value is the **`IdentityId`** (the genesis key), never a current signing
 key. Because `IdentityId` IS a `PublicKey`, every existing `PublicKey`-typed reference
 is already correct; the current signing key is consulted only to verify a signature,
@@ -136,7 +137,7 @@ irrelevant to validity — a proactively rotated key stays valid, past and futur
 compromised and emits `KeyRevoked { identity, key, block }`. An object signed by a
 revoked key is valid iff it is proven to predate the revoking transaction's `block` —
 either by an anchor Merkle branch (doc 12's timestamp anchoring) or by an on-chain
-reference (a donation or bond pointing at it) — an objective, on-chain boundary. New
+reference (a donation pointing at it) — an objective, on-chain boundary. New
 ingests of revoked-key objects without such a proof are rejected; a not-yet-anchored
 object is marked unproven until the next anchor interval. `claimed_epoch` is display
 metadata only and **never** enters validity. (Ingest + anchoring mechanics: 07.)
@@ -240,15 +241,16 @@ pub struct Post {
     /// Optional: address of parent post (makes this a reply).
     pub reply_to: Option<ContentAddress>,
 
+    /// Optional: address of a post being reposted or quoted. MUST NOT be set
+    /// together with `reply_to`. Empty `content` makes this a pure repost; non-empty
+    /// `content` makes it a quote post.
+    pub repost_of: Option<ContentAddress>,
+
     /// Monotonic counter per author (prevents replay).
     pub sequence: u64,
 
     /// Timestamp (informational, not trusted for protocol logic).
     pub created_at: chrono::DateTime<chrono::Utc>,
-
-    /// The amount of Y the author bonds on this post at creation time.
-    /// This is the mandatory first bond — recorded on-chain via a Bond transaction.
-    pub initial_bond_amount: u64,
 
     /// IdentityIds mentioned in the post. Clients resolve @handles to keys at
     /// write time and embed the keys here; handles are never stored structurally.
@@ -295,8 +297,8 @@ impl Post {
         claimed_epoch: u64,
         content: String,
         reply_to: Option<ContentAddress>,
+        repost_of: Option<ContentAddress>,
         sequence: u64,
-        initial_bond_amount: u64,
         mentions: Vec<IdentityId>,
         media: Vec<MediaRef>,
         freshness_anchor: Option<[u8; 32]>,
@@ -309,8 +311,8 @@ impl Post {
     pub fn content_address(&self) -> ContentAddress;
 
     /// The bytes that are signed: all fields except `signature`, including
-    /// `author`, `claimed_epoch`, `sequence`, `mentions`, `media`, and
-    /// `freshness_anchor`.
+    /// `author`, `claimed_epoch`, `sequence`, `repost_of`, `mentions`, `media`,
+    /// and `freshness_anchor`.
     pub fn signable_bytes(&self) -> Vec<u8>;
 }
 ```
@@ -321,7 +323,8 @@ impl Post {
 - `signature` must verify against `signable_bytes()` using the key current for `author`'s IdentityId in the registry (per the validity rule); a revoked signing key requires a pre-revocation anchor/on-chain proof
 - `sequence` must be strictly greater than the author's last known sequence
 - `reply_to`, if present, must reference an existing post
-- `initial_bond_amount > 0` (every post must have a non-zero creator bond)
+- `reply_to` and `repost_of` MUST NOT both be set (a post is a reply or a repost/quote, not both)
+- `repost_of`, if present, must reference an existing post; empty `content` makes it a pure repost, non-empty `content` a quote post
 - `mentions` may reference any `IdentityId`; an identity with no known handle at render time displays as raw hex
 - each `MediaRef.hash` must be a well-formed content address; fetched media bytes must hash to it
 
@@ -382,23 +385,6 @@ pub struct FeedIndex {
 All token operations happen on-chain via smart contracts. These types represent the on-chain data structures that the smart contract manages. Token Y is the sole token — there is no separate reputation token.
 
 ```rust
-/// A bond placed on a post (on-chain).
-/// Bonds are the primary curation signal. Bonding Y on a post signals
-/// belief in its quality. A fraction of each bond is taken as a protocol fee and
-/// recycled to the Reward Pool; tokens are never destroyed. The mandatory first
-/// bond is paid entirely into the Reward Pool (see 03 §C).
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Bond {
-    /// The user placing the bond.
-    pub bonder: PublicKey,
-    /// Content hash of the post being bonded on.
-    pub post_content_hash: ContentAddress,
-    /// Amount of Y bonded.
-    pub amount: u64,
-    /// True if this is the mandatory creator bond (first bond on the post).
-    pub is_first_bond: bool,
-}
-
 /// A donation to a post's creator (on-chain).
 /// Donations transfer Y to the creator, with a fraction taken as a protocol fee
 /// and recycled to the Reward Pool.
@@ -475,12 +461,6 @@ ever escapes fee-free; **payouts and the pool drip round down**.
 
 ### Validation Rules
 
-**Bond:**
-- `amount > 0`
-- If `is_first_bond == true`, `bonder` must be the post author
-- A post must have exactly one first bond (the creator bond)
-- `bonder` must have sufficient Y balance on-chain
-
 **Donation:**
 - `amount >= MIN_DONATION` (smaller donations are invalid — no fee-free dust)
 - `fee_amount + creator_amount == amount`
@@ -507,20 +487,22 @@ Epochs are block-based: the smart contract advances the epoch after a fixed numb
 
 ```rust
 /// Configuration constants for epoch mechanics (on-chain, set at contract deployment).
-/// Changes only through governance or contract migration.
+/// Parameters are fixed at deployment; changing them requires a new deployment and
+/// opt-in migration by users and indexers (see 00, Parameter Immutability & Upgrades).
 pub struct EpochConfig {
     /// Number of blockchain blocks per epoch.
     pub epoch_duration_blocks: u64,
-    /// Bond fee, recycled to the Reward Pool (basis points, e.g., 1000 = 10%). (tunable)
-    pub bond_fee_bps: u64,
     /// Donation fee, recycled to the Reward Pool (basis points, e.g., 500 = 5%). (tunable)
     pub donation_fee_bps: u64,
     /// Minimum valid donation (atomic Y, e.g., 10_000 = 0.01 Y). (tunable)
     pub min_donation: u64,
     /// Y cost to issue an invitation; the fee is recycled to the Reward Pool. (tunable)
     pub invitation_cost_y: u64,
-    /// Maximum percentage of epoch emission any single creator can receive (basis points). (tunable)
-    pub per_creator_emission_cap_bps: u64,
+    /// Cap on a creator's per-epoch emission, as a fraction of that creator's raw
+    /// weighted donation sum for the epoch (basis points, e.g., 400 = 4%). Deployment
+    /// invariant: `emission_match_cap_bps < donation_fee_bps`, so any closed
+    /// wash-donation coalition is net-negative (see 03 §C). (tunable)
+    pub emission_match_cap_bps: u64,
     /// Fraction of the Reward Pool balance dripped into creator emission each epoch
     /// (basis points, e.g., 200 = 2%). (tunable)
     pub reward_pool_drip_bps: u64,
@@ -542,12 +524,6 @@ pub struct EpochConfig {
     /// To cancel a force-buy, the owner must raise V to at least (100% + this) of the bid
     /// (basis points, e.g., 1000 = raise to ≥ 110% of the bid). (tunable)
     pub raise_premium_bps: u64,
-    /// Referral annuity: share of an invitee's protocol fees routed to their direct
-    /// inviter (depth 1) during `referral_term_epochs`, taken before the remainder
-    /// reaches the Reward Pool (basis points). (tunable)
-    pub referral_bps: u64,               // REFERRAL_BPS = 1000  (10%)
-    /// Epochs after an invitee joins during which the referral annuity applies. (tunable)
-    pub referral_term_epochs: u64,       // REFERRAL_TERM_EPOCHS = 208  (~4y)
     /// Share of the gross pool drip routed to the Treasury each epoch, until
     /// `treasury_term_epochs` (basis points). (tunable)
     pub treasury_drip_share_bps: u64,    // TREASURY_DRIP_SHARE_BPS = 1500  (15%)
@@ -603,13 +579,13 @@ impl EmissionSchedule {
 **Epoch-0 genesis bootstrap:** at launch nobody holds Y, so there are no donations
 to direct emission. Epoch 0's scheduled emission (1.4B Y) is instead split equally
 among the deployer-seeded genesis accounts. From epoch 1 onward, distribution is
-donation-directed (see 03 §D).
+donation-directed (see 03 §C).
 
 **Per-epoch total and remainders:** the amount distributed to creators in an epoch is
 `emission_for_epoch(epoch) + creator_drip`, where `gross_drip = pool_balance × drip_bps`,
 `treasury_slice` is skimmed from it (03, A2), and `creator_drip = gross_drip − treasury_slice`.
 Any scheduled emission or `creator_drip` left undistributed (zero qualifying donations,
-or per-creator caps binding) accrues to the Reward Pool rather than being lost.
+or the emission match cap binding — see 03 §C) accrues to the Reward Pool rather than being lost.
 
 ## Chain Events (`chain_events.rs`)
 
@@ -619,10 +595,6 @@ Events emitted by the smart contracts, consumed by the off-chain indexer. These 
 /// Events emitted by smart contracts, consumed by the indexer.
 /// This enum is CANONICAL: the indexer's listener (07) mirrors these variant names
 /// and payload fields exactly.
-///
-/// Referral cut: every fee-bearing variant carries `referral_to` (the payer's direct
-/// inviter, if the payer is within their `referral_term_epochs`) and `referral_amount`
-/// (split off before the pool deposit; 0 if none). See 05.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ChainEvent {
     /// A Y token transfer between two accounts.
@@ -631,21 +603,11 @@ pub enum ChainEvent {
         to: PublicKey,
         amount: u64,
     },
-    /// A bond placed on a post.
-    Bond {
-        bonder: PublicKey,
-        post_hash: ContentAddress,
-        amount: u64,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
-    },
     /// A donation made to a post's creator.
     Donation {
         donor: PublicKey,
         post_hash: ContentAddress,
         amount: u64,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
     },
     /// A handle claimed (previously unowned) on-chain.
     NameClaimed {
@@ -667,8 +629,6 @@ pub enum ChainEvent {
         payer: PublicKey,
         amount: u64,
         paid_through_epoch: u64,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
     },
     /// A force-buy bid opened on a Harberger-tier handle (bid escrowed; 1% fee → pool).
     ForceBuyInitiated {
@@ -676,17 +636,13 @@ pub enum ChainEvent {
         bidder: PublicKey,
         bid: u64,
         deadline_epoch: u64,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
     },
     /// A handle changed owner (claim after a lapse, or a completed force-buy;
-    /// any floor-excess fee flows to the pool net of the referral cut).
+    /// any floor-excess fee flows to the pool).
     NameTransferred {
         handle: String,
         from: PublicKey,
         to: PublicKey,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
     },
     /// A handle lapsed to unowned after the grace period without rent.
     NameLapsed {
@@ -694,19 +650,15 @@ pub enum ChainEvent {
         prior_owner: PublicKey,
         epoch: u64,
     },
-    /// An invitation issued on-chain. Also opens a depth-1 referral annuity from the
-    /// invitee to this inviter (see 05). `referral_*` here is the cut on the invite
-    /// fee the INVITER pays, routed to THEIR own inviter if in-term.
+    /// An invitation issued on-chain.
     Invitation {
         inviter: PublicKey,
         invitee: PublicKey,
         cost: u64,
-        referral_to: Option<IdentityId>,
-        referral_amount: u64,
     },
-    /// The epoch counter advanced. Fee portions (net of referral cuts) of bonds,
-    /// donations, invitations, handle rent, and force-buy fees flow into the Reward
-    /// Pool. The drip is then split: `gross_drip = pool_balance × drip_bps`,
+    /// The epoch counter advanced. Fee portions of donations, invitations, handle
+    /// rent, and force-buy fees flow into the Reward Pool. The drip is then split:
+    /// `gross_drip = pool_balance × drip_bps`,
     /// `treasury_slice = floor(gross_drip × TREASURY_DRIP_SHARE_BPS / 10_000)`
     /// (0 after TREASURY_TERM_EPOCHS), `creator_drip = gross_drip − treasury_slice`.
     EpochAdvanced {
@@ -869,10 +821,9 @@ pub const SIGNATURE_SIZE: usize = 64;    // ed25519
 pub const CONTENT_ADDRESS_SIZE: usize = 32;
 pub const ED25519_SCHEME_ID: u8 = 1;     // scheme_id 1 = ed25519
 
-// Referral annuity, Treasury, and recovery constants — canonical values, mirrored
+// Emission match cap, Treasury, and recovery constants — canonical values, mirrored
 // wherever restated (all tunable). See EpochConfig above.
-pub const REFERRAL_BPS: u64 = 1000;             // 10% of an invitee's protocol fees → direct inviter (depth 1)
-pub const REFERRAL_TERM_EPOCHS: u64 = 208;      // ~4y per invitee
+pub const EMISSION_MATCH_CAP_BPS: u64 = 400;    // 4% of a creator's raw weighted donation sum; invariant: EMISSION_MATCH_CAP_BPS < DONATION_FEE_BPS
 pub const TREASURY_DRIP_SHARE_BPS: u64 = 1500;  // 15% of the pool drip → Treasury
 pub const TREASURY_TERM_EPOCHS: u64 = 260;      // ~5y; then 100% of drip to creators
 pub const TREASURY_RECLAIM_EPOCH: u64 = 416;    // ~8y; unspent treasury auto-returns to pool

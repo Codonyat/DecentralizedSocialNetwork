@@ -12,7 +12,7 @@ Twitter-style architecture (candidate sources → heavy ranker) cut along decent
 
 | Stage | Where | Trust requirement |
 |---|---|---|
-| Money (donations, bonds, rent, emission) | On-chain | Consensus |
+| Money (donations, rent, emission) | On-chain | Consensus |
 | Candidate generation (recall) | Indexers | Verifiable, market-paid (07-indexer.md) |
 | Ranking (precision) | User's device | None — user-owned |
 
@@ -27,8 +27,11 @@ Twitter-style architecture (candidate sources → heavy ranker) cut along decent
 Ranking quality does not require a large model to beat chronological. The reference client ships a small feature-based scorer over, per candidate:
 
 - recency (exponential decay)
-- source (follows / lineage / bonded / mentions)
-- economic signals: `total_donated`, `unique_donors`, `total_bonded` (log-scaled)
+- source (follows / lineage / donated / mentions)
+- economic signals: `total_donated`, `unique_donors` (log-scaled)
+- label signals: counts of labels on the candidate, weighted by which labelers
+  the user's filter trusts (visibility filtering is client-side for the same
+  no-consensus reason ranking is — see 06-moderation.md)
 - relationship signals: author followed? previously donated to? lineage hops
 - thread signals: replies from accounts the user has donated to (donor prominence as a *feature*, not a rule — the local ranker is free to ignore it)
 - local history: the user's past dwell/reply/donation pattern per author and topic
@@ -51,7 +54,7 @@ A ranker is **weights + a declared feature schema**, executed by the client's fi
 
 ## Cold Start
 
-A new account has no follows and no interaction log. The bootstrap feed comes from the **invitation tree**: the `lineage` candidate source serves the inviter's neighborhood, decaying by lineage distance. Your first feed is, roughly, "what the person who invited you sees" — which mirrors how people actually join social networks. Stated trade-off: this seeds an echo chamber by construction and the tree is public (it mirrors real-world social circles — a deanonymization surface users should be told about); the `bonded` source provides the counterweight of network-wide discovery from day one.
+A new account has no follows and no interaction log. The bootstrap feed comes from the **invitation tree**: the `lineage` candidate source serves the inviter's neighborhood, decaying by lineage distance. Your first feed is, roughly, "what the person who invited you sees" — which mirrors how people actually join social networks. Stated trade-off: this seeds an echo chamber by construction and the tree is public (it mirrors real-world social circles — a deanonymization surface users should be told about); the `donated` source provides the counterweight of network-wide discovery from day one.
 
 ## Non-Goals
 
