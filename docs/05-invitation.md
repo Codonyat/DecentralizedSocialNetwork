@@ -1,19 +1,25 @@
-# Invitation Tree & Trust Distance (`dsn-invitation`)
+# Invitations: Vouches, Sponsorship & Aura (`dsn-invitation`)
 
 ## Purpose
 
-The invitation system provides Sybil resistance via an on-chain invitation tree. Each invitation costs Y (flat cost; the fee is recycled to the Reward Pool), creating an auditable tree structure. A donor's **subtree position** — depth, ancestry, and lineage family — weights donations for emission calculation. A donor **outside** the invitation tree carries **zero** donation weight by construction — the property that makes private, unweighted donations safe.
+Invitations are **data**. A signed, recipient-accepted "A vouches for B" object gives a newcomer cold-start context and an offered first follow. There is no invite fee, no on-chain tree, and no invitation-derived weight anywhere in the protocol.
 
-This document is the **canonical donation-weighting spec**. The weighting rules here (pairwise weight + lineage families) REPLACE both prior distance tables — the one that used to live in this file and the one in `03-token-y.md`. No other doc defines donation weights; 03 references this one.
+No sybil defence lives here, because sybils gain nothing in either layer that matters:
+- **Money** is bounded by stake × time: accounts, likes and routing add nothing to what a coalition can direct (03 §B, The bound).
+- **Reach** is a conserved attention budget: creating accounts cannot raise anyone's share (09).
+
+What remains is edge policy: invites are scarce but free, with quotas set by clients and hosts. It also covers two onboarding conveniences, power delegation and client-sponsored onboarding, and one status signal, aura.
+
+Canonical home: this doc specifies `Vouch`, `PowerDelegation`, quotas, and aura. The types live in 01 (`vouch.rs`); money mechanics are in 03.
 
 ## Module Structure
 
 ```
 crates/invitation/src/
   lib.rs
-  invite.rs            # Invitation logic
-  trust_distance.rs    # Depth + ancestry (is_ancestor, LCA, hops_to_ancestor)
-  donation_weight.rs   # Subtree-position donation weighting + lineage families
+  vouch.rs         # Vouch statement signing, acceptance, validation
+  delegation.rs    # PowerDelegation validation; which likes a sponsor may settle
+  policy.rs        # Reference vouch-quota and aura policy (client/host-side, not protocol)
   error.rs
 ```
 
@@ -21,244 +27,114 @@ crates/invitation/src/
 
 ```
 dsn-invitation depends on:
-  - dsn-core    (PublicKey, ContentAddress, etc.)
-  - dsn-chain   (ChainClient trait for on-chain operations)
+  - dsn-core    (IdentityId, Vouch, PowerDelegation, Like, signing)
 ```
 
-## Core Concepts
+No `dsn-chain` dependency: nothing here is on-chain.
 
-### Invitation Tree
+## Vouches (`vouch.rs`)
 
-- Invitations are ON-CHAIN smart contract calls
-- Each invitation costs Y (flat cost, defined in `EpochConfig::invitation_cost_y`); the fee is recycled to the Reward Pool
-- Tree structure: each account has exactly one inviter (except genesis accounts)
-- Genesis accounts seeded by contract deployer at depth 0
+A **vouch** records that a voucher vouched for a vouchee, and that the vouchee accepted.
 
-### Tree Position Concepts
-
-Three properties of the invitation tree drive weighting:
-
-1. **Depth** = hops from genesis (each account has exactly one inviter, hence exactly one depth). Used to locate an account's lineage-family root, not to weight donations directly.
-2. **Ancestry** = whether one account lies on the other's inviter chain to genesis (`is_ancestor`). An account and anyone it ultimately invited are ancestor/descendant at any depth.
-3. **LCA & separation** = the lowest common ancestor of two accounts and `s = min(hops donor→LCA, hops recipient→LCA)`. Small `s` means the two accounts branch apart just below a shared ancestor (siblings, cousins) — cheap to manufacture, so low weight. Large `s` (or different genesis roots) means genuinely separated participants.
-
-### Trust Distance
-
-- `trust_distance(account) = inviter's trust_distance + 1`
-- Genesis accounts have `trust_distance = 0` (equivalently, depth 0)
-
-## Types
+- The voucher signs a statement over `(voucher, vouchee, issued_epoch)`.
+- The **vouchee** publishes the `Vouch` object (01), which embeds that signature. Publication is acceptance: a vouch nobody accepted does not exist. The object carries one envelope signature, the vouchee's (02).
+- It is an ordinary off-chain signed object, published to indexers and synced like any other.
 
 ```rust
-/// An on-chain invitation record.
-pub struct OnChainInvitation {
-    pub inviter: PublicKey,
-    pub invitee: PublicKey,
-    pub y_cost: u64,
-    pub trust_distance: u32,  // invitee's trust distance (inviter's + 1)
-}
+/// Voucher side: sign the statement a vouchee can later publish.
+pub fn sign_vouch_statement(
+    voucher_sk: &SecretKey,
+    voucher: &IdentityId,
+    vouchee: &IdentityId,
+    issued_epoch: u64,
+) -> Signature;
+
+/// Vouchee side: build and sign the Vouch object (publication = acceptance).
+pub fn accept_vouch(
+    vouchee_sk: &SecretKey,
+    voucher: IdentityId,
+    vouchee: IdentityId,
+    issued_epoch: u64,
+    voucher_signature: Signature,
+    claimed_epoch: u64,
+) -> Vouch;
+
+/// Both signatures verify (each under the validity rule of 01), voucher != vouchee.
+pub fn validate_vouch(vouch: &Vouch) -> Result<(), InvitationError>;
 ```
 
-## Invitation Creation (invite.rs)
+**Rules**
+- **Uniqueness.** One vouch per `(voucher, vouchee)`; first-seen wins (ties broken by lowest object hash).
+- **History, not privilege.** A vouch grants nothing, so there is nothing to revoke. The vouchee may retract it (02).
+- **Uses.**
+  - Cold-start context: the default client offers the voucher as the newcomer's first follow (09, Cold Start).
+  - A "vouched by" line on profiles.
+  - Natural guardian candidates (01, Guardians).
+
+**Invite flow.** The newcomer's client generates a key and shares its `IdentityId`, usually through an invite link. The voucher's client signs the statement and returns it as a token. The newcomer's client publishes the `Vouch`. Two things may optionally accompany a vouch:
+- a plain Y transfer, which is just a transfer;
+- a `PowerDelegation`.
+
+## Power Delegation (`delegation.rs`)
+
+Newcomers have **ranking weight immediately**: their likes are free signed objects and count as ranking edges from the first one (09). They have **money weight** when they hold and stake Y, or when a **sponsor** — an inviter or a client — lets them spend part of the sponsor's like power.
+
+- A sponsor signs a `PowerDelegation { sponsor, delegate, expires_epoch }` (01).
+- The delegate's likes name the sponsor (`Like.sponsor`).
+- The sponsor includes those likes in its own daily settlement, where they debit the sponsor's **one** power meter (03 §B).
+
+**Delegation is conserved.** All of a sponsor's delegates debit the same meter, so delegating to a thousand accounts spends no more than the sponsor could spend alone. How much of its meter the sponsor opens to delegates is a sponsor-side allowance: client configuration, with no on-chain state.
 
 ```rust
-/// Validate an invitation before submitting on-chain.
-/// Preconditions:
-/// - Inviter must be an existing on-chain account
-/// - Invitee must NOT already exist in the invitation tree
-/// - Inviter must have sufficient Y balance >= invitation_cost_y
-/// - Cannot self-invite
-pub fn validate_invitation(
-    inviter: &PublicKey,
-    invitee: &PublicKey,
-    inviter_balance: u64,
-    invitation_cost: u64,
-    invitee_exists: bool,
-) -> Result<(), InvitationError>;
-```
-
-### Anti-Sybil Economics
-
-- Creating sock puppets costs Y per invite (the fee is recycled to the Reward Pool)
-- Sock puppets sit CLOSE in the invitation tree (low donation weight when cross-donating)
-- Y cost is the natural limiter (optionally also a per-epoch cap in the contract)
-
-### Onboarding starter grant
-
-An invitation is conventionally accompanied by a plain Y transfer — the **starter grant** (reference-client default 5 Y, `--grant` flag in [08-cli.md](08-cli.md)) — from inviter to invitee, so a new account can immediately donate and rent a handle. This is a convention, not protocol: a transfer is a transfer, and no contract change is involved. Posting and replying are free at the protocol level, so the grant is only needed for economic actions (donations, handle rent).
-
-## Trust Distance Computation (trust_distance.rs)
-
-```rust
-/// Compute the depth (trust distance) of an account from genesis.
-/// Returns None if the account is not in the invitation tree.
-pub fn trust_distance(
-    account: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>, // invitee -> inviter
-) -> Option<u32>;
-
-/// True if `maybe_ancestor` lies on `node`'s inviter chain to genesis
-/// (at any depth). An account is NOT its own ancestor.
-pub fn is_ancestor(
-    maybe_ancestor: &PublicKey,
-    node: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>,
+/// A like may carry the sponsor's power iff a valid PowerDelegation from
+/// `like.sponsor` to `like.liker` exists with `expires_epoch >= epoch`.
+pub fn like_may_use_sponsor(
+    like: &Like,
+    delegations: &[PowerDelegation],
+    epoch: u64,
 ) -> bool;
 
-/// The deepest node that is an ancestor of BOTH accounts, or None when they
-/// descend from different genesis roots (no common ancestor).
-pub fn lowest_common_ancestor(
-    a: &PublicKey,
-    b: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>,
-) -> Option<PublicKey>;
-
-/// Number of inviter steps from `descendant` up to `ancestor`
-/// (0 if they are the same node). None if `ancestor` is not on the chain.
-pub fn hops_to_ancestor(
-    descendant: &PublicKey,
-    ancestor: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>,
-) -> Option<u32>;
+/// Sponsor side: order candidate delegate likes for the day's settlement,
+/// capped by the sponsor's allowance (power units). Pure policy; the chain
+/// sees only the sponsor's own settlement.
+pub fn select_delegate_likes(
+    candidates: &[Like],
+    allowance: u64,
+    power: u64,
+) -> Vec<Like>;
 ```
 
-## Donation Weighting (donation_weight.rs)
+## Sponsored Onboarding (client convention, not protocol)
 
-Donation weight has **two layers** applied together:
+A newcomer should never need ETH or Y to start. Clients pay for onboarding as an acquisition cost and recoup it from facilitator fees (03 §C; 07, Indexer Economics):
 
-1. A **pairwise weight** per donation, from the donor's and recipient's positions in the tree.
-2. A **lineage-family** aggregation across a recipient's incoming donations, so extra donations from the same corner of the tree yield diminishing returns.
+- **Gas.** An ERC-4337 paymaster run by the client sponsors the newcomer's on-chain actions and daily settlements. The client's own abuse policy decides whom it sponsors, for example requiring an accepted vouch. There is no protocol paymaster and no protocol gate.
+- **First handle.** The client funds the first epoch's rent with a plain transfer bundled with the claim (03 §D). The registry is unchanged.
 
-### Pairwise weight
+## Quotas & Aura (`policy.rs`, client/host policy — NOT protocol)
 
-```rust
-/// Pairwise weight of a single donation, from the donor's and recipient's
-/// positions in the invitation tree. This is the sole canonical pairwise
-/// spec — it REPLACES the old tables in both this doc and 03-token-y.
-///
-/// | Relationship                                | Weight |
-/// |---------------------------------------------|--------|
-/// | donor not in the invitation tree (private)  | 0.0    |
-/// | same account (self-donation)                | 0.0    |
-/// | ancestor / descendant (any depth)           | 0.25   |
-/// | else, s = min(hops donor→LCA, recip→LCA):    |        |
-/// |   s ≤ 2 (branch apart near a shared ancestor) | 0.5   |
-/// |   s ≥ 3 (well separated) or different roots    | 1.0   |
-pub fn pairwise_weight(
-    donor: &PublicKey,
-    recipient: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>, // invitee -> inviter
-) -> f64 {
-    // FIRST rule: a donor with no position in the invitation tree
-    // (`trust_distance` = None) — e.g. a fresh standalone keypair used for a
-    // private donation — carries zero emission weight by construction.
-    if trust_distance(donor, tree).is_none() {
-        return 0.0;
-    }
-    if donor == recipient {
-        return 0.0;
-    }
-    if is_ancestor(donor, recipient, tree) || is_ancestor(recipient, donor, tree) {
-        return 0.25; // within one lineage, at ANY depth of chain
-    }
-    match lowest_common_ancestor(donor, recipient, tree) {
-        None => 1.0, // different genesis roots — fully independent
-        Some(lca) => {
-            let sd = hops_to_ancestor(donor, &lca, tree).unwrap_or(0);
-            let sr = hops_to_ancestor(recipient, &lca, tree).unwrap_or(0);
-            if sd.min(sr) <= 2 { 0.5 } else { 1.0 }
-        }
-    }
-}
-```
+**Invites are scarce but free.** A client or host may cap how many vouches an identity issues per epoch. It may refuse to index vouches beyond its policy, or a ranker may ignore them. Quotas exist for spam and UX, not sybil defence: a sybil holding a thousand vouches gains no money and no reach.
 
-Any account not present in `tree` (no inviter chain — a fresh standalone keypair) resolves to weight **0.0**: this is what makes private donations safe, since such keypairs carry zero emission weight by construction. The donor still pays the 5% donation fee and the creator's share is unchanged; only the emission-directing weight is nulled (see the private-donations note in [03-token-y.md](03-token-y.md)).
+**Aura** is a **non-transferable status score** that clients and indexers compute from public likes. The protocol records no aura. It is bound by these rules:
 
-### Lineage-Family Diminishing Returns
-
-A **lineage family** is the boundary that a later participant cannot manufacture. A donor's family is the subtree rooted at the donor's ancestor at depth `FAMILY_ROOT_DEPTH = 2` (tunable). Donors at depth ≤ 2 are their own family. The family is identified by the PublicKey of that depth-2 root node.
-
-Why this boundary is unforgeable: depth-2 nodes are minted only by depth-1 accounts (the genesis invitees). An attacker sitting anywhere deeper than depth 2 can NEVER mint a new family root — every account it creates (siblings, deep chains, parallel chains) walks up through the attacker's own depth-2 ancestor and collapses into a single family.
+- It never feeds money: aura is not an input to issuance, fees or tips.
+- It never feeds reach: aura is not a ranking feature and not a budget input (09).
+- Its one scarce perk is **extra invites**: a larger vouch quota under the computing party's policy.
+- Its formula is local policy, like label aggregation (06). The reference default counts distinct likers of an account's posts over a trailing window; any policy is valid, and an indexer's aura is advisory display.
 
 ```rust
-/// The donor's LINEAGE FAMILY: the subtree rooted at the donor's ancestor
-/// at depth FAMILY_ROOT_DEPTH (= 2). Returns that family-root PublicKey.
-/// Donors at depth ≤ 2 are their own family root.
-pub fn lineage_family(
-    donor: &PublicKey,
-    tree: &HashMap<PublicKey, PublicKey>,
-) -> Option<PublicKey> {
-    let mut node = *donor;
-    let mut depth = trust_distance(&node, tree)?;
-    // Walk up toward genesis, stopping at depth FAMILY_ROOT_DEPTH.
-    while depth > FAMILY_ROOT_DEPTH {
-        node = *tree.get(&node)?;
-        depth -= 1;
-    }
-    Some(node) // depth-2 ancestor, or the donor itself if depth ≤ 2
+/// Reference policy knobs; values are client/host configuration, not protocol constants.
+pub struct VouchQuotaPolicy {
+    pub base_per_epoch: u32,
+    pub aura_bonus_per_epoch: fn(u64) -> u32, // extra invites for a given aura
+    pub aura_window_epochs: u64,
 }
 
-/// Per-epoch weight of a recipient. Incoming donations are grouped by the
-/// donor's lineage family; each family's weighted sum is passed through a
-/// concave exponent (BRANCH_FAMILY_EXPONENT = 0.5) so additional donations
-/// from the SAME family yield diminishing returns. Emission is split across
-/// recipients in proportion to this weight.
-pub fn recipient_epoch_weight(
-    recipient: &PublicKey,
-    donations: &[(PublicKey, u64)], // (donor, amount) to this recipient
-    tree: &HashMap<PublicKey, PublicKey>,
-) -> f64 {
-    let mut family_sums: HashMap<PublicKey, f64> = HashMap::new();
-    for (donor, amount) in donations {
-        let w = pairwise_weight(donor, recipient, tree);
-        let fam = lineage_family(donor, tree).unwrap_or(*donor);
-        *family_sums.entry(fam).or_default() += (*amount as f64) * w;
-    }
-    family_sums
-        .values()
-        .map(|s| s.powf(BRANCH_FAMILY_EXPONENT)) // ^0.5
-        .sum()
-}
-```
+/// Reference aura: distinct likers of `account`'s posts within the window.
+pub fn aura(account: &IdentityId, likes_received: &[Like], window_start_epoch: u64) -> u64;
 
-The concave exponent is applied **per family**, not per donor — this is the key that defeats donation-splitting.
-
-#### Worked example 1 — splitting across self-created invitees (one family, no gain)
-
-Attacker M sits at depth 4 (well below the depth-2 line). M invites `n` fresh puppets `P1..Pn` (each depth 5, costing `n` invitation fees), and each `Pi` donates `A/n` Y to a creator account `C` that M also controls. Every `Pi` walks up through M to the same depth-2 ancestor `F`, so `lineage_family(Pi) = F` for all `i` — **one family**.
-
-That family's weighted sum is `Σ (A/n)·w = A·w` (with `w` the shared pairwise weight), contributing `(A·w)^0.5` to `C`'s weight. A single donation of `A` from one account contributes `(A·w)^0.5` as well. Splitting into `n` puppets buys nothing and costs `n` invitation fees. The naive hope of `n·(A/n)^0.5 = √n·√A` is denied because the concave exponent is applied per family, not per donation.
-
-#### Worked example 2 — sibling attack via a controlled inviter (still one family)
-
-To dodge the ancestor/descendant 0.25 penalty, M instead spins up a controlled inviter `Q` inside his subtree and has `Q` invite many siblings `S1..Sn`, then routes donations sibling→`C`, hoping siblings read as independent (their pairwise separation can be pushed to `s = 1 → 0.5`, above the 0.25 floor).
-
-But pairwise independence does not create family independence. `Q` and every `Si` sit inside M's subtree, so they all resolve to the same depth-2 ancestor `F`. All sibling donations land in the single family `F` and are flattened together by `F_sum^0.5`. Because family roots are minted only by genesis invitees (depth 1), M — being deep in the tree — cannot manufacture a second family no matter how he reshapes the accounts he controls. The sibling attack collapses to the same one-family bound as example 1.
-
-### Why This Works Against Sock Puppets
-
-- **Same-inviter puppets**: A and B share inviter P → `s = min(1,1) = 1` → pairwise 0.5, AND both share the same depth-2 ancestor → one lineage family. Two layers of discount stack.
-- **Chained descendant**: A invites B (B is A's descendant) → `is_ancestor(A, B)` → 0.25 at ANY depth. Lengthening the chain never lifts a within-lineage donation above 0.25.
-- **Self**: donor == recipient → 0.0.
-
-## Constants
-
-```rust
-/// Default invitation cost in Y (can be overridden in EpochConfig).
-/// The invitation fee is recycled to the Reward Pool. (tunable)
-pub const DEFAULT_INVITATION_COST_Y: u64 = 100_000_000; // 100 Y
-
-/// Depth of the lineage-family root: a donor's family is the subtree rooted
-/// at its ancestor at this depth. Depth-2 nodes are minted only by genesis
-/// invitees, so no deeper participant can manufacture a new family. (tunable)
-pub const FAMILY_ROOT_DEPTH: u32 = 2;
-
-/// Concave exponent applied to each lineage family's weighted-donation sum,
-/// giving diminishing returns to extra donations from one family. (tunable)
-pub const BRANCH_FAMILY_EXPONENT: f64 = 0.5;
-
-/// Max ancestry walk when computing depth / LCA / hops (cycle & runaway guard).
-pub const MAX_ANCESTOR_WALK_DEPTH: u32 = 100;
+/// Vouches `account` may issue this epoch under `policy`.
+pub fn vouch_quota(aura: u64, policy: &VouchQuotaPolicy) -> u32;
 ```
 
 ## Error Types
@@ -266,51 +142,46 @@ pub const MAX_ANCESTOR_WALK_DEPTH: u32 = 100;
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum InvitationError {
-    #[error("insufficient Y to invite: have {have}, need {need}")]
-    InsufficientY { have: u64, need: u64 },
+    #[error("cannot vouch for yourself")]
+    SelfVouch,
 
-    #[error("cannot invite yourself")]
-    SelfInvitation,
+    #[error("invalid voucher signature")]
+    InvalidVoucherSignature,
 
-    #[error("invitee already exists in the invitation tree")]
-    AlreadyInvited,
+    #[error("invalid vouchee signature")]
+    InvalidVoucheeSignature,
 
-    #[error("inviter not found in invitation tree")]
-    InviterNotFound,
+    #[error("delegation expired at epoch {expires_epoch}")]
+    DelegationExpired { expires_epoch: u64 },
 
-    #[error("chain error: {0}")]
-    Chain(String),
+    #[error("no delegation from sponsor to liker")]
+    NoDelegation,
 }
 ```
 
 ## Anti-Gaming Analysis
 
-### Chained descendants
+### Sybil vouch farms
 
-**Attack**: A invites B invites C … a long chain, hoping depth buys weight, then donates along the chain.
-**Defense**: Any ancestor/descendant pair scores pairwise weight 0.25 at ANY chain length — lengthening the chain never lifts a within-lineage donation above 0.25. Each hop also costs an invitation fee (recycled to the Reward Pool).
+**Attack.** One controller creates many accounts and vouches for all of them, or collects vouches from them.
+**Outcome.** The farm gains nothing it can spend. Money is stake-bounded (03 §B), and a vouch confers no budget share (09). The only product is aura-based extra invites, which buy only more vouches. Quotas and indexing policy keep the spam cost on the farm's hosts.
 
-### Siblings & parallel chains under one controller
+### Delegation amplification
 
-**Attack**: A controller builds many siblings or parallel sub-chains so cross-donations read as independent (pairwise 0.5–1.0).
-**Defense**: Lineage-family collapse. Everything the controller builds below its own account resolves to one depth-2 family root, so all those donations sum inside a single family and are flattened by `family_sum^0.5` — no `√n` advantage from spreading donations across more puppets (see worked examples above). Family roots are minted only by genesis invitees, so a deeper attacker cannot mint a second family. Compounded by the per-invite fee and the emission match cap (03 §C).
+**Attack.** A sponsor delegates to many accounts to multiply its like power.
+**Outcome.** Impossible by construction: every delegate debits the sponsor's one meter.
 
-### Self-donation rings
+### Cold-start steering (honest limit)
 
-**Attack**: An A ⇄ B ⇄ C cycle donating among accounts one entity controls.
-**Defense**: Self-donations score 0.0; ancestor/descendant recycling scores 0.25; each donation pays the 5% fee (recycled to the Reward Pool) and each account pays an invitation fee. Combined with the emission match cap (03 §C), the ring bleeds Y for a heavily discounted, capped claim.
+A voucher, or the default client, chooses what a newcomer sees first; that is real influence. It is bounded, not removed:
+- The newcomer can unfollow.
+- 20% of the feed is labelled exploration from providers the viewer chooses (09).
+- The budget cannot be inflated by the voucher's own accounts.
 
-### Wash-trading (acknowledged open risk)
+Collusion among trusted accounts, and endorsements sold for money, are not stopped here (09, honest limits).
 
-**Attack**: A controller cycles Y between accounts it owns — or colludes with unrelated accounts — purely to convert fees into an emission claim on a recipient it controls.
+### What was removed
 
-**Analysis**: Each 1 Y washed pays the donation fee `f = 0.05` (5%, recycled to the Reward Pool) and contributes `w`-weighted-Y toward the recipient, where `w` is the pairwise weight — a first-order claim of roughly `w · e` Y, with `e` = emission paid per unit of weighted-Y directed that epoch (epoch emission ÷ total weighted donations, at the margin). The break-evens below are **heuristics**: the concave lineage-family allocation shifts the exact margins, so treat them as first-order guides, not thresholds.
+The on-chain invitation tree, the 100 Y invitation fee, trust distance, and the invitation-weighted donation rules (pairwise weights and lineage-family diminishing returns) are gone.
 
-- **Related-account wash** (ancestor↔descendant, `w = 0.25`): profitable iff `e > f / w = 0.05 / 0.25 = 0.2`. The 0.25 weight makes washing 4× less efficient than an honest arm's-length donation, and the lineage-family `^0.5` concavity shrinks the marginal claim as more flow is pushed through one family.
-- **Reciprocal collusion** (unrelated accounts, `w = 1.0`): two well-separated accounts — or a ring/marketplace — agree to donate to each other. They sit in **different lineage families**, so neither the pairwise discount (which only penalises related accounts) nor family collapse (which only flattens donations *within* a family) applies. Break-even is `e > f = 0.05`. This case is **NOT bounded by the pairwise or lineage-family layers** — those layers only defeat a single controller manufacturing puppets below its own account; they say nothing about two genuinely distinct families colluding.
-
-**Depth-1 / genesis caveat**: the lineage-family boundary is unforgeable only because family roots are minted by depth-1 accounts (the genesis invitees), so the family layer *assumes honest genesis invitees*. A compromised or colluding depth-1 account can mint unlimited distinct family roots, defeating family collapse for everything beneath it. The match cap (below) bounds the payoff of that failure too.
-
-**Closing aggregate invariant**: what bounds every case above — regardless of `e`, `w`, or family structure — is the **emission match cap (03 §C)**. Any closed coalition donating only among itself pays the 5% fee on its flows and can extract at most `EMISSION_MATCH_CAP_BPS = 4%` of those same flows in emission — a guaranteed net loss (≥ 1% of washed volume) at any network size, in any epoch, independent of the allocation shape. The cap does **not** close one honest-adjacent leak: a creator with genuine donation inflow whose concave-allocated share sits below its cap can wash-donate to itself to fill the headroom, profitable up to roughly 4% of its honest weighted inflow. Gaming is thereby bounded by genuine popularity, not eliminated.
-
-This is an **acknowledged open risk, NOT a solved problem**. What remains for **launch simulation**: whether real emission rates `e` sit above the heuristic break-even lines, how much residual-headroom leak honest creators can actually capture, and how `f` (DONATION_FEE_BPS), `w` (pairwise weight floor), `BRANCH_FAMILY_EXPONENT`, and `EMISSION_MATCH_CAP_BPS` should be set — the design does not claim the attack is impossible. (03 Economic Design states the matching guarantees; the maximal adversarial case against donation-directed emission is archived in [archive/09-first-principles-review.md](archive/09-first-principles-review.md) §2.1, non-normative.)
+They defended a money layer that no longer pays by activity. They deterred only lazy harvesters, and they taxed honest friends: every honest invite paid the fee, and every related-account like was discounted. Stake now bounds the money layer (03 §B, and 03 Economic Design, Superseded designs).

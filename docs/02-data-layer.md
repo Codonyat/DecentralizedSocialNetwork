@@ -9,9 +9,9 @@ Abstracts off-chain content storage behind traits, enabling:
 
 Design goals:
 - **Simplicity is an explicit goal.** The protocol specifies a data format (signed, content-addressed objects) and stays silent on transport — no bespoke storage network.
-- **Storage is other participants' responsibility.** Indexers are the hot-storage tier, priced by the existing query-fee market (doc 07); the client always keeps a full local copy of everything its user signs. `docs/12-storage-and-anchoring.md` governs storage semantics; this document aligns with it.
+- **Storage is other participants' responsibility.** Indexers are the hot-storage tier, paid for by the existing indexer economics (doc 07, Indexer Economics: facilitator fees and bulk API access); the client always keeps a full local copy of everything its user signs. `docs/12-storage-and-anchoring.md` governs storage semantics; this document aligns with it.
 
-On-chain operations (tokens, donations, names, invitations, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
+On-chain operations (tokens, stakes and like settlements, tips, genesis claims, names, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
 
 ## Module Structure
 
@@ -34,7 +34,7 @@ Publishing is a relay, not a write to a storage network:
 
 The design assumes a single writing device per identity today: mutable records carry a monotonic `version` (see Core Storage Traits and Concurrency Model below), and concurrent writes from two devices for the same record collide rather than merge. Multi-device sync is a client roadmap item; export/import between devices is available today.
 
-The full text corpus is small (≈ 1 GB/day network-wide even at scale), and registered indexers replicate all of it. Hosting is already paid for by the query-fee market (doc 07, Indexer Economics) — the relay adds no new economic layer.
+The full text corpus is small (≈ 1 GB/day network-wide even at scale), and registered indexers replicate all of it. Hosting is already paid for by the existing indexer economics (doc 07, Indexer Economics: facilitator fees and bulk API access) — the relay adds no new economic layer.
 
 ### Durability (best-effort, honest)
 
@@ -207,16 +207,15 @@ The `ChainClient` trait is defined in the `dsn-chain` crate and provides access 
 
 `ChainClient` covers the following operations:
 
-- **Y token**: balance queries, transfers between accounts
-- **Donations**: executing donations from donor to creator (protocol fee routed to the Reward Pool), querying donation history
-- **Names**: claiming/assessing/renting handles (Harberger), resolving handle to public key
-- **Invitations**: creating invitations, querying tree position (depth, ancestry)
-- **Epochs**: querying current epoch info, emission schedule, treasury drip
-- **Reward Pool**: querying pool balance, per-epoch drip, and the treasury slice
+- **Y token**: balance queries, plain transfers between accounts
+- **Genesis**: activating a genesis entitlement, claiming weekly tranches, splitting entitlement (the treasury is a disclosed genesis leaf)
+- **Like**: stake/unstake, submitting the daily like settlement, claiming creator rewards for closed epochs, reading the power meter
+- **Tips**: tipping an identity (protocol fee routed to the fee pool, optional facilitator fee), foreign-key escrow claim/refund, querying tip history
+- **Names**: claiming/assessing/renting handles (Harberger, base rent), resolving handle to public key
+- **Epochs**: querying current epoch info, mint rate, fee pool, stake-time
 - **Identity (IdentityRegistry)**: resolving `IdentityId → current key`; `rotate`; `set_guardians`; `recover`
-- **Treasury**: querying the disclosed treasury address and its balance
 - **Anchoring**: `post_anchor(root)` and anchor-event queries (Merkle-root timestamp anchors, doc 12 §4)
-- **Events**: listening for on-chain events (donations, epoch transitions, identity events, `Anchored`)
+- **Events**: listening for on-chain events (tips, stakes, like settlements, epoch transitions, identity events, `Anchored`)
 
 See the `dsn-chain` crate documentation for the full trait definition and implementation details.
 
@@ -271,11 +270,13 @@ The real backend relays signed objects to a set of configured indexers. Not impl
 | `FollowList` | Signed object, hosted by indexers | logical address blake3(root_pk‖tag) | Mutable list |
 | Reply link | Signed object (graph), hosted by indexers | blake3(root_pk‖tag) | Immutable edge parent→child |
 | Label | Signed object, hosted by indexers | content hash | One per (author, target, label), first-seen wins (06) |
+| `Like` | Signed object, hosted by indexers | content hash | One per (liker, target), first-seen wins; a ranking edge; settled on-chain for stakers and sponsors' delegates (03 §B) |
+| `Vouch` | Signed object, hosted by indexers | content hash | Published by the vouchee (publishing = acceptance) (05) |
+| `PowerDelegation` | Signed object, hosted by indexers | content hash | Sponsor lets a delegate spend from its power meter (05) |
 | Y Balance | On-chain | smart contract | ERC-20 token |
-| Donations | On-chain | smart contract | Donor→creator, fee to Reward Pool |
+| Tips | On-chain | smart contract | Tipper→any identity, 1% protocol fee to the fee pool + 0–5% facilitator fee; foreign-key escrow |
 | Names | On-chain | smart contract | Handle→public key mapping (Harberger) |
-| Invitations | On-chain | smart contract | Invitation tree |
-| Epochs/Emission | On-chain | smart contract | Auto-distributed |
+| Stakes/Issuance/Fee pool | On-chain | smart contract | Like power, daily settlements, creator claims for closed epochs |
 
 ## Error Types (`error.rs`)
 
@@ -340,7 +341,7 @@ Mutable records carry a monotonic `version`. Indexers keep the highest-version r
 
 ## Media
 
-Media blobs (images, video) are **content-addressed** and stored/served by indexers — or by anyone — at their discretion and price; media hosting is an indexer revenue line alongside query access (doc 07), not a separate role. The guarantee is inherent to content addressing: bytes that don't hash to the requested address are rejected by every honest client, so a lying server is caught on first fetch. Posts reference media by content address plus optional server hints, never by a bare URL:
+Media blobs (images, video) are **content-addressed** and stored/served by indexers — or by anyone — at their discretion and price; media hosting is an indexer revenue line alongside bulk API access and facilitator fees (doc 07), not a separate role. The guarantee is inherent to content addressing: bytes that don't hash to the requested address are rejected by every honest client, so a lying server is caught on first fetch. Posts reference media by content address plus optional server hints, never by a bare URL:
 
 ```rust
 pub struct MediaRef {
@@ -378,6 +379,6 @@ E2E-encrypted DMs, relayed through indexers acting as untrusted mailboxes, fit t
 
 Legal erasure is in tension with a permissionless, self-authenticating, mirrorable corpus. Compliant indexers honor retracts and ingest-time hash blocklists, but the protocol cannot guarantee that every trustless mirror or local copy deletes on request. The design offers best-effort erasure (retract plus honest indexer/host behavior), stated honestly, rather than a guarantee it cannot keep.
 
-### Private donations
+### Private tips
 
-Tree-external donations use a fresh standalone keypair and carry zero emission weight by construction (docs 03 and 05); they appear as anonymous supporters. Privacy here is unlinkability at the donation layer, not chain-analysis resistance — the funding transfer itself is public.
+A private tip is a tip sent from any fresh key (doc 03 §C); it appears as an anonymous supporter. Privacy here is unlinkability at the tip layer only, not chain-analysis resistance — the funding transfer itself is public.

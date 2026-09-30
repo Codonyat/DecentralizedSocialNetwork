@@ -9,9 +9,11 @@ crates/core/src/
 ├── post.rs             # Post, reply, thread types
 ├── profile.rs          # User profile
 ├── social.rs           # Follow list, feed index
+├── like.rs             # Like object: the one button (money rules: 03 §B)
+├── vouch.rs            # Vouch + PowerDelegation (canonical spec: 05)
 ├── label.rs            # Content label (canonical spec: 06)
-├── token.rs            # Donation, NameRecord (on-chain types)
-├── epoch.rs            # Block-based epoch definitions, emission schedule
+├── token.rs            # Tip, ForeignKey, GenesisLeaf, PowerMeter, NameRecord (on-chain types)
+├── epoch.rs            # Time-based epochs, EpochConfig, supply schedule
 ├── chain_events.rs     # ChainEvent enum (smart contract events)
 ├── crypto.rs           # Hashing, signing helpers
 ├── address.rs          # Content addresses, key addresses
@@ -49,8 +51,8 @@ pub struct Signature(pub [u8; 64]);
 /// The display_name is purely cosmetic. The `IdentityId` (genesis public key) is
 /// the only canonical identity. An optional on-chain `@handle` is claimed via
 /// NameRecord by setting an assessed value and paying the first epoch's rent, and
-/// kept by paying per-epoch rent to the Reward Pool (Harberger-taxed for len ≤ 6,
-/// flat rent for len ≥ 7).
+/// kept by paying per-epoch rent to the fee pool (Harberger-taxed for len ≤ 6,
+/// the base rent for len ≥ 7).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub public_key: PublicKey,          // the user's IdentityId (genesis key)
@@ -71,8 +73,8 @@ sign. A handle is a convenience layer, never an identity:
 - The current signing key is rotatable (see below); the `IdentityId` never changes, so structural references stay stable across rotations and recoveries.
 - The on-chain registry keeps queryable ownership history, so a client can render "formerly @x" and warn when a handle recently changed hands. Handles are rented, so a handle pointing at an identity today is no guarantee it did yesterday.
 
-**IdentityId convention (binding).** Wherever protocol data references a user — the
-invitation tree, donation tuples, labels, handle ownership, API `:user_pk` params, CLI
+**IdentityId convention (binding).** Wherever protocol data references a user — vouches,
+likes, tips, stakes, labels, handle ownership, API `:user_pk` params, CLI
 output — the value is the **`IdentityId`** (the genesis key), never a current signing
 key. Because `IdentityId` IS a `PublicKey`, every existing `PublicKey`-typed reference
 is already correct; the current signing key is consulted only to verify a signature,
@@ -116,7 +118,7 @@ pub struct Guardians {
 (see the validity rule). PQ migration is just a rotation into a new `scheme_id`.
 
 **Guardians.** `set_guardians(keys, threshold)` (signed by the current key) opts an
-identity into M-of-N social recovery. The invitation tree is a natural guardian set.
+identity into M-of-N social recovery. Your vouchers and vouchees (05) are a natural guardian set.
 Guardians are `IdentityId`s; their *current* keys sign approvals.
 
 **Recovery.** When a key is lost, guardians recover it:
@@ -137,7 +139,7 @@ irrelevant to validity — a proactively rotated key stays valid, past and futur
 compromised and emits `KeyRevoked { identity, key, block }`. An object signed by a
 revoked key is valid iff it is proven to predate the revoking transaction's `block` —
 either by an anchor Merkle branch (doc 12's timestamp anchoring) or by an on-chain
-reference (a donation pointing at it) — an objective, on-chain boundary. New
+reference (a tip pointing at it) — an objective, on-chain boundary. New
 ingests of revoked-key objects without such a proof are rejected; a not-yet-anchored
 object is marked unproven until the next anchor interval. `claimed_epoch` is display
 metadata only and **never** enters validity. (Ingest + anchoring mechanics: 07.)
@@ -380,34 +382,155 @@ pub struct FeedIndex {
 }
 ```
 
-## Token Types (`token.rs`)
+## Like Types (`like.rs`)
 
-All token operations happen on-chain via smart contracts. These types represent the on-chain data structures that the smart contract manages. Token Y is the sole token — there is no separate reputation token.
+The one button (03 §B). A like is an off-chain signed, content-addressed object — free, and a ranking edge for everyone (09). For an account with stake, or under a sponsor's `PowerDelegation`, the client also settles it on-chain, where it spends like power and directs issuance (03 §B).
 
 ```rust
-/// A donation to a post's creator (on-chain).
-/// Donations transfer Y to the creator, with a fraction taken as a protocol fee
-/// and recycled to the Reward Pool.
+/// A signed like (off-chain, content-addressed).
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Donation {
-    /// The user making the donation.
-    pub donor: PublicKey,
-    /// Content hash of the post being donated to.
-    pub post_content_hash: ContentAddress,
-    /// The creator who receives the donation.
-    pub creator: PublicKey,
-    /// Total amount of Y donated.
+pub struct Like {
+    /// The liker's IdentityId.
+    pub liker: IdentityId,
+    /// Content address of the liked post.
+    pub target: ContentAddress,
+    /// Optional recipient split in basis points (client convention). Empty = 100%
+    /// to the target's author. The protocol enforces only that a settlement's
+    /// shares sum to the batch spend (03 §B).
+    pub recipients: Vec<(IdentityId, u16)>,
+    /// Set when the like spends a sponsor's power under a PowerDelegation (05).
+    pub sponsor: Option<IdentityId>,
+    /// Display metadata only; never enters validity.
+    pub claimed_epoch: u64,
+    /// ed25519 signature over all fields above.
+    pub signature: Signature,
+}
+```
+
+**Validation:** the signature verifies under the validity rule; `target` references an existing post; `recipients` is empty or its bps sum to exactly 10,000; `sponsor`, if set, names an identity holding a live `PowerDelegation` to `liker`. One like per `(liker, target)`, first-seen wins (ties broken by lowest object hash); un-liking is a retract (02).
+
+## Vouch Types (`vouch.rs`)
+
+Invitations are data (canonical spec: 05). Both objects are off-chain, signed, and content-addressed.
+
+```rust
+/// "voucher vouches for vouchee", recipient-accepted: the VOUCHEE publishes it,
+/// so publication is acceptance, and the object carries one envelope signature (02).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Vouch {
+    pub voucher: IdentityId,
+    pub vouchee: IdentityId,
+    /// Epoch the voucher signed the statement.
+    pub issued_epoch: u64,
+    /// The voucher's signature over (voucher, vouchee, issued_epoch).
+    pub voucher_signature: Signature,
+    /// Display metadata only; never enters validity.
+    pub claimed_epoch: u64,
+    /// The vouchee's signature over all fields above.
+    pub signature: Signature,
+}
+
+/// A sponsor lets `delegate` spend the sponsor's like power (03 §B, 05).
+/// All of a sponsor's delegates debit the sponsor's one meter.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PowerDelegation {
+    pub sponsor: IdentityId,
+    pub delegate: IdentityId,
+    /// Last epoch in which the delegate's likes may carry the sponsor's power.
+    pub expires_epoch: u64,
+    /// Display metadata only; never enters validity.
+    pub claimed_epoch: u64,
+    /// The sponsor's signature over all fields above.
+    pub signature: Signature,
+}
+```
+
+## Token Types (`token.rs`)
+
+All token operations happen on-chain via smart contracts. These types represent the on-chain data structures that the smart contracts manage. Token Y is the sole token — there is no separate reputation token, and like power is a meter, never a token.
+
+```rust
+/// A pre-existing external key that can receive an escrowed tip or hold a
+/// genesis leaf (03 §A, §C). Ethereum addresses first; ENS names resolve
+/// client-side to an address.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ForeignKey {
+    Ethereum([u8; 20]),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum TipRecipient {
+    /// A DSN identity; paid immediately.
+    Identity(IdentityId),
+    /// A foreign key; the net amount waits in escrow (03 §C).
+    Foreign(ForeignKey),
+}
+
+/// A tip (on-chain). Fees are taken at tip time (03 §C).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Tip {
+    pub tipper: PublicKey,
+    pub recipient: TipRecipient,
+    /// Optional post the tip refers to.
+    pub post: Option<ContentAddress>,
+    /// Gross amount paid by the tipper.
     pub amount: u64,
-    /// Fee recycled to the Reward Pool (e.g., 5%).
-    pub fee_amount: u64,
-    /// Remainder transferred to the creator.
-    pub creator_amount: u64,
+    /// 1% protocol fee -> fee pool (rounds up).
+    pub protocol_fee: u64,
+    /// The originating client's facilitator address, if any.
+    pub facilitator: Option<PublicKey>,
+    /// Payer-authorized facilitator fee, 0-5% (rounds down).
+    pub facilitator_fee: u64,
+    /// amount - protocol_fee - facilitator_fee; paid or escrowed.
+    pub recipient_amount: u64,
+}
+
+/// One genesis entitlement, committed under the genesis Merkle root (03 §A).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GenesisLeaf {
+    /// Cohort id (TREASURY_COHORT_ID for the treasury leaf).
+    pub cohort: u8,
+    /// The eligible external key.
+    pub key: ForeignKey,
+    /// Nominal entitlement in atomic Y (equal for every key in the cohort).
+    pub entitlement: u64,
+}
+
+/// Per-account genesis state in the GenesisClaim contract (03 §A). A split
+/// changes `nominal` only from `next_effective_epoch`, so a tranche is always
+/// claimed on the nominal in force during its own epoch.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GenesisAccount {
+    /// Nominal entitlement in force now.
+    pub nominal: u64,
+    /// Nominal after pending splits in and out; takes effect at `next_effective_epoch`.
+    pub next_nominal: u64,
+    pub next_effective_epoch: u64,
+    /// Last epoch whose tranche was claimed (each tranche claims at most once).
+    pub last_claimed_epoch: Option<u64>,
+}
+
+/// Per-account like-power state in the Like contract (03 §B).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PowerMeter {
+    /// Stake that regenerates power.
+    pub eligible_stake: u64,
+    /// Stake awaiting withdrawal; regenerates nothing.
+    pub pending_unstake: u64,
+    /// Block time at which `pending_unstake` becomes withdrawable.
+    pub unstake_available_at: u64,
+    /// Power stored at `last_update` (<= power_cap(eligible_stake)).
+    pub stored_power: u64,
+    /// Block timestamp of the last accrual.
+    pub last_update: u64,
+    /// Next expected settlement nonce (replay protection).
+    pub settle_nonce: u64,
 }
 
 /// An on-chain @handle record.
 /// A handle is claimed (never purchased) and kept by paying per-epoch rent to the
-/// Reward Pool; tokens are never destroyed. Short handles (len ≤ 6) are Harberger-
-/// taxed on a self-assessed value; long handles (len ≥ 7) pay a flat rent.
+/// fee pool; tokens are never destroyed. Short handles (len ≤ 6) are Harberger-
+/// taxed on a self-assessed value; long handles (len ≥ 7) pay the base rent.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NameRecord {
     /// The current owner.
@@ -424,7 +547,8 @@ pub struct NameRecord {
     pub force_buy: Option<ForceBuy>,
     /// Epoch at which the handle was claimed.
     pub claimed_at_epoch: u64,
-    /// Rent is paid through (and including) this epoch.
+    /// Rent is paid through (and including) this epoch; at most
+    /// MAX_PREPAID_EPOCHS past the current epoch (03 §D).
     pub rent_paid_through_epoch: u64,
 }
 
@@ -437,155 +561,151 @@ pub struct ForceBuy {
     /// The transfer executes at this epoch unless the owner cancels first.
     pub deadline_epoch: u64,
 }
-
-/// An invitation record (on-chain).
-/// Invitations form a web-of-trust tree rooted at genesis users.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct OnChainInvitation {
-    /// The user issuing the invitation.
-    pub inviter: PublicKey,
-    /// The user being invited.
-    pub invitee: PublicKey,
-    /// Y paid to issue this invitation; the fee is recycled to the Reward Pool.
-    pub y_cost: u64,
-    /// Trust distance from genesis (inviter's distance + 1).
-    pub trust_distance: u32,
-}
 ```
 
-**Fee arithmetic convention (applies to every bps calculation in these docs):**
-every basis-point multiplication uses `u128` intermediates, because at the 140B-Y
-scale `amount * bps` (and pool-balance math) overflows `u64`. Protocol **fees round
-up** — `fee = ((x as u128 * bps as u128 + 9_999) / 10_000) as u64` — so no dust
-ever escapes fee-free; **payouts and the pool drip round down**.
+**Fee arithmetic convention (applies to every bps and rate calculation in these docs):**
+every basis-point or rate multiplication uses `u128` intermediates, because at the
+140B-Y scale `amount * bps` (and pool-balance or stake-time math) overflows `u64`.
+Protocol **fees round up** — `fee = ((x as u128 * bps as u128 + 9_999) / 10_000) as u64` —
+so no dust ever escapes fee-free; **payouts, drips, reservations and facilitator fees
+round down**; a zero denominator yields zero.
 
 ### Validation Rules
 
-**Donation:**
-- `amount >= MIN_DONATION` (smaller donations are invalid — no fee-free dust)
-- `fee_amount + creator_amount == amount`
-- `fee_amount` must match the ceiling-division fee `((amount as u128 * donation_fee_bps as u128 + 9_999) / 10_000) as u64`
-- `donor` must have sufficient Y balance on-chain
-- `creator` must be the actual author of the referenced post
+**Tip:**
+- `facilitator_fee` bps ≤ `MAX_FACILITATOR_FEE_BPS`, authorized by the tipper's signature
+- `protocol_fee` must match the ceiling-division fee at `PROTOCOL_FEE_BPS`; `facilitator_fee` the round-down fee
+- `protocol_fee + facilitator_fee <= amount` and `recipient_amount == amount - protocol_fee - facilitator_fee`
+- `tipper` must have sufficient Y balance on-chain
+- If `post` is set, an `Identity` recipient should be its author (checked by clients and indexers; the contract cannot see off-chain authorship)
+
+**PowerMeter (settlement):**
+- `nonce == settle_nonce`; `n_likes >= 1`; every allocation weight > 0; no allocation to the staker itself
+- Power spent is computed by the contract from block time (03 §B); the sum allocated is debited
+
+**GenesisLeaf (activation):**
+- Merkle proof to the genesis root; signature by `key` naming the destination `IdentityId`; each leaf activates once
 
 **NameRecord (claim):**
 - `handle` must match `^[a-z0-9-]{1,32}$` (NFKC-normalized before matching)
 - `handle` must not already be owned (claim only if unowned)
-- Harberger tier (len ≤ 6): `assessed_value >= assessment_floor(len)`; flat tier (len ≥ 7): `assessed_value` is ignored and stored as `0`
+- Harberger tier (len ≤ 6): `assessed_value >= assessment_floor(len, base_rent)`; flat tier (len ≥ 7): `assessed_value` is ignored and stored as `0`
 - The first epoch's rent is due at claim time
-- `owner` must have sufficient Y balance on-chain
-
-**OnChainInvitation:**
-- `inviter` must be an existing invited user (or genesis)
-- `invitee` must not already be invited
-- `y_cost` must match `EpochConfig::invitation_cost_y`
-- `trust_distance == inviter.trust_distance + 1`
+- `owner` must have sufficient Y balance on-chain (a client may fund it by a bundled transfer, 05)
 
 ## Epoch Types (`epoch.rs`)
 
-Epochs are block-based: the smart contract advances the epoch after a fixed number of blocks. Emission is distributed on-chain at epoch boundaries.
+Epochs are time-based: an epoch is `EPOCH_SECONDS` (604,800 s, one week) of L2 block time, derived by the contracts from `block.timestamp` and counted from the main deployment (epoch 0). Like power accrues continuously from block timestamps (03 §B). No caller-supplied timestamp sets priority or rate. Each epoch is closed lazily by the first transaction after its boundary: the close reserves that epoch's issuance budget and fee-pool share for pulled creator claims, and steps the handle base rent (03 §B, Fee Pool, §D).
 
 ```rust
-/// Configuration constants for epoch mechanics (on-chain, set at contract deployment).
-/// Parameters are fixed at deployment; changing them requires a new deployment and
-/// opt-in migration by users and indexers (see 00, Parameter Immutability & Upgrades).
+/// Configuration constants (on-chain, set at contract deployment). Canonical values
+/// and rationale live in 03; fields mirror them. Parameters are fixed at deployment;
+/// changing them requires a new deployment and opt-in migration by users and
+/// indexers (see 00, Parameter Immutability & Upgrades).
 pub struct EpochConfig {
-    /// Number of blockchain blocks per epoch.
-    pub epoch_duration_blocks: u64,
-    /// Donation fee, recycled to the Reward Pool (basis points, e.g., 500 = 5%). (tunable)
-    pub donation_fee_bps: u64,
-    /// Minimum valid donation (atomic Y, e.g., 10_000 = 0.01 Y). (tunable)
-    pub min_donation: u64,
-    /// Y cost to issue an invitation; the fee is recycled to the Reward Pool. (tunable)
-    pub invitation_cost_y: u64,
-    /// Cap on a creator's per-epoch emission, as a fraction of that creator's raw
-    /// weighted donation sum for the epoch (basis points, e.g., 400 = 4%). Deployment
-    /// invariant: `emission_match_cap_bps < donation_fee_bps`, so any closed
-    /// wash-donation coalition is net-negative (see 03 §C). (tunable)
-    pub emission_match_cap_bps: u64,
-    /// Fraction of the Reward Pool balance dripped into creator emission each epoch
-    /// (basis points, e.g., 200 = 2%). (tunable)
-    pub reward_pool_drip_bps: u64,
+    /// Seconds of L2 block time per epoch. (tunable)
+    pub epoch_seconds: u64,                  // EPOCH_SECONDS = 604_800 (one week)
+    // --- Tips (03 §C) ---
+    /// Protocol fee on tips, to the fee pool (basis points, rounds up). (tunable)
+    pub protocol_fee_bps: u64,               // PROTOCOL_FEE_BPS = 100 (1%)
+    /// Cap on the payer-authorized facilitator fee (basis points, rounds down). (tunable)
+    pub max_facilitator_fee_bps: u64,        // MAX_FACILITATOR_FEE_BPS = 500 (5%)
+    /// Seconds before an unclaimed foreign-key escrow refunds to the tipper. (tunable)
+    pub tip_escrow_refund_seconds: u64,      // TIP_ESCROW_REFUND_SECONDS = 2_592_000 (30 days)
+    // --- Like power & issuance (03 §B) ---
+    /// Seconds of regeneration the power meter can hold. (tunable)
+    pub power_cap_seconds: u64,              // POWER_CAP_SECONDS = 86_400 (24 h)
+    /// Share of current power each like spends (basis points). (tunable)
+    pub like_spend_bps: u64,                 // LIKE_SPEND_BPS = 200 (2%)
+    /// Delay between an unstake request and withdrawal; regeneration stops at the request. (tunable)
+    pub unstake_delay_seconds: u64,          // UNSTAKE_DELAY_SECONDS = 604_800 (7 days)
+    // --- Fee pool ---
+    /// Share of the fee pool balance dripped at each epoch close (basis points). (tunable)
+    pub fee_pool_drip_bps: u64,              // FEE_POOL_DRIP_BPS = 200 (2%)
+    // --- Genesis (03 §A) ---
+    /// Epochs a genesis tranche stays claimable. (tunable)
+    pub genesis_claim_window_epochs: u64,    // GENESIS_CLAIM_WINDOW_EPOCHS = 1
+    // --- Names (03 §D) ---
     /// Harberger rent rate for short handles (basis points of `max(V, floor)` per epoch,
     /// e.g., 10 = 0.1%). (tunable)
     pub handle_rent_rate_bps: u64,
-    /// Flat rent per epoch for long handles (len ≥ 7), identical for all such lengths
-    /// (atomic Y, e.g., 1 Y). (tunable)
-    pub flat_handle_rent: u64,
+    /// Base rent at launch: the flat-tier rent and the unit of the Harberger floors (atomic Y). (tunable)
+    pub launch_base_rent: u64,               // LAUNCH_BASE_RENT = 1_000_000 (1 Y)
+    /// Clamp on the base rent (atomic Y). MAX keeps 1_000_000 × base within u64.
+    pub min_base_rent: u64,                  // MIN_BASE_RENT = 1_000
+    pub max_base_rent: u64,                  // MAX_BASE_RENT = u64::MAX / 1_000_000
+    /// Per-epoch base-rent step toward the claim target (basis points). (tunable)
+    pub base_rent_step_bps: u64,             // BASE_RENT_STEP_BPS = 1_250 (12.5%)
+    /// New flat-tier claims per epoch the base rent targets.
+    pub target_flat_claims_per_epoch: u64,   // TARGET_FLAT_CLAIMS_PER_EPOCH = TBD
+    /// Maximum epochs of rent paid ahead of the current epoch. (tunable)
+    pub max_prepaid_epochs: u64,             // MAX_PREPAID_EPOCHS = 26
     /// Force-buy notice window: epochs the owner has to cancel before transfer. (tunable)
     pub notice_window_epochs: u64,
     /// Epochs over which an assessment decrease (and retroactive rent) is applied. (tunable)
     pub lookback_epochs: u64,
     /// Grace epochs after nonpayment before a handle lapses to unowned. (tunable)
     pub grace_epochs: u64,
-    /// Non-refundable force-buy fee, recycled to the Reward Pool (basis points of the bid,
+    /// Non-refundable force-buy fee, to the fee pool (basis points of the bid,
     /// e.g., 100 = 1%). (tunable)
     pub force_buy_fee_bps: u64,
     /// To cancel a force-buy, the owner must raise V to at least (100% + this) of the bid
     /// (basis points, e.g., 1000 = raise to ≥ 110% of the bid). (tunable)
     pub raise_premium_bps: u64,
-    /// Share of the gross pool drip routed to the Treasury each epoch, until
-    /// `treasury_term_epochs` (basis points). (tunable)
-    pub treasury_drip_share_bps: u64,    // TREASURY_DRIP_SHARE_BPS = 1500  (15%)
-    /// Epochs the Treasury slice is taken; afterward 100% of the drip goes to
-    /// creators. (tunable)
-    pub treasury_term_epochs: u64,       // TREASURY_TERM_EPOCHS = 260  (~5y)
-    /// Epoch at which any unspent Treasury balance auto-returns to the pool. (tunable)
-    pub treasury_reclaim_epoch: u64,     // TREASURY_RECLAIM_EPOCH = 416  (~8y)
+    // --- Identity ---
     /// Veto window (in epochs) after guardian recovery reaches threshold, during
     /// which the current key can cancel the recovery. (tunable)
-    pub recovery_veto_epochs: u64,       // RECOVERY_VETO_EPOCHS = 2
+    pub recovery_veto_epochs: u64,           // RECOVERY_VETO_EPOCHS = 2
 }
 
-/// Y emission schedule — fixed at contract deployment, halving-based.
-/// Enforced on-chain by the smart contract. `emission_for_epoch` returns only the
-/// *scheduled* portion; the per-epoch total distributed to creators is
-/// `scheduled + creator_drip`, where `creator_drip = gross_drip − treasury_slice`
-/// (see the Reward Pool and drip accounting, 03).
-pub struct EmissionSchedule {
-    /// Hard-cap total supply of Y (atomic units): 140B Y (6 decimals, fits u64).
-    /// Scheduled emission asymptotically approaches this cap; integer-truncation
-    /// dust stays unminted. (tunable)
+/// Y supply schedule — fixed at contract deployment (03 §A, §B). Genesis and
+/// like-power issuance are the only mint paths; together they never exceed
+/// `total_supply`, and missed tranches or dust never reopen capacity.
+pub struct SupplySchedule {
+    /// Hard cap on genesis + issuance (atomic units): 140B Y (6 decimals, fits u64).
     pub total_supply: u64,                  // 140_000_000_000_000_000
-    /// Y emitted per epoch before any halving: 1.4B Y. (tunable)
-    pub initial_emission_per_epoch: u64,    // 1_400_000_000_000_000
-    /// Number of epochs between halvings (ideal sum 1.4B × 50 × 2 = 140B). (tunable)
-    pub halving_interval: u64,              // 50
+    /// total_supply × GENESIS_SHARE_BPS / 10_000.
+    pub genesis_total: u64,                 // GENESIS_SHARE_BPS = TBD
+    /// total_supply − genesis_total: the most like-power issuance can ever mint.
+    pub issuance_capacity: u64,
+    /// k at epoch 0, in parts per billion: atomic Y minted per power unit spent × 1e9
+    /// (5_000_000 = 0.5%; a power unit = 1 atomic Y staked for 1 epoch). (tunable)
+    pub initial_mint_rate_ppb: u64,         // INITIAL_MINT_RATE_PPB = 5_000_000 (k×r = 0.5%/epoch)
+    /// Epochs between halvings of k. (tunable)
+    pub mint_halving_epochs: u64,           // MINT_HALVING_EPOCHS = 104
+    /// Epochs between halvings of genesis tranches. (tunable)
+    pub genesis_vest_halving_epochs: u64,   // GENESIS_VEST_HALVING_EPOCHS = 104
+    /// Merkle root of GenesisLeaf hashes, published with the dataset, rules and
+    /// concentration analysis before deployment.
+    pub genesis_root: [u8; 32],
 }
 ```
 
-### Emission Calculation
+### Supply Calculation
 
 ```rust
-impl EmissionSchedule {
-    /// Compute the *scheduled* Y emission for a given epoch number.
-    /// This logic is mirrored in the smart contract.
-    pub fn emission_for_epoch(&self, epoch: u64) -> u64 {
-        let halvings = epoch / self.halving_interval;
-        // Shift-width safety only: 1.4e15 < 2^51, so the value is already 0 from
-        // halving 51 onward. This is NOT an economic cutoff — creator emission
-        // continues (as recycled fees via the pool drip) under the 140B cap.
-        if halvings >= 51 { return 0; }
-        self.initial_emission_per_epoch >> halvings
+impl SupplySchedule {
+    /// k for an epoch, in ppb; halves every `mint_halving_epochs`.
+    /// Mirrored in the Like contract (03 §B `mint_rate_ppb`).
+    pub fn mint_rate_ppb(&self, epoch: u64) -> u64 {
+        let halvings = epoch / self.mint_halving_epochs;
+        if halvings >= 64 { return 0; } // shift-width safety only; already 0 from halving 23
+        self.initial_mint_rate_ppb >> halvings
     }
 
-    /// Compute total scheduled Y minted up to (not including) a given epoch.
-    /// The hard cap applies to cumulative *scheduled* minting; the pool drip only
-    /// redistributes already-minted tokens and does not mint against the cap.
-    pub fn total_emitted_before_epoch(&self, epoch: u64) -> u64;
+    /// Tranche that nominal genesis entitlement `entitlement` vests in `epoch`.
+    /// Mirrored in the GenesisClaim contract (03 §A `genesis_tranche`).
+    pub fn genesis_tranche(&self, entitlement: u64, epoch: u64) -> u64 {
+        let window = epoch / self.genesis_vest_halving_epochs;
+        if window >= 64 { return 0; }
+        (entitlement / (2 * self.genesis_vest_halving_epochs)) >> window
+    }
 }
 ```
 
-**Epoch-0 genesis bootstrap:** at launch nobody holds Y, so there are no donations
-to direct emission. Epoch 0's scheduled emission (1.4B Y) is instead split equally
-among the deployer-seeded genesis accounts. From epoch 1 onward, distribution is
-donation-directed (see 03 §C).
+**Genesis:** there is no deployer-chosen account set. The genesis allocation is a snapshot Merkle root over eligible external keys, claimed in weekly tranches from epoch 0 (03 §A).
 
-**Per-epoch total and remainders:** the amount distributed to creators in an epoch is
-`emission_for_epoch(epoch) + creator_drip`, where `gross_drip = pool_balance × drip_bps`,
-`treasury_slice` is skimmed from it (03, A2), and `creator_drip = gross_drip − treasury_slice`.
-Any scheduled emission or `creator_drip` left undistributed (zero qualifying donations,
-or the emission match cap binding — see 03 §C) accrues to the Reward Pool rather than being lost.
+**Per-epoch issuance:** creators receive, per closed epoch, `mint_budget_e × received / spent_e` of new Y plus `drip_e × received / max(S_e, spent_e)` of recycled fees. Both are reserved at the epoch's close and pulled by the creator (03 §B, Fee Pool).
 
 ## Chain Events (`chain_events.rs`)
 
@@ -603,11 +723,42 @@ pub enum ChainEvent {
         to: PublicKey,
         amount: u64,
     },
-    /// A donation made to a post's creator.
-    Donation {
-        donor: PublicKey,
-        post_hash: ContentAddress,
-        amount: u64,
+    // --- Tips (03 §C) ---
+    /// A tip paid to a DSN identity; `protocol_fee` → fee pool, `facilitator_fee`
+    /// → `facilitator`, the rest → `recipient`.
+    Tip {
+        tipper: PublicKey,
+        recipient: IdentityId,
+        post_hash: Option<ContentAddress>,
+        amount: u64,                     // gross
+        protocol_fee: u64,
+        facilitator: Option<PublicKey>,
+        facilitator_fee: u64,
+    },
+    /// A tip to a foreign key; fees are taken now and the net amount is escrowed.
+    TipEscrowed {
+        escrow_id: u64,
+        tipper: PublicKey,
+        recipient_key: ForeignKey,
+        post_hash: Option<ContentAddress>,
+        amount: u64,                     // gross
+        protocol_fee: u64,
+        facilitator: Option<PublicKey>,
+        facilitator_fee: u64,
+        escrowed: u64,                   // net = amount − fees
+        refund_after: u64,               // block timestamp
+    },
+    /// The foreign key's owner claimed the escrow into a DSN identity.
+    TipEscrowClaimed {
+        escrow_id: u64,
+        destination: IdentityId,
+        amount: u64,                     // net
+    },
+    /// An unclaimed escrow refunded to the tipper after `refund_after`.
+    TipEscrowRefunded {
+        escrow_id: u64,
+        tipper: PublicKey,
+        amount: u64,                     // net
     },
     /// A handle claimed (previously unowned) on-chain.
     NameClaimed {
@@ -623,22 +774,23 @@ pub enum ChainEvent {
         new_value: u64,
         effective_epoch: u64,
     },
-    /// Per-epoch handle rent paid into the Reward Pool.
+    /// Handle rent paid into the fee pool (`amount` goes to the pool in full).
     NameRentPaid {
         handle: String,
         payer: PublicKey,
         amount: u64,
         paid_through_epoch: u64,
     },
-    /// A force-buy bid opened on a Harberger-tier handle (bid escrowed; 1% fee → pool).
+    /// A force-buy bid opened on a Harberger-tier handle (bid escrowed; 1% fee → fee pool).
     ForceBuyInitiated {
         handle: String,
         bidder: PublicKey,
         bid: u64,
         deadline_epoch: u64,
+        fee_to_pool: u64,
     },
     /// A handle changed owner (claim after a lapse, or a completed force-buy;
-    /// any floor-excess fee flows to the pool).
+    /// any floor excess flows to the fee pool).
     NameTransferred {
         handle: String,
         from: PublicKey,
@@ -650,29 +802,73 @@ pub enum ChainEvent {
         prior_owner: PublicKey,
         epoch: u64,
     },
-    /// An invitation issued on-chain.
-    Invitation {
-        inviter: PublicKey,
-        invitee: PublicKey,
-        cost: u64,
-    },
-    /// The epoch counter advanced. Fee portions of donations, invitations, handle
-    /// rent, and force-buy fees flow into the Reward Pool. The drip is then split:
-    /// `gross_drip = pool_balance × drip_bps`,
-    /// `treasury_slice = floor(gross_drip × TREASURY_DRIP_SHARE_BPS / 10_000)`
-    /// (0 after TREASURY_TERM_EPOCHS), `creator_drip = gross_drip − treasury_slice`.
-    EpochAdvanced {
-        epoch: u64,
-        scheduled_emission: u64,
-        gross_drip: u64,
-        treasury_slice: u64,
-        pool_balance: u64,
-    },
-    /// Emission distributed to a creator for an epoch.
-    EmissionDistributed {
-        epoch: u64,
-        creator: PublicKey,
+    // --- Like power & issuance (03 §B) ---
+    /// Y staked into the Like contract (adds regeneration, never stored power).
+    Staked {
+        staker: IdentityId,
         amount: u64,
+    },
+    /// Stake moved to pending withdrawal; regeneration on it stops now.
+    UnstakeRequested {
+        staker: IdentityId,
+        amount: u64,
+        available_at: u64,               // block timestamp
+    },
+    /// Pending stake withdrawn after the delay.
+    Unstaked {
+        staker: IdentityId,
+        amount: u64,
+    },
+    /// A batched like settlement. `power_spent` = Σ allocations (dust stays in the meter).
+    LikesSettled {
+        staker: IdentityId,
+        nonce: u64,
+        epoch: u64,
+        n_likes: u32,
+        power_spent: u64,
+        allocations: Vec<(IdentityId, u64)>, // (recipient, power received)
+    },
+    /// A creator pulled its reward for one closed epoch.
+    CreatorRewardsClaimed {
+        creator: IdentityId,
+        epoch: u64,
+        minted: u64,                     // new Y, counted against issuance capacity
+        fee_reward: u64,                 // recycled Y from the fee-pool reserve
+    },
+    /// The epoch counter advanced, closing `epoch − 1`: its issuance budget and
+    /// fee-pool share are reserved for pulled claims, and the base rent steps.
+    /// `closed_fee_reserved = closed_fee_drip × spent / max(stake_time, spent)`.
+    EpochAdvanced {
+        epoch: u64,                      // the new epoch
+        closed_power_spent: u64,
+        closed_stake_time: u64,
+        closed_mint_budget: u64,
+        closed_fee_drip: u64,
+        closed_fee_reserved: u64,
+        fee_pool_balance: u64,           // after the reservation
+        mint_rate_ppb: u64,              // k for the new epoch
+        base_rent: u64,                  // base rent for the new epoch
+    },
+    // --- Genesis (03 §A) ---
+    /// A genesis leaf activated into a DSN identity.
+    GenesisActivated {
+        key: ForeignKey,
+        cohort: u8,
+        account: IdentityId,
+        entitlement: u64,                // nominal
+    },
+    /// One epoch's genesis tranche claimed.
+    GenesisTrancheClaimed {
+        account: IdentityId,
+        epoch: u64,
+        amount: u64,
+    },
+    /// Nominal entitlement moved to another account (future tranches only).
+    EntitlementSplit {
+        from: IdentityId,
+        to: IdentityId,
+        amount: u64,
+        effective_epoch: u64,            // current epoch + 1
     },
     /// A batch of newly indexed content addresses anchored as a Merkle root on the
     /// AnchorLog contract — proves every included object existed before this block
@@ -821,11 +1017,8 @@ pub const SIGNATURE_SIZE: usize = 64;    // ed25519
 pub const CONTENT_ADDRESS_SIZE: usize = 32;
 pub const ED25519_SCHEME_ID: u8 = 1;     // scheme_id 1 = ed25519
 
-// Emission match cap, Treasury, and recovery constants — canonical values, mirrored
-// wherever restated (all tunable). See EpochConfig above.
-pub const EMISSION_MATCH_CAP_BPS: u64 = 400;    // 4% of a creator's raw weighted donation sum; invariant: EMISSION_MATCH_CAP_BPS < DONATION_FEE_BPS
-pub const TREASURY_DRIP_SHARE_BPS: u64 = 1500;  // 15% of the pool drip → Treasury
-pub const TREASURY_TERM_EPOCHS: u64 = 260;      // ~5y; then 100% of drip to creators
-pub const TREASURY_RECLAIM_EPOCH: u64 = 416;    // ~8y; unspent treasury auto-returns to pool
+// Epoch and recovery constants (tunable). Economic constants are canonical in 03
+// and mirrored in EpochConfig / SupplySchedule above.
+pub const EPOCH_SECONDS: u64 = 604_800;         // one week of L2 block time
 pub const RECOVERY_VETO_EPOCHS: u64 = 2;        // guardian-recovery veto window
 ```

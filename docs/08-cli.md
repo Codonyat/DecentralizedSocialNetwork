@@ -13,11 +13,11 @@ crates/cli/src/
 │   ├── mod.rs          # Command enum re-exports
 │   ├── key.rs          # Key generation, import, export
 │   ├── profile.rs      # Profile create, update, view
-│   ├── post.rs         # Post create, read, reply, repost, thread view
+│   ├── post.rs         # Post create, read, reply, repost, like, thread view
 │   ├── social.rs       # Follow, unfollow, feed view
-│   ├── token_y.rs      # Donate, tip, view balance, emission info
+│   ├── token_y.rs      # Like settlement, tip, transfer, stake, claim, balance, issuance
 │   ├── name.rs         # Claim/assess handles, rent status, pay rent, force-buy, lookup(+history)
-│   ├── invitation.rs   # Invite users, view invitation chain
+│   ├── invitation.rs   # Vouch send/accept/list
 │   └── label.rs        # Add/list content labels
 ├── config.rs           # Configuration loading (file + env + flags)
 ├── keystore.rs         # Local encrypted keyfile management
@@ -72,11 +72,11 @@ pub enum Command {
     TokenY(TokenYCommand),
     /// Handle management (Harberger-rented @handles)
     Name(NameCommand),
-    /// Invitation management
+    /// Invitations (vouches)
     Invite(InviteCommand),
     /// Content labels
     Label(LabelCommand),
-    /// View a creator's supporters (donor recognition; indexer convenience, NOT protocol)
+    /// View a creator's supporters (supporter recognition from tips; indexer convenience, NOT protocol)
     Supporters {
         /// Public key of the creator (short hex or full hex)
         creator: String,
@@ -127,8 +127,8 @@ pub enum KeyAction {
     /// Opt in to M-of-N social recovery by registering guardians (their
     /// IdentityIds) and a threshold. Signed by your current key.
     RecoverySetup {
-        /// Guardian IdentityId in hex (repeatable). Invitation-tree neighbors
-        /// are the natural choice.
+        /// Guardian IdentityId in hex (repeatable). Your vouchers and
+        /// vouchees are the natural choice.
         #[arg(long = "guardian")]
         guardians: Vec<String>,
         /// Number of guardian approvals required (M of N).
@@ -267,6 +267,15 @@ pub enum PostAction {
         #[arg(long)]
         quote: Option<String>,
     },
+    /// Like a post: publishes a signed `Like` object (free; a ranking edge
+    /// for everyone). If you are staked or hold a PowerDelegation, the like
+    /// is also queued for the daily batched settlement (03 §B), which spends
+    /// power and mints to the author. The reference client sends 100% of a
+    /// like to the author.
+    Like {
+        /// Content address of the post to like
+        address: String,
+    },
     /// View a single post by content address
     View {
         /// Content address of the post
@@ -329,51 +338,95 @@ pub enum SocialAction {
 }
 ```
 
-**Local ranking mode.** With `--local`, the CLI calls `GET /api/v1/candidates/:user_pk` instead of the feed endpoint and ranks on-device using the local interaction log (dwell, replies, donations — recorded locally, never uploaded). Rankers are weights + a declared feature schema executed by the CLI's fixed runtime — never code — and are swappable per invocation. Full design: 09-client-ranking.md.
+**Local ranking mode.** With `--local`, the CLI calls `GET /api/v1/candidates/:user_pk?sources=budget` instead of the feed endpoint; each candidate carries its budget share and why-path (09). It ranks on-device using the local interaction log (dwell, replies, likes, tips — recorded locally, never uploaded). Rankers are weights + a declared feature schema executed by the CLI's fixed runtime — never code — and are swappable per invocation. Full design: 09-client-ranking.md.
 
 ### Token Y Subcommands (`token_y.rs`)
 
 ```rust
 #[derive(Subcommand)]
 pub enum TokenYAction {
-    /// View your Y balance
+    /// View your Y balance, stake, and like power
     Balance,
-    /// Donate Y to a post's creator
-    Donate {
-        /// Content address of the post
+    /// Send Y as a plain transfer (no fee)
+    Transfer {
+        /// Recipient IdentityId (hex) or @handle
         #[arg(long)]
-        post: String,
-        /// Amount of Y to donate
+        to: String,
+        /// Amount of Y to send (atomic units)
         #[arg(long)]
         amount: u64,
-        /// Donate privately: the client generates a fresh standalone keypair,
-        /// funds it, and donates from it. The donation carries zero emission
-        /// weight (the fresh key is outside your invitation tree) and appears
-        /// anonymous in supporter features. Privacy is unlinkability at the
-        /// donation layer only, NOT chain-analysis resistance (the funding
-        /// transfer is public); private donors pay their own gas.
+    },
+    /// Tip Y to a user, optionally for a post. Protocol fee 1% to the fee
+    /// pool; facilitator fee 0-5% set by the originating client (the
+    /// reference CLI sets 0); the recipient gets the rest.
+    Tip {
+        /// Recipient: IdentityId (hex), @handle, or 0x… Ethereum address.
+        /// A tip to an Ethereum address goes to escrow until the key's owner
+        /// claims it; after 30 days unclaimed it becomes refundable to you
+        /// (`dsn y refund`; anyone may trigger the refund).
+        #[arg(long)]
+        to: String,
+        /// Content address of the post the tip is for
+        #[arg(long)]
+        post: Option<String>,
+        /// Amount of Y to tip (atomic units)
+        #[arg(long)]
+        amount: u64,
+        /// Tip privately: the client generates a fresh key, funds it, and
+        /// tips from it; the tip appears anonymous in supporter features.
+        /// Unlinkability at the tip layer only, NOT chain-analysis resistance
+        /// (the funding transfer is public); gas is not sponsored unless the
+        /// client chooses to.
         #[arg(long)]
         private: bool,
     },
-    /// Tip Y to another user
-    Tip {
-        /// Recipient public key
-        #[arg(long)]
-        to: String,
-        /// Amount of Y to send
+    /// Stake Y into the Like contract for like power. Power starts empty and
+    /// regenerates up to a cap of 24 h of regeneration.
+    Stake {
+        /// Amount of Y to stake (atomic units)
         #[arg(long)]
         amount: u64,
     },
+    /// Request an unstake. The amount is withdrawable after a 7-day delay;
+    /// its regeneration stops at the request.
+    Unstake {
+        /// Amount of Y to unstake (atomic units)
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Withdraw stake whose 7-day unstake delay has passed.
+    Withdraw,
+    /// Refund an unclaimed foreign-key escrow to its tipper once its 30 days
+    /// have passed (anyone may trigger it; the net escrowed amount returns).
+    Refund {
+        /// Escrow id printed when the tip was escrowed
+        #[arg(long)]
+        escrow: u64,
+    },
+    /// Show your power meter: current power, cap (24 h of regeneration),
+    /// and last settlement.
+    Power,
+    /// Submit the day's batched like settlement now (normally automatic,
+    /// once per day; gas paid by your gas account, or by a paymaster if one
+    /// is configured).
+    Settle,
+    /// Claim your creator rewards (issuance + fee-pool share) for closed
+    /// epochs.
+    Claim,
     /// View Y transaction history
     History {
         /// Number of transactions to show
         #[arg(long, default_value = "20")]
         limit: usize,
     },
-    /// View the current epoch emission info
-    Emission,
+    /// View the current epoch's issuance info: mint rate, fee pool, total
+    /// stake (reads `GET /api/v1/epoch`), plus your unclaimed rewards
+    /// (`GET /api/v1/users/:pk/economy`).
+    Issuance,
 }
 ```
+
+Genesis claims and foreign-key escrow claims are not CLI commands: they need an Ethereum wallet (the web client is TBD).
 
 ### Name Subcommands (`name.rs`)
 
@@ -381,14 +434,14 @@ pub enum TokenYAction {
 #[derive(Subcommand)]
 pub enum NameAction {
     /// Claim an unowned @handle. Sets the self-assessed value V (Harberger)
-    /// and pays the first epoch's rent into the Reward Pool at claim time.
+    /// and pays the first epoch's rent into the fee pool at claim time.
     Claim {
         /// The @handle to claim (given without the leading @)
         handle: String,
         /// Self-assessed value V in Y (atomic units). Mandatory and must be
         /// >= the tier floor for short handles (len 1-6). Omit for the flat
-        /// tier (len >= 7), where V is meaningless: flat 1 Y/epoch rent, no
-        /// force-buy.
+        /// tier (len >= 7), where V is meaningless: base rent (1 Y at launch,
+        /// demand-targeted — 03 §D), no force-buy.
         #[arg(long)]
         value: Option<u64>,
     },
@@ -403,7 +456,7 @@ pub enum NameAction {
         value: u64,
     },
     /// Pay rent on a handle you own, extending its paid-through epoch.
-    /// Rent flows to the Reward Pool.
+    /// Rent flows to the fee pool.
     PayRent {
         /// The @handle to pay rent on
         handle: String,
@@ -419,7 +472,7 @@ pub enum NameAction {
     },
     /// Force-buy a short (Harberger-tier) handle at its deterministic price
     /// = max(V, floor). Escrows the bid for the notice window and pays a
-    /// non-refundable 1% fee to the Reward Pool. Not available for flat-tier
+    /// non-refundable 1% fee to the fee pool. Not available for flat-tier
     /// handles (len >= 7 are a safe harbor).
     ForceBuy {
         /// The @handle to force-buy
@@ -438,20 +491,30 @@ pub enum NameAction {
 ```rust
 #[derive(Subcommand)]
 pub enum InviteAction {
-    /// Send an invitation to a new user (costs Y)
+    /// Vouch for a new user: prints a signed vouch token for the invitee's
+    /// key. No invite fee, no on-chain tree (05).
     Send {
         /// Public key of the invitee
         #[arg(long)]
         to: String,
-        /// Starter grant: a plain Y transfer from inviter to invitee sent
-        /// alongside the invitation, so the new account can immediately donate
-        /// and rent a handle. Reference-client convention (default 5 Y), not a
+        /// Optional starter grant: a plain Y transfer from voucher to invitee
+        /// sent alongside the vouch. Reference-client default 0; not a
         /// contract rule — a starter grant is just a transfer.
-        #[arg(long, default_value = "5000000")]
+        #[arg(long, default_value = "0")]
         grant: u64,
+        /// Also sign a PowerDelegation valid for this many epochs, so the
+        /// invitee's likes are settled from your power meter before they hold Y.
+        #[arg(long)]
+        delegate: Option<u64>,
     },
-    /// View your invitation chain (who invited you, who you invited)
-    Chain,
+    /// Accept a vouch: the invitee publishes the Vouch (publishing is
+    /// acceptance).
+    Accept {
+        /// Vouch token printed by the voucher's `invite send`
+        token: String,
+    },
+    /// List your vouches (vouched by / vouched for)
+    List,
 }
 ```
 
@@ -481,19 +544,19 @@ pub enum LabelAction {
 }
 ```
 
-### Donor Recognition Display (client convention, NOT protocol)
+### Supporter Recognition Display (client convention, NOT protocol)
 
-Donor recognition is a **presentation-layer convenience** computed by the client and
-indexer from public chain data. It is verifiable but carries **no economic-accuracy
-guarantee** — the protocol still treats a donation as a pure financial loss with no
-on-chain privilege. The CLI surfaces three conventions:
+Supporter recognition is a **presentation-layer convenience** computed by the client
+and indexer from public tips. It is verifiable but carries **no economic-accuracy
+guarantee** — a tip buys no on-chain privilege. The CLI surfaces three conventions:
 
-- **Thread-level prominence.** A donor's replies rank higher *within the donated
-  thread only*, proportional to the amount donated (a "superchat"). This never
+- **Thread-level prominence.** A tipper's replies rank higher *within the tipped
+  thread only*, proportional to the amount tipped (a "superchat"). This never
   buys global reach — confining the boost to the thread prevents pay-for-reach
   corruption of the wider feed.
-- **Supporter badges.** A user's lifetime Y donated to a creator, shown as a badge
-  on that creator's threads. Derived from public donations, so anyone can recompute it.
+- **Supporter badges.** A user's lifetime Y tipped to a creator, shown as a badge
+  on that creator's threads. Derived from public tips, so anyone can recompute it;
+  tips from fresh keys appear as anonymous supporters.
 - **Creator leaderboards.** `dsn supporters <creator>` renders the creator's ranked
   supporter list from the indexer's `GET /api/v1/creators/:pk/supporters` endpoint.
 
@@ -603,9 +666,11 @@ impl IndexerClient {
         after: Option<&ContentAddress>,
     ) -> Result<Vec<FeedItem>, IndexerError>;
 
-    /// Fetch the global trending feed.
-    pub async fn trending(
+    /// Fetch labelled exploration items for a topic from a topic indexer
+    /// (`GET /api/v1/explore?topic=`; the 20% exploration slot, see 09).
+    pub async fn explore(
         &self,
+        topic: &str,
         limit: usize,
     ) -> Result<Vec<FeedItem>, IndexerError>;
 
@@ -652,8 +717,17 @@ impl IndexerClient {
         user: &PublicKey,
     ) -> Result<YBalanceSummary, IndexerError>;
 
-    /// Fetch epoch info via `GET /api/v1/epoch`: current epoch, scheduled
-    /// emission, Reward Pool drip (2% of balance), and Reward Pool balance.
+    /// Fetch a user's economy via `GET /api/v1/users/:pk/economy`: balance,
+    /// stake, power, cap, unclaimed creator rewards, genesis status.
+    pub async fn economy(
+        &self,
+        user: &PublicKey,
+    ) -> Result<UserEconomy, IndexerError>;
+
+    /// Fetch epoch info via `GET /api/v1/epoch`: current epoch, mint rate,
+    /// last close (power spent, stake-time, mint budget, fee drip and fee
+    /// reserved), fee pool balance, minted total, issuance capacity, total
+    /// stake, base rent, and treasury balance.
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
     // --- Handle queries ---
@@ -672,16 +746,18 @@ impl IndexerClient {
         handle: &str,
     ) -> Result<NameStatus, IndexerError>;
 
-    // --- Donation queries ---
+    // --- Engagement queries ---
 
-    /// Fetch donation totals for a post.
-    pub async fn post_donations(
+    /// Fetch engagement for a post (likes + tips): like count, tip total,
+    /// unique tippers, and the tips.
+    pub async fn post_engagement(
         &self,
         post: &ContentAddress,
-    ) -> Result<DonationInfo, IndexerError>;
+    ) -> Result<PostEngagement, IndexerError>;
 
-    /// Fetch a creator's supporter leaderboard (donor recognition; derived
-    /// from public chain data, NOT under the economic-accuracy guarantee).
+    /// Fetch a creator's supporter leaderboard (supporter recognition from
+    /// tips; derived from public chain data, NOT under the economic-accuracy
+    /// guarantee).
     pub async fn creator_supporters(
         &self,
         creator: &PublicKey,
@@ -695,13 +771,14 @@ impl IndexerClient {
         post: &ContentAddress,
     ) -> Result<Vec<LabelInfo>, IndexerError>;
 
-    // --- Invitation queries ---
+    // --- Vouch queries ---
 
-    /// Fetch the invitation chain for a user.
-    pub async fn invitation_chain(
+    /// Fetch a user's vouches (vouched by / vouched for) via
+    /// `GET /api/v1/profiles/:user_pk/vouches`.
+    pub async fn vouches(
         &self,
         user: &PublicKey,
-    ) -> Result<InvitationChain, IndexerError>;
+    ) -> Result<VouchList, IndexerError>;
 }
 ```
 
@@ -718,9 +795,15 @@ pub struct FeedItem {
     pub repost_of: Option<ContentAddress>,
     /// Count of reposts/quotes of this post.
     pub repost_count: u64,
-    pub donation_total: u64,
-    /// Donor-recognition badge for the author (client convention, NOT protocol).
+    pub like_count: u64,
+    /// Total Y tipped to this post (atomic units).
+    pub tip_total: u64,
+    /// Supporter-recognition badge for the author (client convention, NOT protocol).
     pub author_badge: Option<SupporterBadge>,
+    /// Why-path of a budget item (09), shown as "via you → Alice → repost".
+    pub why_path: Option<WhyPath>,
+    /// Provider and topic label of an exploration item (09).
+    pub explore: Option<ExploreLabel>,
 }
 
 /// Detailed post view.
@@ -733,30 +816,32 @@ pub struct PostDetail {
     pub repost_of: Option<ContentAddress>,
     /// Count of reposts/quotes of this post.
     pub repost_count: u64,
-    pub donation_total: u64,
+    pub like_count: u64,
+    /// Total Y tipped to this post (atomic units).
+    pub tip_total: u64,
     pub labels: Vec<LabelInfo>,
-    /// Donor-recognition badge for the author (client convention, NOT protocol).
+    /// Supporter-recognition badge for the author (client convention, NOT protocol).
     pub author_badge: Option<SupporterBadge>,
-    /// Thread-scoped donor prominence (atomic Y donated to this thread's root
-    /// author); used only to rank this reply within its thread, never globally.
+    /// Thread-scoped supporter prominence (atomic Y tipped to this thread's
+    /// root author); used only to rank this reply within its thread, never globally.
     pub thread_prominence: Option<u64>,
 }
 
 /// Thread view: root post plus nested replies.
 pub struct ThreadView {
     pub root: PostDetail,
-    /// Nested replies, ordered by thread-scoped donor prominence then recency.
+    /// Nested replies, ordered by thread-scoped supporter prominence then recency.
     pub replies: Vec<ThreadView>,
-    /// True if this node was surfaced by thread-level donor prominence
+    /// True if this node was surfaced by thread-level supporter prominence
     /// (superchat-style boost, confined to this thread only).
-    pub donor_boosted: bool,
+    pub supporter_boosted: bool,
 }
 
-/// Donor-recognition badge, computed from public chain data. Verifiable but
+/// Supporter-recognition badge, computed from public tips. Verifiable but
 /// NOT part of the protocol's economic-accuracy guarantee.
 pub struct SupporterBadge {
-    /// Lifetime Y donated to the creator in context (atomic units, JSON string).
-    pub lifetime_donated: u64,
+    /// Lifetime Y tipped to the creator in context (atomic units, JSON string).
+    pub lifetime_tipped: u64,
     /// Rank on the creator's supporter leaderboard, if ranked.
     pub rank: Option<u32>,
 }
@@ -770,7 +855,7 @@ pub struct CreatorSupporters {
 pub struct SupporterEntry {
     pub supporter: PublicKey,
     pub profile: Option<UserProfile>,
-    pub lifetime_donated: u64,  // atomic Y
+    pub lifetime_tipped: u64,   // atomic Y
     pub rank: u32,
 }
 
@@ -782,7 +867,7 @@ pub struct NameStatus {
     /// Self-assessed value V in atomic Y; 0 for the flat tier.
     pub assessed_value: u64,
     pub tier: HandleTier,
-    /// Rent per epoch in atomic Y (0.1% of max(V, floor) for Harberger; flat 1 Y).
+    /// Rent per epoch in atomic Y (0.1% of max(V, floor) for Harberger; base rent for Flat).
     pub rent_per_epoch: u64,
     pub rent_status: RentState,
     /// Present while a force-buy is in its notice window.
@@ -795,7 +880,8 @@ pub struct NameStatus {
 pub enum HandleTier {
     /// len 1-6: rent = 0.1% of max(V, floor), force-buyable.
     Harberger,
-    /// len >= 7: flat 1 Y/epoch, no force-buy (safe harbor).
+    /// len >= 7: base rent (1 Y at launch, demand-targeted — 03 §D), no
+    /// force-buy (safe harbor).
     Flat,
 }
 
@@ -863,11 +949,11 @@ impl SpotChecker {
         post: &ContentAddress,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
-    /// Verify donation data reported by the indexer against on-chain records.
-    pub async fn verify_donations(
+    /// Verify tip data reported by the indexer against on-chain tip records.
+    pub async fn verify_tips(
         &self,
         post: &ContentAddress,
-        indexer_donations: &DonationInfo,
+        indexer_engagement: &PostEngagement,
     ) -> Result<SpotCheckResult, SpotCheckError>;
 
     /// Return a summary of recent spot-check results.
@@ -892,10 +978,10 @@ impl SpotChecker {
 3. Confirm the branch resolves to an on-chain anchor root; the anchoring transaction's block gives a trustless "existed before" bound (independent of the informational `claimed_epoch`)
 4. An un-anchored object is reported Inconclusive until the next anchor interval
 
-**Donation verification:**
+**Tip verification:**
 
-1. Read donation records for the post from on-chain data via `dsn-chain`
-2. Compare the total donated amount and individual donations against the indexer's report
+1. Read tip records for the post from on-chain data via `dsn-chain`
+2. Compare the tip total and individual tips against the indexer's report
 3. If any values mismatch, flag the indexer result as untrustworthy
 
 ### Result Types
@@ -927,7 +1013,7 @@ pub enum CheckType {
     PostContent,
     PostSignature,
     PostAnchor,
-    DonationData,
+    TipData,
 }
 
 pub struct SpotCheckSummary {
@@ -1039,7 +1125,7 @@ Post by alice (a1b2c3d4...)
 
   This is my first post on the decentralized social network!
 
-  Replies: 3 | Reposts: 2 | Donations: 450 Y
+  Replies: 3 | Reposts: 2 | Likes: 12 | Tips: 450 Y
   Address: 0xabcd1234...
 ```
 
@@ -1053,7 +1139,8 @@ Post by alice (a1b2c3d4...)
   "reply_count": 3,
   "repost_of": null,
   "repost_count": 2,
-  "donation_total": 450,
+  "like_count": 12,
+  "tip_total": 450,
   "created_at": "2026-01-15T10:32:00Z"
 }
 ```
@@ -1061,9 +1148,9 @@ Post by alice (a1b2c3d4...)
 **Table**: Compact tabular format for listing commands.
 
 ```
-ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  REPOSTS  DONATED
-abcd1234..   alice (a1b2) This is my first post on the decent..  3        2        450 Y
-ef567890..   bob (e5f6)   Replying to the above — great to se..  1        0        120 Y
+ADDRESS      AUTHOR       CONTENT (preview)                      REPLIES  REPOSTS  LIKES  TIPS
+abcd1234..   alice (a1b2) This is my first post on the decent..  3        2        12     450 Y
+ef567890..   bob (e5f6)   Replying to the above — great to se..  1        0        4      120 Y
 ```
 
 ### Implementation
@@ -1139,7 +1226,7 @@ Post by Alice (a1b2c3d4...)
 
   Hello, decentralized world!
 
-  Replies: 0 | Reposts: 0 | Donations: 0 Y
+  Replies: 0 | Reposts: 0 | Likes: 0 | Tips: 0 Y
 
 # Reply to a post
 $ dsn post reply --to abcd1234efgh5678 "Welcome, Alice!"
@@ -1179,60 +1266,102 @@ Now following e5f6a7b8... (Bob)
 $ dsn social feed --limit 10
 [1] Bob (e5f6a7b8...) — 5 min ago
     Just deployed v0.2 of the indexer. Performance is 3x better!
-    Replies: 2 | Reposts: 4 | Donations: 320 Y
+    Replies: 2 | Reposts: 4 | Likes: 41 | Tips: 320 Y
 
 [2] Charlie (c9d0e1f2...) — 20 min ago
     Interesting paper on sybil resistance: https://...
-    Replies: 7 | Reposts: 9 | Donations: 1,050 Y
+    Replies: 7 | Reposts: 9 | Likes: 88 | Tips: 1,050 Y
 ```
 
 ### Token Operations
 
 ```bash
-# View Y balance
+# Stake Y for like power (power starts empty; the cap is 24 h of regeneration)
+$ dsn y stake --amount 500000000
+Enter passphrase: ********
+Staked 500.000000 Y. Like power starts at 0 and regenerates to a cap of 71,428,571.
+
+# View Y balance, stake and like power (about 21 h later)
 $ dsn y balance
 Y Balance: 1,250.000000
+Staked: 500.000000 Y
+Like power: 62,400,000 / 71,428,571 (cap)
 Nonce: 14
 
-# Donate Y to a post's creator
-$ dsn y donate --post abcd1234efgh5678 --amount 25000000
+# Like a post: publishes a signed Like (free; a ranking edge). You are staked,
+# so it is also queued for today's batched settlement.
+$ dsn post like abcd1234efgh5678
 Enter passphrase: ********
-Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
-  (5% fee to Reward Pool; the remainder weights the creator's next-epoch emission share)
+Like published: abcd1234efgh5678 (author: e5f6a7b8..., Bob)
+  Queued for today's settlement (2% of current power; 100% to the author).
 
-# Donate privately (fresh standalone keypair; zero emission weight, anonymous)
-$ dsn y donate --post abcd1234efgh5678 --amount 25000000 --private
-Enter passphrase: ********
-Generated a fresh standalone keypair and funded it.
-Donated 25.000000 Y to post abcd1234efgh5678 (creator: e5f6a7b8..., Bob)
-  (5% fee to Reward Pool; creator share unchanged)
-  Weight: 0.0 — the fresh key is outside your invitation tree, so this donation
-  carries no emission weight and appears anonymous in supporter features.
-  WARNING: privacy is unlinkability at the donation layer only, NOT
-  chain-analysis resistance — the funding transfer is public and its gas is
-  paid by you (the sponsored-gas paymaster covers only invited accounts).
+# Check the power meter
+$ dsn y power
+Like power: 62,400,000 / 71,428,571   (cap = 24 h of regeneration)
+Queued likes: 3
+Last settlement: epoch 43, 5 h ago
 
-# Tip a user
-$ dsn y tip --to e5f6a7b8... --amount 25000000
+# Settle today's batch now (normally automatic, once per day)
+$ dsn y settle
+Settled 3 likes (epoch 43): 3,669,618 power spent -> 2 creators
+
+# Claim creator rewards (issuance + fee-pool share) for closed epochs
+$ dsn y claim
 Enter passphrase: ********
-Tip sent: 25.000000 Y to e5f6a7b8... (Bob)
+Claimed creator rewards for epochs 41-42:
+  Issuance:   38.250000 Y
+  Fee pool:    1.120000 Y
+  Total:      39.370000 Y
+
+# Request an unstake (withdrawable after 7 days; regeneration on it stops now)
+$ dsn y unstake --amount 100000000
+Enter passphrase: ********
+Unstake requested: 100.000000 Y, withdrawable in 7 days.
+
+# Tip a post's author (1% protocol fee to the fee pool; the reference CLI
+# charges no facilitator fee)
+$ dsn y tip --to @bob --post abcd1234efgh5678 --amount 25000000
+Enter passphrase: ********
+Tip sent: 25.000000 Y to e5f6a7b8... (Bob) for post abcd1234efgh5678
+  Protocol fee (1%): 0.250000 Y -> fee pool | Facilitator fee: 0 | Bob receives 24.750000 Y
+
+# Tip an Ethereum address that has no DSN identity yet: held in escrow until
+# the key's owner claims it, refundable to you after 30 days if unclaimed
+$ dsn y tip --to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed --amount 10000000
+Enter passphrase: ********
+Tip escrowed: 9.900000 Y for 0x5aAe...eAed (escrow 1842)
+  Protocol fee (1%): 0.100000 Y -> fee pool
+  Refundable to you after 30 days if unclaimed: dsn y refund --escrow 1842
+
+# Tip privately (from a fresh key; appears as an anonymous supporter)
+$ dsn y tip --to @bob --amount 25000000 --private
+Enter passphrase: ********
+Generated a fresh key and funded it.
+Tip sent: 25.000000 Y to e5f6a7b8... (Bob) from a fresh key
+  WARNING: privacy is unlinkability at the tip layer only, NOT
+  chain-analysis resistance — the funding transfer is public.
+
+# Plain Y transfer (no fee)
+$ dsn y transfer --to e5f6a7b8... --amount 5000000
+Enter passphrase: ********
+Transferred 5.000000 Y to e5f6a7b8... (Bob)
 
 # View Y transaction history
 $ dsn y history --limit 5
 TYPE      AMOUNT       TO/POST                  EPOCH
-donate    25.000000    abcd1234efgh5678         43
-tip       25.000000    e5f6a7b8... (Bob)        43
-emission  87.500000    (auto)                   42
+tip       25.000000    abcd1234efgh5678         43
+transfer   5.000000    e5f6a7b8... (Bob)        43
+claim     39.370000    (creator rewards)        43
 tip       10.000000    c9d0e1f2... (Charlie)    41
 
-# View emission info (reads GET /api/v1/epoch via IndexerClient::epoch_info)
-$ dsn y emission
+# View issuance info (IndexerClient::epoch_info, plus economy() for your rewards)
+$ dsn y issuance
 Current epoch: 43
-Scheduled emission: 1,400,000,000 Y      (epochs 0-49, before the first halving)
-Reward Pool drip (2%): 250,000 Y         (pool balance: 12,500,000 Y)
-Total epoch emission: 1,400,250,000 Y    (scheduled + drip)
-Your share (last epoch): 87.500000 Y
-Distribution: automatic per epoch, directed by donation weighting
+Mint rate: 5,000,000 ppb   (0.5% of power spent; halves every 104 epochs)
+Last close (epoch 42): 9,100,000 Y reserved for creator claims
+Fee pool: 12,366,177 Y     (last drip 250,000 Y; 133,823 Y reserved for creators)
+Total stake: 3,400,000,000 Y
+Your unclaimed creator rewards: 0.000000 Y
 ```
 
 ### Handles (Harberger @handles)
@@ -1242,14 +1371,14 @@ Short handles (len 1-6) are Harberger-taxed; long handles (len >= 7) rent flat.
 
 ```bash
 # Claim a short @handle (Harberger tier). Set the self-assessed value V and pay
-# the first epoch's rent to the Reward Pool. V itself is NOT spent — it is the
+# the first epoch's rent to the fee pool. V itself is NOT spent — it is the
 # price at which you agree to be force-bought.
 $ dsn name claim alice --value 10000000000
 Enter passphrase: ********
 Handle claimed: @alice
   Tier: Harberger (len 5, assessment floor 10,000 Y)
   Self-assessed value (V): 10,000.000000 Y
-  First-epoch rent paid: 10.000000 Y   (0.1% of max(V, floor)) -> Reward Pool
+  First-epoch rent paid: 10.000000 Y   (0.1% of max(V, floor)) -> fee pool
   Rent paid through: epoch 43
   Your Y after: 1,240.000000 Y
 
@@ -1275,7 +1404,7 @@ Handle: @alice
 $ dsn name pay-rent alice --epochs 3
 Enter passphrase: ********
 Rent paid: @alice
-  3 epochs x 50.000000 Y = 150.000000 Y -> Reward Pool
+  3 epochs x 50.000000 Y = 150.000000 Y -> fee pool
   Rent paid through: epoch 46
   Your Y after: 1,090.000000 Y
 
@@ -1286,7 +1415,7 @@ Enter passphrase: ********
 Force-buy initiated on @chris
   Deterministic price (bid): 20,000.000000 Y   (max(V = 20,000, floor = 10,000))
   Escrowed until epoch 47 (1-epoch notice window): 20,000.000000 Y
-  Non-refundable fee (1%): 200.000000 Y -> Reward Pool
+  Non-refundable fee (1%): 200.000000 Y -> fee pool
   Total charged now: 20,200.000000 Y
   The owner may cancel by raising V to >= 22,000.000000 Y (110% of the bid).
   If uncontested, @chris transfers to you at epoch 47.
@@ -1300,16 +1429,16 @@ Assessment updated: @chris
   Self-assessed value (V): 22,000.000000 Y   (>= 110% of the 20,000 Y bid)
   Force-buy cancelled; the challenger's 20,000 Y bid is refunded (the 1% fee is not).
   New rent: 22.000000 Y/epoch
-  Retroactive rent on the +2,000 Y increase over 26 epochs: 52.000000 Y -> Reward Pool
+  Retroactive rent on the +2,000 Y increase over 26 epochs: 52.000000 Y -> fee pool
 
 # If the owner does NOT cancel, the transfer executes at the deadline with a
 # waterfall over the escrowed 20,000 Y bid (it can never exceed the bid or underflow).
 # Example with 40 Y of rent arrears owed by the previous owner:
-#   1. arrears -> Reward Pool:                   40.000000 Y
+#   1. arrears -> fee pool:                      40.000000 Y
 #   2. owner_share = min(V, bid - arrears):  19,960.000000 Y -> previous owner
-#   3. remainder -> Reward Pool:                  0.000000 Y
+#   3. remainder -> fee pool:                     0.000000 Y
 # Under-assessing does not help a squatter: the owner payout is capped at
-# min(V, ...), and any excess up to the floor-based bid goes to the Reward Pool.
+# min(V, ...), and any excess up to the floor-based bid goes to the fee pool.
 
 # Look up a handle: owner, live rent status, and ownership history.
 $ dsn name lookup nadia
@@ -1326,13 +1455,14 @@ Handle: @nadia
 Flat tier (len >= 7) — no assessed value, flat rent, and a permanent safe harbor:
 
 ```bash
-# Claim a long @handle: omit --value; rent is a flat 1 Y/epoch for every length >= 7.
+# Claim a long @handle: omit --value; rent is the base rent (1 Y at launch,
+# demand-targeted — 03 §D) for every length >= 7.
 $ dsn name claim decentralist
 Enter passphrase: ********
 Handle claimed: @decentralist
   Tier: Flat (len 12)
   Rent: 1.000000 Y/epoch   (identical for every handle of length >= 7)
-  First-epoch rent paid: 1.000000 Y -> Reward Pool
+  First-epoch rent paid: 1.000000 Y -> fee pool
   Rent paid through: epoch 43
   Note: no self-assessed value and no force-buy — long handles cannot be taken.
 
@@ -1341,33 +1471,39 @@ $ dsn name force-buy decentralist
 Error: force-buy not available for @decentralist (flat tier, len 12 — safe harbor)
 ```
 
-### Invitations
+### Invitations (vouches)
 
 ```bash
-# Invite a new user (costs Y; a 5 Y starter grant is sent alongside by default
-# so the invitee can immediately donate and rent a handle)
+# Vouch for a new user: prints a signed vouch token for the invitee's key
+# (no invite fee, no on-chain tree; no starter grant by default)
 $ dsn invite send --to f3a4b5c6...
 Enter passphrase: ********
-Invitation sent.
-  Invitee: f3a4b5c6...
-  Y cost deducted from balance.
-  Starter grant: 5.000000 Y -> f3a4b5c6...   (plain transfer, not a protocol rule)
+Vouch token for f3a4b5c6...:
+  9c2e41d0a7b3...7b41
+  The invitee accepts with: dsn invite accept <token>
 
-# Send a larger starter grant
-$ dsn invite send --to f3a4b5c6... --grant 20000000
+# Vouch with a 5 Y starter grant and a PowerDelegation, so the invitee's likes
+# settle from your power meter before they hold Y
+$ dsn invite send --to f3a4b5c6... --grant 5000000 --delegate 4
 Enter passphrase: ********
-Invitation sent.
-  Invitee: f3a4b5c6...
-  Y cost deducted from balance.
-  Starter grant: 20.000000 Y -> f3a4b5c6...
+Vouch token for f3a4b5c6...:
+  4a8d17c2e9f0...e019
+  Starter grant: 5.000000 Y -> f3a4b5c6...   (plain transfer, not a protocol rule)
+  PowerDelegation published: f3a4b5c6... may spend from your power meter
 
-# View your invitation chain
-$ dsn invite chain
-You (a1b2c3d4...) — invited by d7e8f9a0... (epoch 12)
-├── e5f6a7b8... (Bob) — invited epoch 20
-├── c9d0e1f2... (Charlie) — invited epoch 25
-│   └── f3a4b5c6... (Dave) — invited epoch 38
-└── [2 more invitees]
+# (invitee) Accept: publishing the Vouch is the acceptance
+$ dsn invite accept 9c2e41d0a7b3...7b41
+Enter passphrase: ********
+Vouch published: vouched for by a1b2c3d4... (Alice)
+
+# List your vouches
+$ dsn invite list
+Vouched by:
+  d7e8f9a0... — epoch 12
+Vouched for:
+  e5f6a7b8... (Bob)     — epoch 20
+  c9d0e1f2... (Charlie) — epoch 25
+  f3a4b5c6... (Dave)    — epoch 38
 ```
 
 ### Labels
@@ -1389,20 +1525,20 @@ Labels: 3
   harassment   by c9d0e1f2... — epoch 44
 ```
 
-### Supporters (Donor Recognition)
+### Supporters (Supporter Recognition)
 
 ```bash
-# View a creator's supporter leaderboard (derived from public donations;
+# View a creator's supporter leaderboard (derived from public tips;
 # a client/indexer convenience, NOT a protocol privilege).
 $ dsn supporters e5f6a7b8...
 Supporters of Bob (e5f6a7b8...):
-  RANK  SUPPORTER              LIFETIME DONATED
+  RANK  SUPPORTER              LIFETIME TIPPED
   1     a1b2c3d4... (Alice)    1,250.000000 Y
   2     c9d0e1f2... (Charlie)    640.000000 Y
   3     f3a4b5c6... (Dave)       180.000000 Y
   [12 more]
 Note: badges and thread prominence are computed off-chain and verifiable, but
-carry no economic-accuracy guarantee — a donation buys no on-chain privilege.
+carry no economic-accuracy guarantee — a tip buys no on-chain privilege.
 ```
 
 ## Error Handling Strategy
@@ -1578,6 +1714,6 @@ async fn main() {
 | `rand` | latest | Spot-check probability, nonce generation |
 | `dsn-core` | workspace | Core types, crypto primitives |
 | `dsn-data` | workspace | Storage trait abstractions |
-| `dsn-chain` | workspace | On-chain data reading (donations, names) |
+| `dsn-chain` | workspace | On-chain data reading (tips, stakes, names) |
 | `dsn-token-y` | workspace | Y balance validation, transfer verification |
-| `dsn-invitation` | workspace | Invitation chain operations |
+| `dsn-invitation` | workspace | Vouch and delegation objects |
