@@ -12,7 +12,7 @@ crates/core/src/
 ├── like.rs             # Like object: the one button (money rules: 03 §B)
 ├── vouch.rs            # Vouch + PowerDelegation (canonical spec: 05)
 ├── label.rs            # Content label (canonical spec: 06)
-├── token.rs            # Tip, ForeignKey, GenesisLeaf, PowerMeter, NameRecord (on-chain types)
+├── token.rs            # Tip, ForeignKey, SnapshotLeaf, PowerMeter, NameRecord (on-chain types)
 ├── epoch.rs            # Time-based epochs, EpochConfig, supply schedule
 ├── chain_events.rs     # ChainEvent enum (smart contract events)
 ├── crypto.rs           # Hashing, signing helpers
@@ -74,7 +74,7 @@ sign. A handle is a convenience layer, never an identity:
 - The on-chain registry keeps queryable ownership history, so a client can render "formerly @x" and warn when a handle recently changed hands. Handles are rented, so a handle pointing at an identity today is no guarantee it did yesterday.
 
 **IdentityId convention (binding).** Wherever protocol data references a user — vouches,
-likes, tips, stakes, labels, handle ownership, API `:user_pk` params, CLI
+likes, tips, deposits, labels, handle ownership, API `:user_pk` params, CLI
 output — the value is the **`IdentityId`** (the genesis key), never a current signing
 key. Because `IdentityId` IS a `PublicKey`, every existing `PublicKey`-typed reference
 is already correct; the current signing key is consulted only to verify a signature,
@@ -384,7 +384,7 @@ pub struct FeedIndex {
 
 ## Like Types (`like.rs`)
 
-The one button (03 §B). A like is an off-chain signed, content-addressed object — free, and a ranking edge for everyone (09). For an account with stake, or under a sponsor's `PowerDelegation`, the client also settles it on-chain, where it spends like power and directs issuance (03 §B).
+The one button (03 §B). A like is an off-chain signed, content-addressed object — free, and a ranking edge for everyone (09). For an account with a deposit, or under a sponsor's `PowerDelegation`, the client also settles it on-chain, where it spends like power and directs issuance (03 §B).
 
 ```rust
 /// A signed like (off-chain, content-addressed).
@@ -451,7 +451,7 @@ All token operations happen on-chain via smart contracts. These types represent 
 
 ```rust
 /// A pre-existing external key that can receive an escrowed tip or hold a
-/// genesis leaf (03 §A, §C). Ethereum addresses first; ENS names resolve
+/// snapshot leaf (03 §A, §C). Ethereum addresses first; ENS names resolve
 /// client-side to an address.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ForeignKey {
@@ -485,9 +485,9 @@ pub struct Tip {
     pub recipient_amount: u64,
 }
 
-/// One genesis entitlement, committed under the genesis Merkle root (03 §A).
+/// One snapshot entitlement, committed under the snapshot Merkle root (03 §A).
 #[derive(Clone, Serialize, Deserialize)]
-pub struct GenesisLeaf {
+pub struct SnapshotLeaf {
     /// Cohort id (TREASURY_COHORT_ID for the treasury leaf).
     pub cohort: u8,
     /// The eligible external key.
@@ -496,11 +496,11 @@ pub struct GenesisLeaf {
     pub entitlement: u64,
 }
 
-/// Per-account genesis state in the GenesisClaim contract (03 §A). A split
+/// Per-account snapshot state in the SnapshotClaim contract (03 §A). A split
 /// changes `nominal` only from `next_effective_epoch`, so a tranche is always
 /// claimed on the nominal in force during its own epoch.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct GenesisAccount {
+pub struct SnapshotAccount {
     /// Nominal entitlement in force now.
     pub nominal: u64,
     /// Nominal after pending splits in and out; takes effect at `next_effective_epoch`.
@@ -513,13 +513,13 @@ pub struct GenesisAccount {
 /// Per-account like-power state in the Like contract (03 §B).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PowerMeter {
-    /// Stake that regenerates power.
-    pub eligible_stake: u64,
-    /// Stake awaiting withdrawal; regenerates nothing.
-    pub pending_unstake: u64,
-    /// Block time at which `pending_unstake` becomes withdrawable.
-    pub unstake_available_at: u64,
-    /// Power stored at `last_update` (<= power_cap(eligible_stake)).
+    /// Deposit that regenerates power.
+    pub eligible_deposit: u64,
+    /// Deposit awaiting withdrawal; regenerates nothing.
+    pub pending_withdrawal: u64,
+    /// Block time at which `pending_withdrawal` becomes withdrawable.
+    pub withdrawal_available_at: u64,
+    /// Power stored at `last_update` (<= power_cap(eligible_deposit)).
     pub stored_power: u64,
     /// Block timestamp of the last accrual.
     pub last_update: u64,
@@ -565,7 +565,7 @@ pub struct ForceBuy {
 
 **Fee arithmetic convention (applies to every bps and rate calculation in these docs):**
 every basis-point or rate multiplication uses `u128` intermediates, because at the
-140B-Y scale `amount * bps` (and pool-balance or stake-time math) overflows `u64`.
+140B-Y scale `amount * bps` (and pool-balance or deposit-time math) overflows `u64`.
 Protocol **fees round up** — `fee = ((x as u128 * bps as u128 + 9_999) / 10_000) as u64` —
 so no dust ever escapes fee-free; **payouts, drips, reservations and facilitator fees
 round down**; a zero denominator yields zero.
@@ -580,11 +580,11 @@ round down**; a zero denominator yields zero.
 - If `post` is set, an `Identity` recipient should be its author (checked by clients and indexers; the contract cannot see off-chain authorship)
 
 **PowerMeter (settlement):**
-- `nonce == settle_nonce`; `n_likes >= 1`; every allocation weight > 0; no allocation to the staker itself
+- `nonce == settle_nonce`; `n_likes >= 1`; every allocation weight > 0; no allocation to the depositor itself
 - Power spent is computed by the contract from block time (03 §B); the sum allocated is debited
 
-**GenesisLeaf (activation):**
-- Merkle proof to the genesis root; signature by `key` naming the destination `IdentityId`; each leaf activates once
+**SnapshotLeaf (activation):**
+- Merkle proof to the snapshot root; signature by `key` naming the destination `IdentityId`; each leaf activates once
 
 **NameRecord (claim):**
 - `handle` must match `^[a-z0-9-]{1,32}$` (NFKC-normalized before matching)
@@ -617,14 +617,14 @@ pub struct EpochConfig {
     pub power_cap_seconds: u64,              // POWER_CAP_SECONDS = 86_400 (24 h)
     /// Share of current power each like spends (basis points). (tunable)
     pub like_spend_bps: u64,                 // LIKE_SPEND_BPS = 200 (2%)
-    /// Delay between an unstake request and withdrawal; regeneration stops at the request. (tunable)
-    pub unstake_delay_seconds: u64,          // UNSTAKE_DELAY_SECONDS = 604_800 (7 days)
+    /// Delay between a withdrawal request and withdrawal; regeneration stops at the request. (tunable)
+    pub withdrawal_delay_seconds: u64,          // WITHDRAWAL_DELAY_SECONDS = 604_800 (7 days)
     // --- Fee pool ---
     /// Share of the fee pool balance dripped at each epoch close (basis points). (tunable)
     pub fee_pool_drip_bps: u64,              // FEE_POOL_DRIP_BPS = 200 (2%)
-    // --- Genesis (03 §A) ---
-    /// Epochs a genesis tranche stays claimable. (tunable)
-    pub genesis_claim_window_epochs: u64,    // GENESIS_CLAIM_WINDOW_EPOCHS = 1
+    // --- Snapshot (03 §A) ---
+    /// Epochs a snapshot tranche stays claimable. (tunable)
+    pub snapshot_claim_window_epochs: u64,    // SNAPSHOT_CLAIM_WINDOW_EPOCHS = 1
     // --- Names (03 §D) ---
     /// Harberger rent rate for short handles (basis points of `max(V, floor)` per epoch,
     /// e.g., 10 = 0.1%). (tunable)
@@ -634,9 +634,11 @@ pub struct EpochConfig {
     /// Clamp on the base rent (atomic Y). MAX keeps 1_000_000 × base within u64.
     pub min_base_rent: u64,                  // MIN_BASE_RENT = 1_000
     pub max_base_rent: u64,                  // MAX_BASE_RENT = u64::MAX / 1_000_000
-    /// Per-epoch base-rent step toward the claim target (basis points). (tunable)
+    /// Maximum per-epoch base-rent step; the actual step is proportional to the
+    /// miss against the claim target (basis points). (tunable)
     pub base_rent_step_bps: u64,             // BASE_RENT_STEP_BPS = 1_250 (12.5%)
-    /// New flat-tier claims per epoch the base rent targets.
+    /// New flat-tier claims per epoch the base rent targets; sized above peak
+    /// onboarding. The constructor rejects values below 10.
     pub target_flat_claims_per_epoch: u64,   // TARGET_FLAT_CLAIMS_PER_EPOCH = TBD
     /// Maximum epochs of rent paid ahead of the current epoch. (tunable)
     pub max_prepaid_epochs: u64,             // MAX_PREPAID_EPOCHS = 26
@@ -658,26 +660,26 @@ pub struct EpochConfig {
     pub recovery_veto_epochs: u64,           // RECOVERY_VETO_EPOCHS = 2
 }
 
-/// Y supply schedule — fixed at contract deployment (03 §A, §B). Genesis and
+/// Y supply schedule — fixed at contract deployment (03 §A, §B). Snapshot and
 /// like-power issuance are the only mint paths; together they never exceed
 /// `total_supply`, and missed tranches or dust never reopen capacity.
 pub struct SupplySchedule {
-    /// Hard cap on genesis + issuance (atomic units): 140B Y (6 decimals, fits u64).
+    /// Hard cap on snapshot + issuance (atomic units): 140B Y (6 decimals, fits u64).
     pub total_supply: u64,                  // 140_000_000_000_000_000
-    /// total_supply × GENESIS_SHARE_BPS / 10_000.
-    pub genesis_total: u64,                 // GENESIS_SHARE_BPS = TBD
-    /// total_supply − genesis_total: the most like-power issuance can ever mint.
+    /// total_supply × SNAPSHOT_SHARE_BPS / 10_000.
+    pub snapshot_total: u64,                 // SNAPSHOT_SHARE_BPS = TBD
+    /// total_supply − snapshot_total: the most like-power issuance can ever mint.
     pub issuance_capacity: u64,
     /// k at epoch 0, in parts per billion: atomic Y minted per power unit spent × 1e9
-    /// (5_000_000 = 0.5%; a power unit = 1 atomic Y staked for 1 epoch). (tunable)
+    /// (5_000_000 = 0.5%; a power unit = 1 atomic Y deposited for 1 epoch). (tunable)
     pub initial_mint_rate_ppb: u64,         // INITIAL_MINT_RATE_PPB = 5_000_000 (k×r = 0.5%/epoch)
     /// Epochs between halvings of k. (tunable)
     pub mint_halving_epochs: u64,           // MINT_HALVING_EPOCHS = 104
-    /// Epochs between halvings of genesis tranches. (tunable)
-    pub genesis_vest_halving_epochs: u64,   // GENESIS_VEST_HALVING_EPOCHS = 104
-    /// Merkle root of GenesisLeaf hashes, published with the dataset, rules and
+    /// Epochs between halvings of snapshot tranches. (tunable)
+    pub snapshot_vest_halving_epochs: u64,   // SNAPSHOT_VEST_HALVING_EPOCHS = 104
+    /// Merkle root of SnapshotLeaf hashes, published with the dataset, rules and
     /// concentration analysis before deployment.
-    pub genesis_root: [u8; 32],
+    pub snapshot_root: [u8; 32],
 }
 ```
 
@@ -693,17 +695,17 @@ impl SupplySchedule {
         self.initial_mint_rate_ppb >> halvings
     }
 
-    /// Tranche that nominal genesis entitlement `entitlement` vests in `epoch`.
-    /// Mirrored in the GenesisClaim contract (03 §A `genesis_tranche`).
-    pub fn genesis_tranche(&self, entitlement: u64, epoch: u64) -> u64 {
-        let window = epoch / self.genesis_vest_halving_epochs;
+    /// Tranche that nominal snapshot entitlement `entitlement` vests in `epoch`.
+    /// Mirrored in the SnapshotClaim contract (03 §A `snapshot_tranche`).
+    pub fn snapshot_tranche(&self, entitlement: u64, epoch: u64) -> u64 {
+        let window = epoch / self.snapshot_vest_halving_epochs;
         if window >= 64 { return 0; }
-        (entitlement / (2 * self.genesis_vest_halving_epochs)) >> window
+        (entitlement / (2 * self.snapshot_vest_halving_epochs)) >> window
     }
 }
 ```
 
-**Genesis:** there is no deployer-chosen account set. The genesis allocation is a snapshot Merkle root over eligible external keys, claimed in weekly tranches from epoch 0 (03 §A).
+**Snapshot:** there is no deployer-chosen account set. The snapshot allocation is a Merkle root over eligible external keys, claimed in weekly tranches from epoch 0 (03 §A).
 
 **Per-epoch issuance:** creators receive, per closed epoch, `mint_budget_e × received / spent_e` of new Y plus `drip_e × received / max(S_e, spent_e)` of recycled fees. Both are reserved at the epoch's close and pulled by the creator (03 §B, Fee Pool).
 
@@ -803,25 +805,25 @@ pub enum ChainEvent {
         epoch: u64,
     },
     // --- Like power & issuance (03 §B) ---
-    /// Y staked into the Like contract (adds regeneration, never stored power).
-    Staked {
-        staker: IdentityId,
+    /// Y deposited into the Like contract (adds regeneration, never stored power).
+    Deposited {
+        depositor: IdentityId,
         amount: u64,
     },
-    /// Stake moved to pending withdrawal; regeneration on it stops now.
-    UnstakeRequested {
-        staker: IdentityId,
+    /// Deposit moved to pending withdrawal; regeneration on it stops now.
+    WithdrawalRequested {
+        depositor: IdentityId,
         amount: u64,
         available_at: u64,               // block timestamp
     },
-    /// Pending stake withdrawn after the delay.
-    Unstaked {
-        staker: IdentityId,
+    /// Pending deposit withdrawn after the delay.
+    Withdrawn {
+        depositor: IdentityId,
         amount: u64,
     },
     /// A batched like settlement. `power_spent` = Σ allocations (dust stays in the meter).
     LikesSettled {
-        staker: IdentityId,
+        depositor: IdentityId,
         nonce: u64,
         epoch: u64,
         n_likes: u32,
@@ -837,11 +839,11 @@ pub enum ChainEvent {
     },
     /// The epoch counter advanced, closing `epoch − 1`: its issuance budget and
     /// fee-pool share are reserved for pulled claims, and the base rent steps.
-    /// `closed_fee_reserved = closed_fee_drip × spent / max(stake_time, spent)`.
+    /// `closed_fee_reserved = closed_fee_drip × spent / max(deposit_time, spent)`.
     EpochAdvanced {
         epoch: u64,                      // the new epoch
         closed_power_spent: u64,
-        closed_stake_time: u64,
+        closed_deposit_time: u64,
         closed_mint_budget: u64,
         closed_fee_drip: u64,
         closed_fee_reserved: u64,
@@ -849,16 +851,16 @@ pub enum ChainEvent {
         mint_rate_ppb: u64,              // k for the new epoch
         base_rent: u64,                  // base rent for the new epoch
     },
-    // --- Genesis (03 §A) ---
-    /// A genesis leaf activated into a DSN identity.
-    GenesisActivated {
+    // --- Snapshot (03 §A) ---
+    /// A snapshot leaf activated into a DSN identity.
+    SnapshotActivated {
         key: ForeignKey,
         cohort: u8,
         account: IdentityId,
         entitlement: u64,                // nominal
     },
-    /// One epoch's genesis tranche claimed.
-    GenesisTrancheClaimed {
+    /// One epoch's snapshot tranche claimed.
+    SnapshotTrancheClaimed {
         account: IdentityId,
         epoch: u64,
         amount: u64,

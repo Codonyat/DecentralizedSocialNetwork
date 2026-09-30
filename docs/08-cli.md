@@ -15,7 +15,7 @@ crates/cli/src/
 │   ├── profile.rs      # Profile create, update, view
 │   ├── post.rs         # Post create, read, reply, repost, like, thread view
 │   ├── social.rs       # Follow, unfollow, feed view
-│   ├── token_y.rs      # Like settlement, tip, transfer, stake, claim, balance, issuance
+│   ├── token_y.rs      # Like settlement, tip, transfer, deposit, claim, balance, issuance
 │   ├── name.rs         # Claim/assess handles, rent status, pay rent, force-buy, lookup(+history)
 │   ├── invitation.rs   # Vouch send/accept/list
 │   └── label.rs        # Add/list content labels
@@ -268,7 +268,7 @@ pub enum PostAction {
         quote: Option<String>,
     },
     /// Like a post: publishes a signed `Like` object (free; a ranking edge
-    /// for everyone). If you are staked or hold a PowerDelegation, the like
+    /// for everyone). If you have a deposit or hold a PowerDelegation, the like
     /// is also queued for the daily batched settlement (03 §B), which spends
     /// power and mints to the author. The reference client sends 100% of a
     /// like to the author.
@@ -345,7 +345,7 @@ pub enum SocialAction {
 ```rust
 #[derive(Subcommand)]
 pub enum TokenYAction {
-    /// View your Y balance, stake, and like power
+    /// View your Y balance, deposit, and like power
     Balance,
     /// Send Y as a plain transfer (no fee)
     Transfer {
@@ -380,22 +380,22 @@ pub enum TokenYAction {
         #[arg(long)]
         private: bool,
     },
-    /// Stake Y into the Like contract for like power. Power starts empty and
+    /// Deposit Y into the Like contract for like power. Power starts empty and
     /// regenerates up to a cap of 24 h of regeneration.
-    Stake {
-        /// Amount of Y to stake (atomic units)
+    Deposit {
+        /// Amount of Y to deposit (atomic units)
         #[arg(long)]
         amount: u64,
     },
-    /// Request an unstake. The amount is withdrawable after a 7-day delay;
+    /// Request a withdrawal. The amount is withdrawable after a 7-day delay;
     /// its regeneration stops at the request.
-    Unstake {
-        /// Amount of Y to unstake (atomic units)
+    Withdraw {
+        /// Amount of Y to withdraw (atomic units)
         #[arg(long)]
         amount: u64,
     },
-    /// Withdraw stake whose 7-day unstake delay has passed.
-    Withdraw,
+    /// Complete withdrawals whose 7-day delay has passed.
+    CompleteWithdrawal,
     /// Refund an unclaimed foreign-key escrow to its tipper once its 30 days
     /// have passed (anyone may trigger it; the net escrowed amount returns).
     Refund {
@@ -420,13 +420,13 @@ pub enum TokenYAction {
         limit: usize,
     },
     /// View the current epoch's issuance info: mint rate, fee pool, total
-    /// stake (reads `GET /api/v1/epoch`), plus your unclaimed rewards
+    /// deposits (reads `GET /api/v1/epoch`), plus your unclaimed rewards
     /// (`GET /api/v1/users/:pk/economy`).
     Issuance,
 }
 ```
 
-Genesis claims and foreign-key escrow claims are not CLI commands: they need an Ethereum wallet (the web client is TBD).
+Snapshot claims and foreign-key escrow claims are not CLI commands: they need an Ethereum wallet (the web client is TBD).
 
 ### Name Subcommands (`name.rs`)
 
@@ -718,16 +718,16 @@ impl IndexerClient {
     ) -> Result<YBalanceSummary, IndexerError>;
 
     /// Fetch a user's economy via `GET /api/v1/users/:pk/economy`: balance,
-    /// stake, power, cap, unclaimed creator rewards, genesis status.
+    /// deposit, power, cap, unclaimed creator rewards, snapshot status.
     pub async fn economy(
         &self,
         user: &PublicKey,
     ) -> Result<UserEconomy, IndexerError>;
 
     /// Fetch epoch info via `GET /api/v1/epoch`: current epoch, mint rate,
-    /// last close (power spent, stake-time, mint budget, fee drip and fee
+    /// last close (power spent, deposit-time, mint budget, fee drip and fee
     /// reserved), fee pool balance, minted total, issuance capacity, total
-    /// stake, base rent, and treasury balance.
+    /// deposits, base rent, and treasury balance.
     pub async fn epoch_info(&self) -> Result<EpochInfo, IndexerError>;
 
     // --- Handle queries ---
@@ -1276,19 +1276,19 @@ $ dsn social feed --limit 10
 ### Token Operations
 
 ```bash
-# Stake Y for like power (power starts empty; the cap is 24 h of regeneration)
-$ dsn y stake --amount 500000000
+# Deposit Y for like power (power starts empty; the cap is 24 h of regeneration)
+$ dsn y deposit --amount 500000000
 Enter passphrase: ********
-Staked 500.000000 Y. Like power starts at 0 and regenerates to a cap of 71,428,571.
+Deposited 500.000000 Y. Like power starts at 0 and regenerates to a cap of 71,428,571.
 
-# View Y balance, stake and like power (about 21 h later)
+# View Y balance, deposit and like power (about 21 h later)
 $ dsn y balance
 Y Balance: 1,250.000000
-Staked: 500.000000 Y
-Like power: 62,400,000 / 71,428,571 (cap)
+Deposited: 500.000000 Y
+Heart: 87%   (62,400,000 / 71,428,571 power)
 Nonce: 14
 
-# Like a post: publishes a signed Like (free; a ranking edge). You are staked,
+# Like a post: publishes a signed Like (free; a ranking edge). You have a deposit,
 # so it is also queued for today's batched settlement.
 $ dsn post like abcd1234efgh5678
 Enter passphrase: ********
@@ -1297,7 +1297,7 @@ Like published: abcd1234efgh5678 (author: e5f6a7b8..., Bob)
 
 # Check the power meter
 $ dsn y power
-Like power: 62,400,000 / 71,428,571   (cap = 24 h of regeneration)
+Heart: 87%   (62,400,000 / 71,428,571 power; full = 24 h of regeneration)
 Queued likes: 3
 Last settlement: epoch 43, 5 h ago
 
@@ -1313,10 +1313,10 @@ Claimed creator rewards for epochs 41-42:
   Fee pool:    1.120000 Y
   Total:      39.370000 Y
 
-# Request an unstake (withdrawable after 7 days; regeneration on it stops now)
-$ dsn y unstake --amount 100000000
+# Request a withdrawal (withdrawable after 7 days; regeneration on it stops now)
+$ dsn y withdraw --amount 100000000
 Enter passphrase: ********
-Unstake requested: 100.000000 Y, withdrawable in 7 days.
+Withdrawal requested: 100.000000 Y, withdrawable in 7 days.
 
 # Tip a post's author (1% protocol fee to the fee pool; the reference CLI
 # charges no facilitator fee)
@@ -1360,7 +1360,7 @@ Current epoch: 43
 Mint rate: 5,000,000 ppb   (0.5% of power spent; halves every 104 epochs)
 Last close (epoch 42): 9,100,000 Y reserved for creator claims
 Fee pool: 12,366,177 Y     (last drip 250,000 Y; 133,823 Y reserved for creators)
-Total stake: 3,400,000,000 Y
+Total deposits: 3,400,000,000 Y
 Your unclaimed creator rewards: 0.000000 Y
 ```
 
@@ -1714,6 +1714,6 @@ async fn main() {
 | `rand` | latest | Spot-check probability, nonce generation |
 | `dsn-core` | workspace | Core types, crypto primitives |
 | `dsn-data` | workspace | Storage trait abstractions |
-| `dsn-chain` | workspace | On-chain data reading (tips, stakes, names) |
+| `dsn-chain` | workspace | On-chain data reading (tips, deposits, names) |
 | `dsn-token-y` | workspace | Y balance validation, transfer verification |
 | `dsn-invitation` | workspace | Vouch and delegation objects |

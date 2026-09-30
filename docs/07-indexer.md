@@ -4,7 +4,7 @@
 
 Signed content objects carry no query capability on their own. Clients cannot ask a raw object stream "give me Alice's feed" or "search for posts about Rust." The indexer bridges this gap: it ingests client-published signed objects, syncs the corpus from peer indexers, listens to blockchain events, builds queryable indices locally, and exposes a REST API for clients. Indexers double as the network's hot storage — they store what they serve (see `docs/12-storage-and-anchoring.md`, which governs storage semantics).
 
-Because ALL source content is a signed, content-addressed object (posts, mutable records, signed edges) and all economic activity (tips, stakes, like settlements, issuance, transfers) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: verifiability = local signature verification (every object carries its author's signature and hashes to its own address) + cross-indexer checks + anchor proofs (`docs/12`) that bind a post to a provable existed-before time. Clients spot-check any result the indexer returns by re-verifying the underlying signed object, cross-checking a second indexer, or querying the blockchain.
+Because ALL source content is a signed, content-addressed object (posts, mutable records, signed edges) and all economic activity (tips, deposits, like settlements, issuance, transfers) is recorded on-chain, any indexer output can be independently verified against the source. This makes indexers **verifiable**: verifiability = local signature verification (every object carries its author's signature and hashes to its own address) + cross-indexer checks + anchor proofs (`docs/12`) that bind a post to a provable existed-before time. Clients spot-check any result the indexer returns by re-verifying the underlying signed object, cross-checking a second indexer, or querying the blockchain.
 
 Multiple competing indexers can run simultaneously. No single indexer can censor content without clients noticing — they simply switch to a different indexer, verify signatures locally, or re-publish from their own local copy.
 
@@ -30,8 +30,8 @@ crates/indexer/src/
 │   ├── engagement.rs   # GET /engagement/:post_address, /posts/:address/{likes,tips}, /users/:pk/tips
 │   ├── labels.rs       # GET /labels/:address — raw labels + this indexer's visibility verdict
 │   ├── names.rs        # GET /names/:handle — handle resolution + lifecycle state
-│   ├── epoch.rs        # GET /epoch — issuance, fee pool, stake totals, treasury
-│   ├── economy.rs      # GET /users/:pk/economy — balance, stake, power, unclaimed rewards, genesis
+│   ├── epoch.rs        # GET /epoch — issuance, fee pool, deposit totals, treasury
+│   ├── economy.rs      # GET /users/:pk/economy — balance, deposit, power, unclaimed rewards, snapshot
 │   ├── creators.rs     # GET /creators/:pk/supporters — supporter recognition (not protocol)
 │   ├── spotcheck.rs    # GET /spotcheck/... — raw signed object + signature proof; anchor branch
 │   └── health.rs       # GET /health — indexer status, ingest stats
@@ -42,13 +42,13 @@ crates/indexer/src/
 
 ## Chain Listener (`chain_listener.rs`)
 
-The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (tips, stakes, like settlements, issuance, genesis claims, transfers, handle lifecycle events, and fee pool state).
+The chain listener subscribes to blockchain events and populates the local index with on-chain activity. This is the authoritative source for all economic data (tips, deposits, like settlements, issuance, snapshot claims, transfers, handle lifecycle events, and fee pool state).
 
 ### Event Types
 
 The listener processes the following on-chain events:
 
-Variant names and payload fields below are canonical in `docs/01-core-types.md`; this table and the match arms mirror them field-for-field. Every fee-bearing event (`Tip` / `TipEscrowed` `protocol_fee`, `NameRentPaid` `amount`, `ForceBuyInitiated` `fee_to_pool`) routes its fee to the fee pool in full; the listener adds it to the fee-pool mirror, and each `EpochAdvanced` resets the mirror to the authoritative `fee_pool_balance`. `y_balance` mirrors YToken `Transfer` events only (every balance movement emits one — mints from the zero address, stake and escrow custody, fee-pool payouts), so the economic arms below record their own tables and never touch balances; nothing is counted twice.
+Variant names and payload fields below are canonical in `docs/01-core-types.md`; this table and the match arms mirror them field-for-field. Every fee-bearing event (`Tip` / `TipEscrowed` `protocol_fee`, `NameRentPaid` `amount`, `ForceBuyInitiated` `fee_to_pool`) routes its fee to the fee pool in full; the listener adds it to the fee-pool mirror, and each `EpochAdvanced` resets the mirror to the authoritative `fee_pool_balance`. `y_balance` mirrors YToken `Transfer` events only (every balance movement emits one — mints from the zero address, deposit and escrow custody, fee-pool payouts), so the economic arms below record their own tables and never touch balances; nothing is counted twice.
 
 | Event | Description | Index Action |
 |---|---|---|
@@ -57,15 +57,15 @@ Variant names and payload fields below are canonical in `docs/01-core-types.md`;
 | **TipEscrowed** | A tip to a foreign key (Ethereum address): fees taken on the gross `amount`; the escrow holds the net `escrowed` until `refund_after` | `open_tip_escrow`, `add_fee_pool_inflow` |
 | **TipEscrowClaimed** | The foreign key's owner claims the net escrow to `destination` | `claim_tip_escrow` (the tip now counts toward `destination`) |
 | **TipEscrowRefunded** | Unclaimed after 30 days; the net refunds to the tipper | `refund_tip_escrow` |
-| **Staked** | Y deposited into the Like contract; its power starts empty | `record_stake` |
-| **UnstakeRequested** | Withdrawal requested; regeneration stops on `amount`, stored power clamps to the new cap | `request_unstake` |
-| **Unstaked** | Withdrawal completed after the unstake delay | `record_unstake` |
-| **LikesSettled** | A staker's daily like batch landed: `power_spent` (= Σ `allocations`) credited to each recipient for `epoch` | `record_settlement` |
+| **Deposited** | Y deposited into the Like contract; its power starts empty | `record_deposit` |
+| **WithdrawalRequested** | Withdrawal requested; regeneration stops on `amount`, stored power clamps to the new cap | `request_withdrawal` |
+| **Withdrawn** | Withdrawal completed after the withdrawal delay | `record_withdrawal` |
+| **LikesSettled** | A depositor's daily like batch landed: `power_spent` (= Σ `allocations`) credited to each recipient for `epoch` | `record_settlement` |
 | **CreatorRewardsClaimed** | A creator pulled its issuance (`minted`) and `fee_reward` for a closed epoch | `record_creator_claim` |
-| **GenesisActivated** | An eligible foreign key activated its genesis entitlement to an account | `ensure_user_known`, `record_genesis_activation` |
-| **GenesisTrancheClaimed** | An account claimed its tranche within that tranche's epoch | `record_genesis_tranche` |
-| **EntitlementSplit** | Nominal genesis entitlement moved between accounts, counted from `effective_epoch` (future tranches only) | `ensure_user_known`, `record_entitlement_split` |
-| **EpochAdvanced** | Epoch boundary crossed (lazily, by the first transaction after it): the closed epoch's power spent, stake-time, mint budget, fee drip and fee reserve; current pool balance, mint rate, base rent | `record_epoch_close` (`epochs` row + `economy` snapshot) |
+| **SnapshotActivated** | An eligible foreign key activated its snapshot entitlement to an account | `ensure_user_known`, `record_snapshot_activation` |
+| **SnapshotTrancheClaimed** | An account claimed its tranche within that tranche's epoch | `record_snapshot_tranche` |
+| **EntitlementSplit** | Nominal snapshot entitlement moved between accounts, counted from `effective_epoch` (future tranches only) | `ensure_user_known`, `record_entitlement_split` |
+| **EpochAdvanced** | Epoch boundary crossed (lazily, by the first transaction after it): the closed epoch's power spent, deposit-time, mint budget, fee drip and fee reserve; current pool balance, mint rate, base rent | `record_epoch_close` (`epochs` row + `economy` snapshot) |
 | **NameClaimed** | User claims an unowned @handle (sets assessed value, pays first-epoch rent) | `upsert_name` |
 | **AssessmentChanged** | Owner changes a handle's assessed value (decreases take effect after the lookback window) | `update_name_assessment` |
 | **NameRentPaid** | Handle rent paid through an epoch (`amount` → fee pool) | `record_rent_payment`, `add_fee_pool_inflow` |
@@ -164,31 +164,31 @@ async fn process_chain_event(
             index.refund_tip_escrow(*escrow_id, tipper, *amount).await?;
         }
 
-        // --- Like power (03 §B; the store replays each staker's PowerMeter) ---
-        ChainEvent::Staked { staker, amount } => {
-            index.record_stake(staker, *amount).await?;
+        // --- Like power (03 §B; the store replays each depositor's PowerMeter) ---
+        ChainEvent::Deposited { depositor, amount } => {
+            index.record_deposit(depositor, *amount).await?;
         }
-        ChainEvent::UnstakeRequested { staker, amount, available_at } => {
-            index.request_unstake(staker, *amount, *available_at).await?;
+        ChainEvent::WithdrawalRequested { depositor, amount, available_at } => {
+            index.request_withdrawal(depositor, *amount, *available_at).await?;
         }
-        ChainEvent::Unstaked { staker, amount } => {
-            index.record_unstake(staker, *amount).await?;
+        ChainEvent::Withdrawn { depositor, amount } => {
+            index.record_withdrawal(depositor, *amount).await?;
         }
-        ChainEvent::LikesSettled { staker, nonce, epoch, n_likes, power_spent, allocations } => {
+        ChainEvent::LikesSettled { depositor, nonce, epoch, n_likes, power_spent, allocations } => {
             // power_spent = Σ allocations; each allocation is `received` for `epoch`.
-            index.record_settlement(staker, *nonce, *epoch, *n_likes, *power_spent, allocations).await?;
+            index.record_settlement(depositor, *nonce, *epoch, *n_likes, *power_spent, allocations).await?;
         }
         ChainEvent::CreatorRewardsClaimed { creator, epoch, minted, fee_reward } => {
             index.record_creator_claim(creator, *epoch, *minted, *fee_reward).await?;
         }
 
-        // --- Genesis (03 §A) ---
-        ChainEvent::GenesisActivated { key, cohort, account, entitlement } => {
+        // --- Snapshot (03 §A) ---
+        ChainEvent::SnapshotActivated { key, cohort, account, entitlement } => {
             index.ensure_user_known(account).await?;
-            index.record_genesis_activation(key, *cohort, account, *entitlement).await?;
+            index.record_snapshot_activation(key, *cohort, account, *entitlement).await?;
         }
-        ChainEvent::GenesisTrancheClaimed { account, epoch, amount } => {
-            index.record_genesis_tranche(account, *epoch, *amount).await?;
+        ChainEvent::SnapshotTrancheClaimed { account, epoch, amount } => {
+            index.record_snapshot_tranche(account, *epoch, *amount).await?;
         }
         ChainEvent::EntitlementSplit { from, to, amount, effective_epoch } => {
             index.ensure_user_known(to).await?;
@@ -196,10 +196,10 @@ async fn process_chain_event(
         }
 
         // --- Epoch close (authoritative snapshot; resets the fee-pool mirror) ---
-        ChainEvent::EpochAdvanced { epoch, closed_power_spent, closed_stake_time, closed_mint_budget,
+        ChainEvent::EpochAdvanced { epoch, closed_power_spent, closed_deposit_time, closed_mint_budget,
                                     closed_fee_drip, closed_fee_reserved, fee_pool_balance,
                                     mint_rate_ppb, base_rent } => {
-            index.record_epoch_close(*epoch, *closed_power_spent, *closed_stake_time,
+            index.record_epoch_close(*epoch, *closed_power_spent, *closed_deposit_time,
                                      *closed_mint_budget, *closed_fee_drip, *closed_fee_reserved,
                                      *fee_pool_balance, *mint_rate_ppb, *base_rent).await?;
         }
@@ -264,7 +264,7 @@ async fn process_chain_event(
 
 ## Ingest & Sync (`ingest.rs`, `publish.rs`, `stream.rs`)
 
-Content reaches an indexer two ways: clients **publish** their signed objects directly (`POST /api/v1/publish`), and indexers **sync** the corpus from peers (`GET /api/v1/stream?cursor=`). There is no polling of a storage network — the indexer stores what it serves. Content handling never touches economic data (tips, balances, stakes, issuance); that stays the chain listener's responsibility. A Like object is content: it moves money only when a settlement lands on-chain as `LikesSettled`, and the indexer never infers a payout from Like objects.
+Content reaches an indexer two ways: clients **publish** their signed objects directly (`POST /api/v1/publish`), and indexers **sync** the corpus from peers (`GET /api/v1/stream?cursor=`). There is no polling of a storage network — the indexer stores what it serves. Content handling never touches economic data (tips, balances, deposits, issuance); that stays the chain listener's responsibility. A Like object is content: it moves money only when a settlement lands on-chain as `LikesSettled`, and the indexer never infers a payout from Like objects.
 
 ### `POST /api/v1/publish` — signature-verified intake
 
@@ -305,7 +305,7 @@ pub async fn ingest_object(
 
 ### `GET /api/v1/stream?cursor=` — peer backfill
 
-Indexers replicate the full text corpus (posts, profiles, follow graph, likes, vouches, power delegations, labels, retract tombstones) from one another. The stream is an ordered feed of signed objects; the `cursor` is the caller's last-seen position, and anchor roots serve as checkpoint markers within it — so "give me everything since root R" is the cursor contract. Every streamed item is verified **item-by-item** exactly as in publish intake (signatures and addresses are self-checking), so a peer cannot inject forgeries. Discovery of new authors comes from ingested **Vouch** objects (each names a voucher and a vouchee), from registry and stake events on-chain (`KeyRotated`, `GuardiansSet`, `Staked`, `GenesisActivated`, …), and from peer exchange; there is no follow-list walk or priority queue.
+Indexers replicate the full text corpus (posts, profiles, follow graph, likes, vouches, power delegations, labels, retract tombstones) from one another. The stream is an ordered feed of signed objects; the `cursor` is the caller's last-seen position, and anchor roots serve as checkpoint markers within it — so "give me everything since root R" is the cursor contract. Every streamed item is verified **item-by-item** exactly as in publish intake (signatures and addresses are self-checking), so a peer cannot inject forgeries. Discovery of new authors comes from ingested **Vouch** objects (each names a voucher and a vouchee), from registry and deposit events on-chain (`KeyRotated`, `GuardiansSet`, `Deposited`, `SnapshotActivated`, …), and from peer exchange; there is no follow-list walk or priority queue.
 
 ### Anchor loop (`ingest.rs`)
 
@@ -384,10 +384,10 @@ pub struct IndexedUser {
     /// Distinct accounts vouching for this user (from ingested Vouch objects, 05).
     pub vouched_by_count: u32,
     /// Token state (from on-chain events). `y_balance` is liquid Y (Transfer
-    /// events only); `stake` is eligible stake in the Like contract.
+    /// events only); `deposit` is eligible deposit in the Like contract.
     pub y_balance: u64,
     pub y_nonce: u64,
-    pub stake: u64,
+    pub deposit: u64,
     /// Aggregate tip stats (from on-chain events). Received is net (Σ
     /// `recipient_amount`, claimed escrows included); given is gross (Σ `amount`).
     pub tips_received: u64,
@@ -554,7 +554,7 @@ pub enum HandleRentStatus {
 
 | Table | Primary Key | Purpose |
 |---|---|---|
-| `users` | `public_key` | User profiles, stats, token balances, stake, tip totals, advisory aura |
+| `users` | `public_key` | User profiles, stats, token balances, deposit, tip totals, advisory aura |
 | `posts` | `address` | Post content, engagement counts |
 | `follows` | `(follower, followee)` | Follow relationships (the budget graph's edges) |
 | `likes` | `(liker, target)` | Like objects (first-seen wins; a retract removes the row): recipients, sponsor, object address |
@@ -562,12 +562,12 @@ pub enum HandleRentStatus {
 | `delegations` | `(sponsor, delegate)` | PowerDelegation objects (latest `expires_epoch` kept); validates `Like.sponsor` |
 | `tips` | `(block_number, log_index)` | Tip records (from chain): tipper, recipient, post, gross amount, protocol and facilitator fees, net amount |
 | `tip_escrows` | `escrow_id` | Foreign-key escrows: recipient key, net `escrowed`, `refund_after`, state (open / claimed to a destination / refunded) |
-| `stakes` | `staker` | Mirrored `PowerMeter` per staker (eligible stake, pending unstake, `available_at`, stored power, last update, settle nonce) |
-| `settlements` | `(staker, nonce)` | LikesSettled batches: epoch, `n_likes`, `power_spent`, allocations |
+| `deposits` | `depositor` | Mirrored `PowerMeter` per depositor (eligible deposit, pending withdrawal, `available_at`, stored power, last update, settle nonce) |
+| `settlements` | `(depositor, nonce)` | LikesSettled batches: epoch, `n_likes`, `power_spent`, allocations |
 | `creator_rewards` | `(creator, epoch)` | Power `received` per closed epoch (Σ settled allocations) and what was claimed (`minted`, `fee_reward`) |
-| `genesis` | `account` | Activation (foreign key, cohort, entitlement), nominal entitlement after splits, tranches claimed |
-| `epochs` | `epoch` | Per-epoch EpochAdvanced totals (power spent, stake-time, mint budget, fee drip, fee reserve) — the denominators for creator claims |
-| `economy` | singleton | Current epoch, mint rate, minted total, issuance capacity, fee pool balance, last fee drip / reserve, base rent, total stake, treasury balance |
+| `snapshot` | `account` | Activation (foreign key, cohort, entitlement), nominal entitlement after splits, tranches claimed |
+| `epochs` | `epoch` | Per-epoch EpochAdvanced totals (power spent, deposit-time, mint budget, fee drip, fee reserve) — the denominators for creator claims |
+| `economy` | singleton | Current epoch, mint rate, minted total, issuance capacity, fee pool balance, last fee drip / reserve, base rent, total deposits, treasury balance |
 | `names` | `handle` | Current handle ownership: owner, assessed value, tier, rent status, last-paid epoch, force-buy state (from chain) |
 | `name_history` | `(handle, claimed_at_epoch)` | Past ownership spans of a handle ("formerly @x") |
 | `supporters` | `(creator, supporter)` | Per-creator lifetime tip totals — supporter recognition (derived from `tips`) |
@@ -620,7 +620,7 @@ pub trait IndexStore: Send + Sync {
     async fn author_keys(&self, identity: &IdentityId) -> Result<AuthorKeys, IndexerError>;
 
     // --- Write operations (used by chain listener). All atomic Y amounts and
-    // power / stake-time values are u64; every row is stamped with its event's
+    // power / deposit-time values are u64; every row is stamped with its event's
     // block (number, timestamp) for rollback and meter replay. ---
     /// Mirror a YToken Transfer (the only source of `y_balance`); a transfer
     /// from the zero address is a mint (no debit).
@@ -638,21 +638,21 @@ pub trait IndexStore: Send + Sync {
     async fn refund_tip_escrow(&self, escrow_id: u64, tipper: &IdentityId, amount: u64) -> Result<(), IndexerError>;
     // Like power (03 §B). Each call first replays `accrue(meter, block_timestamp)`
     // on the mirrored PowerMeter, then applies the event.
-    async fn record_stake(&self, staker: &IdentityId, amount: u64) -> Result<(), IndexerError>;
-    async fn request_unstake(&self, staker: &IdentityId, amount: u64, available_at: u64) -> Result<(), IndexerError>;
-    async fn record_unstake(&self, staker: &IdentityId, amount: u64) -> Result<(), IndexerError>;
-    /// Debit the staker's mirrored meter by `power_spent` and add each
+    async fn record_deposit(&self, depositor: &IdentityId, amount: u64) -> Result<(), IndexerError>;
+    async fn request_withdrawal(&self, depositor: &IdentityId, amount: u64, available_at: u64) -> Result<(), IndexerError>;
+    async fn record_withdrawal(&self, depositor: &IdentityId, amount: u64) -> Result<(), IndexerError>;
+    /// Debit the depositor's mirrored meter by `power_spent` and add each
     /// allocation to `creator_rewards[(recipient, epoch)].received`.
-    async fn record_settlement(&self, staker: &IdentityId, nonce: u64, epoch: u64, n_likes: u32,
+    async fn record_settlement(&self, depositor: &IdentityId, nonce: u64, epoch: u64, n_likes: u32,
                                power_spent: u64, allocations: &[(IdentityId, u64)]) -> Result<(), IndexerError>;
     /// Record a pulled reward; `minted` also adds to the economy's minted total.
     async fn record_creator_claim(&self, creator: &IdentityId, epoch: u64, minted: u64,
                                   fee_reward: u64) -> Result<(), IndexerError>;
-    // Genesis (03 §A).
-    async fn record_genesis_activation(&self, key: &ForeignKey, cohort: u8, account: &IdentityId,
+    // Snapshot (03 §A).
+    async fn record_snapshot_activation(&self, key: &ForeignKey, cohort: u8, account: &IdentityId,
                                        entitlement: u64) -> Result<(), IndexerError>;
     /// `amount` also adds to the economy's minted total.
-    async fn record_genesis_tranche(&self, account: &IdentityId, epoch: u64, amount: u64) -> Result<(), IndexerError>;
+    async fn record_snapshot_tranche(&self, account: &IdentityId, epoch: u64, amount: u64) -> Result<(), IndexerError>;
     async fn record_entitlement_split(&self, from: &IdentityId, to: &IdentityId, amount: u64,
                                       effective_epoch: u64) -> Result<(), IndexerError>;
     /// Add a protocol fee (tip, escrowed tip, rent, force-buy) to the fee-pool mirror.
@@ -661,7 +661,7 @@ pub trait IndexStore: Send + Sync {
     /// mirror to `fee_pool_balance`, subtracts `closed_mint_budget` from the
     /// issuance capacity (the budget is reserved at close, claimed or not), and
     /// stores `mint_rate_ppb` and `base_rent`.
-    async fn record_epoch_close(&self, epoch: u64, closed_power_spent: u64, closed_stake_time: u64,
+    async fn record_epoch_close(&self, epoch: u64, closed_power_spent: u64, closed_deposit_time: u64,
                                 closed_mint_budget: u64, closed_fee_drip: u64,
                                 closed_fee_reserved: u64, fee_pool_balance: u64,
                                 mint_rate_ppb: u64, base_rent: u64) -> Result<(), IndexerError>;
@@ -827,16 +827,16 @@ pub struct Supporter {
 pub struct EpochInfo {
     pub epoch: u64,
     pub closed_power_spent: u64,      // Σ settled power (= Σ allocations) in the closed epoch
-    pub closed_stake_time: u64,       // S_e, in power units
+    pub closed_deposit_time: u64,       // S_e, in power units
     pub closed_mint_budget: u64,      // atomic Y reserved for creator claims
     pub closed_fee_drip: u64,         // atomic Y = FEE_POOL_DRIP_BPS of the pool balance at close
     pub closed_fee_reserved: u64,     // drip × spent / max(S_e, spent), moved to the claim reserve
     pub fee_pool_balance: u64,        // last snapshot + fee inflows mirrored since
     pub mint_rate_ppb: u64,           // k for the current epoch
     pub base_rent: u64,               // atomic Y; flat-tier rent, Harberger floors are multiples
-    pub minted_total: u64,            // Σ GenesisTrancheClaimed.amount + Σ CreatorRewardsClaimed.minted
+    pub minted_total: u64,            // Σ SnapshotTrancheClaimed.amount + Σ CreatorRewardsClaimed.minted
     pub issuance_capacity: u64,       // SupplySchedule.issuance_capacity − Σ closed_mint_budget
-    pub total_stake: u64,             // Σ Staked − Σ Unstaked (pending unstakes included)
+    pub total_deposits: u64,             // Σ Deposited − Σ Withdrawn (pending withdrawals included)
     pub treasury_balance: u64,        // y_balance of the disclosed treasury account (03 §A)
 }
 
@@ -846,13 +846,13 @@ pub struct EpochInfo {
 pub struct UserEconomy {
     pub identity_id: IdentityId,
     pub y_balance: u64,
-    pub stake: u64,                   // eligible stake
-    pub pending_unstake: u64,
-    pub unstake_available_at: Option<u64>, // unix seconds (block time)
+    pub deposit: u64,                   // eligible deposit
+    pub pending_withdrawal: u64,
+    pub withdrawal_available_at: Option<u64>, // unix seconds (block time)
     pub power: u64,                   // accrue(meter, now) (03 §B)
-    pub power_cap: u64,               // power_cap(stake) (03 §B)
+    pub power_cap: u64,               // power_cap(deposit) (03 §B)
     pub unclaimed: UnclaimedRewards,
-    pub genesis: Option<GenesisStatus>,
+    pub snapshot: Option<SnapshotStatus>,
 }
 
 /// Closed-epoch rewards not yet pulled (no expiry), per 03 §B creator claims:
@@ -863,11 +863,11 @@ pub struct UnclaimedRewards {
     pub epochs: Vec<u64>,
 }
 
-pub struct GenesisStatus {
+pub struct SnapshotStatus {
     pub key: Option<ForeignKey>,      // None when the entitlement arrived only by split
     pub cohort: Option<u8>,
     pub entitlement: u64,             // nominal, after splits in and out
-    pub tranche_this_epoch: u64,      // genesis_tranche(entitlement, epoch) (03 §A)
+    pub tranche_this_epoch: u64,      // snapshot_tranche(entitlement, epoch) (03 §A)
     pub claimed_this_epoch: bool,     // missed tranches are never minted
     pub claimed_total: u64,
 }
@@ -946,7 +946,7 @@ pub enum FeedRanking {
 }
 ```
 
-Neither strategy reads stake, tips or network-wide like counts.
+Neither strategy reads deposits, tips or network-wide like counts.
 
 ### Home Feed Construction
 
@@ -1046,7 +1046,7 @@ Rules (09 canonical):
 5. **One entry per item.** An item reachable by several paths appears once, under the path with the largest share.
 6. **Conservation.** Before renormalization the shares sum to exactly FEED_BUDGET and no share exceeds what its parent passed: splitting never increases a share, so creating accounts or edges cannot raise anyone's slice of a viewer's attention. This bounds outsiders; it does not stop accounts a viewer follows from colluding or selling endorsements (09).
 
-**Money never enters recall.** No server path — feeds, candidates, search — reads stake, tips or network-wide like counts as a reach input. A like counts only in `graph_likes` for viewers whose budget graph contains the liker, so a whale's like pays the creator (03 §B) and reaches no one beyond the viewers who already route budget through the whale. Tip-based prominence applies only *within a single thread* (see Supporter Recognition below): a tip buys the tipper higher placement in the replies to the post they supported — nowhere else.
+**Money never enters recall.** No server path — feeds, candidates, search — reads deposits, tips or network-wide like counts as a reach input. A like counts only in `graph_likes` for viewers whose budget graph contains the liker, so a whale's like pays the creator (03 §B) and reaches no one beyond the viewers who already route budget through the whale. Tip-based prominence applies only *within a single thread* (see Supporter Recognition below): a tip buys the tipper higher placement in the replies to the post they supported — nowhere else.
 
 ## Supporter Recognition (client/indexer convention — NOT protocol)
 
@@ -1112,7 +1112,7 @@ All endpoints return JSON. Pagination uses cursor-based pagination with `?cursor
 
 **API convention — `:user_pk` is an IdentityId.** Every `:user_pk` path parameter and every `public_key`/author field in a response is the user's **IdentityId** (the genesis public key that anchors vouches, likes, tips, labels, and handle ownership), never a rotated signing key. The current signing key is consulted only for signature verification via the registry (see 01 Identity Principle, A9). Clients resolve display handles from the IdentityId at render time.
 
-**API convention — atomic Y amounts are JSON strings.** Every token amount (balances, stakes, tip amounts and fees, assessed values, rent, issuance, fee pool balances) is a **base-10 string of atomic Y** (6 decimals, so `"1000000"` = 1 Y). At the 140B-Y hard cap the supply is `140_000_000_000_000_000` atomic, which exceeds JSON's safe integer range (2^53 ≈ 9.0×10^15); serializing these as numbers would silently lose precision in JavaScript clients. Power and stake-time values use the same string encoding (their magnitudes match atomic Y). Counts, block numbers, epochs, `mint_rate_ppb`, `budget_share` (a fraction) and `aura` remain JSON numbers. All sample responses below follow this convention.
+**API convention — atomic Y amounts are JSON strings.** Every token amount (balances, deposits, tip amounts and fees, assessed values, rent, issuance, fee pool balances) is a **base-10 string of atomic Y** (6 decimals, so `"1000000"` = 1 Y). At the 140B-Y hard cap the supply is `140_000_000_000_000_000` atomic, which exceeds JSON's safe integer range (2^53 ≈ 9.0×10^15); serializing these as numbers would silently lose precision in JavaScript clients. Power and deposit-time values use the same string encoding (their magnitudes match atomic Y). Counts, block numbers, epochs, `mint_rate_ppb`, `budget_share` (a fraction) and `aura` remain JSON numbers. All sample responses below follow this convention.
 
 ### Feeds
 
@@ -1221,7 +1221,7 @@ Response:
     "following_count": 15,
     "post_count": 128,
     "y_balance": "50000000000",
-    "stake": "20000000000",
+    "deposit": "20000000000",
     "vouched_by_count": 3,
     "tips_received": "12000000000",
     "tips_given": "3500000000",
@@ -1229,7 +1229,7 @@ Response:
 }
 ```
 
-`stake` is the user's eligible stake in the Like contract. `tips_received` is net (Σ `recipient_amount`, claimed escrows included); `tips_given` is gross (Σ `amount`). `aura` is advisory: this indexer's own computation from public likes under its own policy (05 Aura), never a ranking, reach or money input; `null` when the indexer computes none.
+`deposit` is the user's eligible deposit in the Like contract. `tips_received` is net (Σ `recipient_amount`, claimed escrows included); `tips_given` is gross (Σ `amount`). `aura` is advisory: this indexer's own computation from public likes under its own policy (05 Aura), never a ranking, reach or money input; `null` when the indexer computes none.
 
 ```
 GET /api/v1/profiles/:user_pk/vouches?cursor=0&limit=50
@@ -1384,7 +1384,7 @@ Response:
 {
     "epoch": 37,
     "closed_power_spent": "4000000000000000",
-    "closed_stake_time": "19500000000000000",
+    "closed_deposit_time": "19500000000000000",
     "closed_mint_budget": "20000000000000",
     "closed_fee_drip": "17000000000",
     "closed_fee_reserved": "3487179487",
@@ -1393,12 +1393,12 @@ Response:
     "base_rent": "1000000",
     "minted_total": "3120000000000000",
     "issuance_capacity": "83900000000000000",
-    "total_stake": "20000000000000000",
+    "total_deposits": "20000000000000000",
     "treasury_balance": "412000000000"
 }
 ```
 
-Reports the latest `EpochAdvanced` field-for-field plus four derived figures (03 §A, §B, Fee Pool). The `closed_*` fields describe the epoch that closed: settled power, stake-time `S_e`, the mint budget reserved for creator claims (`min(k × spent, remaining capacity)`), the fee drip (`FEE_POOL_DRIP_BPS` of the pool balance at close) and the part of it reserved for claims (`drip × spent / max(S_e, spent)`; the rest stays in the pool). `mint_rate_ppb` is the current `k`, halving every `MINT_HALVING_EPOCHS`; `base_rent` is the controller-set flat-tier rent that Harberger floors multiply. `fee_pool_balance` is the last snapshot plus fee inflows mirrored since. `minted_total` sums genesis tranches and creator mints; `issuance_capacity` is the capacity left after every reserved mint budget; `total_stake` includes pending unstakes; `treasury_balance` is the balance of the disclosed treasury account (a genesis leaf, 03 §A). Amounts, power and stake-time are strings. This is the read path behind the CLI `epoch_info` command.
+Reports the latest `EpochAdvanced` field-for-field plus four derived figures (03 §A, §B, Fee Pool). The `closed_*` fields describe the epoch that closed: settled power, deposit-time `S_e`, the mint budget reserved for creator claims (`min(k × spent, remaining capacity)`), the fee drip (`FEE_POOL_DRIP_BPS` of the pool balance at close) and the part of it reserved for claims (`drip × spent / max(S_e, spent)`; the rest stays in the pool). `mint_rate_ppb` is the current `k`, halving every `MINT_HALVING_EPOCHS`; `base_rent` is the controller-set flat-tier rent that Harberger floors multiply. `fee_pool_balance` is the last snapshot plus fee inflows mirrored since. `minted_total` sums snapshot tranches and creator mints; `issuance_capacity` is the capacity left after every reserved mint budget; `total_deposits` includes pending withdrawals; `treasury_balance` is the balance of the disclosed treasury account (a snapshot leaf, 03 §A). Amounts, power and deposit-time are strings. This is the read path behind the CLI `epoch_info` command.
 
 ### Per-User Economy
 
@@ -1409,9 +1409,9 @@ Response:
 {
     "identity_id": "hex...",
     "y_balance": "50000000000",
-    "stake": "20000000000",
-    "pending_unstake": "0",
-    "unstake_available_at": null,
+    "deposit": "20000000000",
+    "pending_withdrawal": "0",
+    "withdrawal_available_at": null,
     "power": "2610000000",
     "power_cap": "2857142857",
     "unclaimed": {
@@ -1419,7 +1419,7 @@ Response:
         "fee_reward": "4100000",
         "epochs": [35, 36]
     },
-    "genesis": {
+    "snapshot": {
         "key": "0x..." | null,
         "cohort": 1 | null,
         "entitlement": "1040000000000",
@@ -1430,7 +1430,7 @@ Response:
 }
 ```
 
-`power` and `power_cap` apply 03 §B's `accrue` and `power_cap` to the mirrored `PowerMeter` at the latest block timestamp; `unclaimed` applies the creator-claim formulas to the mirrored `received` and `epochs` totals (closed epochs, no expiry); `tranche_this_epoch` is `genesis_tranche(entitlement, epoch)` on the nominal entitlement after splits, claimable only within the current epoch. All are advisory recomputations — the Like and GenesisClaim contracts are authoritative.
+`power` and `power_cap` apply 03 §B's `accrue` and `power_cap` to the mirrored `PowerMeter` at the latest block timestamp; `unclaimed` applies the creator-claim formulas to the mirrored `received` and `epochs` totals (closed epochs, no expiry); `tranche_this_epoch` is `snapshot_tranche(entitlement, epoch)` on the nominal entitlement after splits, claimable only within the current epoch. All are advisory recomputations — the Like and SnapshotClaim contracts are authoritative.
 
 ### Tips and Likes per User/Post
 
@@ -1750,7 +1750,7 @@ pub struct ChainConfig {
     /// Number of confirmations before considering events final.
     pub confirmation_depth: u64,       // default: 12
 
-    /// The disclosed treasury genesis leaf's account (03 §A); its y_balance
+    /// The disclosed treasury snapshot leaf's account (03 §A); its y_balance
     /// is reported as `treasury_balance` on /epoch.
     pub treasury_account: String,      // e.g. "0xdef..."
 }
@@ -1985,7 +1985,7 @@ impl IndexerService {
         });
 
         // Backfills the text corpus from peer indexers (GET /api/v1/stream) and
-        // discovers authors from ingested Vouch objects, registry/stake events,
+        // discovers authors from ingested Vouch objects, registry/deposit events,
         // and peer exchange.
         let ingest_and_sync_handle = tokio::spawn({
             let storage = self.storage.clone();
@@ -2062,6 +2062,6 @@ The indexer is an **untrusted convenience layer**. Its trust model is:
 | **Ranking fairness** | NOT guaranteed. An indexer may bias feed rankings or omit candidates. Every budget item carries a why-path and share recomputable from public signed objects (follow lists, reposts, quotes), so a fabricated or inflated path is detectable (09); explore items are labelled with their provider and topic and fill at most EXPLORE_BUDGET of the feed. `Chronological` stays the neutral baseline. |
 | **Visibility policy** | Indexer-local by design. Each indexer derives its own visibility verdict from the public label record under its own policy; the protocol mandates nothing. Because the label record is public and auditable, any hiding decision can be compared against it, and a client can recompute or override it (see 06, 09). |
 | **Supporter recognition** | Derived and subjective, like the visibility policy — NOT part of the economic-accuracy guarantee. Badges, thread-scoped superchat prominence, and per-creator leaderboards are presentation conventions, not protocol, and confer no on-chain rights. The underlying tip totals they summarize are verifiable against the chain, but their display (tier cutoffs, prominence weighting, thread-local ordering) is the indexer's choice; a different indexer may show them differently or not at all. The profile's advisory `aura` has the same status (05). |
-| **Economic accuracy** | On-chain events are the source of truth for tips, stakes, like settlements, issuance, the fee pool, genesis claims, transfers, and handle rent. The indexer merely mirrors this data for queryability; derived figures (power, unclaimed rewards, genesis tranches) are recomputed with 03's formulas and are advisory. Any discrepancy can be detected by checking the chain directly. |
+| **Economic accuracy** | On-chain events are the source of truth for tips, deposits, like settlements, issuance, the fee pool, snapshot claims, transfers, and handle rent. The indexer merely mirrors this data for queryability; derived figures (power, unclaimed rewards, snapshot tranches) are recomputed with 03's formulas and are advisory. Any discrepancy can be detected by checking the chain directly. |
 | **Availability & durability** | NOT guaranteed by any single indexer. Durability comes from independently chosen indexers + the author's local copy + trustless third-party mirrors (mirroring is trustless because objects are self-authenticating) + permissionless republication — any dropped indexer is a re-publish event, not data loss. No storage venue is normative; out-of-protocol archival services may exist but none is required. |
 | **Censorship-resistance** | Suppressing a user requires suppressing **every** indexer AND their permissionless ability to republish (from a local copy, to any indexer, including one they run themselves); anchors keep prior timestamps provable forever. |

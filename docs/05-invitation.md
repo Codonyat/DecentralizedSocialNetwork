@@ -5,7 +5,7 @@
 Invitations are **data**. A signed, recipient-accepted "A vouches for B" object gives a newcomer cold-start context and an offered first follow. There is no invite fee, no on-chain tree, and no invitation-derived weight anywhere in the protocol.
 
 No sybil defence lives here, because sybils gain nothing in either layer that matters:
-- **Money** is bounded by stake × time: accounts, likes and routing add nothing to what a coalition can direct (03 §B, The bound).
+- **Money** is bounded by deposit × time: accounts, likes and routing add nothing to what a coalition can direct (03 §B, The bound).
 - **Reach** is a conserved attention budget: creating accounts cannot raise anyone's share (09).
 
 What remains is edge policy: invites are scarce but free, with quotas set by clients and hosts. It also covers two onboarding conveniences, power delegation and client-sponsored onboarding, and one status signal, aura.
@@ -77,7 +77,7 @@ pub fn validate_vouch(vouch: &Vouch) -> Result<(), InvitationError>;
 
 ## Power Delegation (`delegation.rs`)
 
-Newcomers have **ranking weight immediately**: their likes are free signed objects and count as ranking edges from the first one (09). They have **money weight** when they hold and stake Y, or when a **sponsor** — an inviter or a client — lets them spend part of the sponsor's like power.
+Newcomers have **ranking weight immediately**: their likes are free signed objects and count as ranking edges from the first one (09). They have **money weight** when they hold and deposit Y, or when a **sponsor** — an inviter or a client — lets them spend part of the sponsor's like power.
 
 - A sponsor signs a `PowerDelegation { sponsor, delegate, expires_epoch }` (01).
 - The delegate's likes name the sponsor (`Like.sponsor`).
@@ -164,7 +164,7 @@ pub enum InvitationError {
 ### Sybil vouch farms
 
 **Attack.** One controller creates many accounts and vouches for all of them, or collects vouches from them.
-**Outcome.** The farm gains nothing it can spend. Money is stake-bounded (03 §B), and a vouch confers no budget share (09). The only product is aura-based extra invites, which buy only more vouches. Quotas and indexing policy keep the spam cost on the farm's hosts.
+**Outcome.** The farm gains nothing it can spend. Money is deposit-bounded (03 §B), and a vouch confers no budget share (09). The only product is aura-based extra invites, which buy only more vouches. Quotas and indexing policy keep the spam cost on the farm's hosts.
 
 ### Delegation amplification
 
@@ -184,4 +184,4 @@ Collusion among trusted accounts, and endorsements sold for money, are not stopp
 
 The on-chain invitation tree, the 100 Y invitation fee, trust distance, and the invitation-weighted donation rules (pairwise weights and lineage-family diminishing returns) are gone.
 
-They defended a money layer that no longer pays by activity. They deterred only lazy harvesters, and they taxed honest friends: every honest invite paid the fee, and every related-account like was discounted. Stake now bounds the money layer (03 §B, and 03 Economic Design, Superseded designs).
+They defended a money layer that no longer pays by activity. They deterred only lazy harvesters, and they taxed honest friends: every honest invite paid the fee, and every related-account like was discounted. Deposits now bound the money layer (03 §B, and 03 Economic Design, Superseded designs).

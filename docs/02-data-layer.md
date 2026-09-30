@@ -11,7 +11,7 @@ Design goals:
 - **Simplicity is an explicit goal.** The protocol specifies a data format (signed, content-addressed objects) and stays silent on transport — no bespoke storage network.
 - **Storage is other participants' responsibility.** Indexers are the hot-storage tier, paid for by the existing indexer economics (doc 07, Indexer Economics: facilitator fees and bulk API access); the client always keeps a full local copy of everything its user signs. `docs/12-storage-and-anchoring.md` governs storage semantics; this document aligns with it.
 
-On-chain operations (tokens, stakes and like settlements, tips, genesis claims, names, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
+On-chain operations (tokens, deposits and like settlements, tips, snapshot claims, names, epochs, identity, anchoring) are handled by the `dsn-chain` crate and its `ChainClient` trait. This document focuses on the off-chain content layer.
 
 ## Module Structure
 
@@ -208,14 +208,14 @@ The `ChainClient` trait is defined in the `dsn-chain` crate and provides access 
 `ChainClient` covers the following operations:
 
 - **Y token**: balance queries, plain transfers between accounts
-- **Genesis**: activating a genesis entitlement, claiming weekly tranches, splitting entitlement (the treasury is a disclosed genesis leaf)
-- **Like**: stake/unstake, submitting the daily like settlement, claiming creator rewards for closed epochs, reading the power meter
+- **Snapshot**: activating a snapshot entitlement, claiming weekly tranches, splitting entitlement (the treasury is a disclosed snapshot leaf)
+- **Like**: deposit/withdraw, submitting the daily like settlement, claiming creator rewards for closed epochs, reading the power meter
 - **Tips**: tipping an identity (protocol fee routed to the fee pool, optional facilitator fee), foreign-key escrow claim/refund, querying tip history
 - **Names**: claiming/assessing/renting handles (Harberger, base rent), resolving handle to public key
-- **Epochs**: querying current epoch info, mint rate, fee pool, stake-time
+- **Epochs**: querying current epoch info, mint rate, fee pool, deposit-time
 - **Identity (IdentityRegistry)**: resolving `IdentityId → current key`; `rotate`; `set_guardians`; `recover`
 - **Anchoring**: `post_anchor(root)` and anchor-event queries (Merkle-root timestamp anchors, doc 12 §4)
-- **Events**: listening for on-chain events (tips, stakes, like settlements, epoch transitions, identity events, `Anchored`)
+- **Events**: listening for on-chain events (tips, deposits, like settlements, epoch transitions, identity events, `Anchored`)
 
 See the `dsn-chain` crate documentation for the full trait definition and implementation details.
 
@@ -270,13 +270,13 @@ The real backend relays signed objects to a set of configured indexers. Not impl
 | `FollowList` | Signed object, hosted by indexers | logical address blake3(root_pk‖tag) | Mutable list |
 | Reply link | Signed object (graph), hosted by indexers | blake3(root_pk‖tag) | Immutable edge parent→child |
 | Label | Signed object, hosted by indexers | content hash | One per (author, target, label), first-seen wins (06) |
-| `Like` | Signed object, hosted by indexers | content hash | One per (liker, target), first-seen wins; a ranking edge; settled on-chain for stakers and sponsors' delegates (03 §B) |
+| `Like` | Signed object, hosted by indexers | content hash | One per (liker, target), first-seen wins; a ranking edge; settled on-chain for depositors and sponsors' delegates (03 §B) |
 | `Vouch` | Signed object, hosted by indexers | content hash | Published by the vouchee (publishing = acceptance) (05) |
 | `PowerDelegation` | Signed object, hosted by indexers | content hash | Sponsor lets a delegate spend from its power meter (05) |
 | Y Balance | On-chain | smart contract | ERC-20 token |
 | Tips | On-chain | smart contract | Tipper→any identity, 1% protocol fee to the fee pool + 0–5% facilitator fee; foreign-key escrow |
 | Names | On-chain | smart contract | Handle→public key mapping (Harberger) |
-| Stakes/Issuance/Fee pool | On-chain | smart contract | Like power, daily settlements, creator claims for closed epochs |
+| Deposits/Issuance/Fee pool | On-chain | smart contract | Like power, daily settlements, creator claims for closed epochs |
 
 ## Error Types (`error.rs`)
 

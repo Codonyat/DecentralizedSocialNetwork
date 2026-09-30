@@ -22,14 +22,14 @@ Twitter-style architecture (candidate sources → heavy ranker) cut along decent
 
 | Stage | Where | Trust requirement |
 |---|---|---|
-| Money (like-power settlement, tips, rent, genesis claims) | On-chain | Consensus |
+| Money (like-power settlement, tips, rent, snapshot claims) | On-chain | Consensus |
 | Recall (attention budget, exploration) | Indexers | Verifiable — why-paths and shares recompute from signed objects (07-indexer.md) |
 | Ranking (precision) | User's device | None — user-owned |
 
 - **Indexers stay dumb.** They serve bulk, un-ranked candidate sets carrying budget metadata (`GET /api/v1/candidates/:user_pk?sources=budget`, see 07-indexer.md) and topic exploration sets (`GET /api/v1/explore?topic=`). Cheap, commodity, verifiable. An indexer that omits candidates is detectable by cross-querying, same as feed completeness; one that forges a path fails recomputation.
 - **The client ranks.** A local model orders the candidates using features from the metadata plus the user's private interaction history.
 - **Server-side ranked feeds remain** as the thin-client path (07-indexer.md, Feed Builder: `FeedRanking::{Chronological, Budget}`) for devices that can't run a model.
-- **Reach is never bought.** Money and recall are separate layers. Stake, like power, balances and tip sizes never enter the budget; a like or tip is a ranking feature, never a recall edge. A whale's like pays the creator (03-token-y.md §B) and reaches only viewers whose budget graph already contains the whale (they follow it, or one of their sources does), where it counts once like anyone else's. Recommenders are not paid: a like pays the author, and reposting earns nothing.
+- **Reach is never bought.** Money and recall are separate layers. Deposits, like power, balances and tip sizes never enter the budget; a like or tip is a ranking feature, never a recall edge. A whale's like pays the creator (03-token-y.md §B) and reaches only viewers whose budget graph already contains the whale (they follow it, or one of their sources does), where it counts once like anyone else's. Recommenders are not paid: a like pays the author, and reposting earns nothing.
 - **Mentions** feed the notifications view (`sources=mentions`), never the feed budget.
 
 ## Attention Budget
@@ -123,7 +123,7 @@ Ranking quality does not require a large model to beat chronological. The refere
 **Excluded from the default feature set:**
 - Global like or tip totals. A network-wide count would sell reach at the price of a like or tip; only viewer-relative, per-account-capped counts are features.
 - Aura (05-invitation.md). It is a status score and never a ranking feature.
-- Anything money-weighted: stake, like power, balance, tip size. Money never buys reach. The one money-sized ordering anywhere is an indexer's thread-local supporter prominence (07, Supporter Recognition): presentation among the replies to one post, never recall or feed ranking.
+- Anything money-weighted: deposit, like power, balance, tip size. Money never buys reach. The one money-sized ordering anywhere is an indexer's thread-local supporter prominence (07, Supporter Recognition): presentation among the replies to one post, never recall or feed ranking.
 
 ### Upgrade path
 
